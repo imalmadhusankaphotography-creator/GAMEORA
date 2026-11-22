@@ -1,0 +1,392 @@
+// @vitest-environment happy-dom
+import { act, useState } from "react";
+import { createRoot } from "react-dom/client";
+import { renderToStaticMarkup } from "react-dom/server";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { filterModels, groupModelsByProvider, ModelSelector, useAgentModels } from "../src/renderer/model-selector.js";
+import type { AgentModel, AgentModelCatalog, AgentModelRef, AgentReasoningLevel } from "../src/shared/contracts.js";
+import { MODELS_CHANGED_EVENT } from "../src/renderer/model-settings-events.js";
+import { PROVIDER_ICONS } from "../src/renderer/provider-icons.js";
+
+const model: AgentModel = {
+  provider: "openai",
+  providerName: "OpenAI",
+  id: "gpt-test",
+  name: "GPT Test",
+  reasoningLevels: ["off", "medium"],
+};
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
+describe("ModelSelector", () => {
+  it("searches model names, IDs and provider metadata without changing their order", () => {
+    const available = [model, { ...model, provider: "relay", providerName: "My Gateway", id: "vendor/fast", name: "Fast Model" }];
+    expect(filterModels(available, "  GPT-TEST ")).toEqual([model]);
+    expect(filterModels(available, "gateway")).toEqual([available[1]]);
+    expect(filterModels(available, "fast model")).toEqual([available[1]]);
+    expect(filterModels(available, "missing")).toEqual([]);
+    expect(filterModels(available, " ")).toEqual(available);
+  });
+  it("allows recovery when models are available but none is selected", () => {
+    const html = renderToStaticMarkup(
+      <ModelSelector models={[model]} onChange={() => undefined} onReasoningChange={() => undefined} />,
+    );
+
+    expect(html).toContain("No language model");
+    expect(html).not.toContain("disabled=\"\"");
+  });
+
+  it("stays disabled when no models are available", () => {
+    const html = renderToStaticMarkup(
+      <ModelSelector models={[]} onChange={() => undefined} onReasoningChange={() => undefined} />,
+    );
+
+    expect(html).toContain("disabled=\"\"");
+  });
+
+  it("keeps the current conversation model named when it is hidden from the menu", () => {
+    const html = renderToStaticMarkup(
+      <ModelSelector models={[]} value={model} onChange={() => undefined} onReasoningChange={() => undefined} />,
+    );
+    expect(html).toContain("GPT Test");
+    expect(html).not.toContain("No language model");
+  });
+
+  it("groups models by provider while preserving provider and model order", () => {
+    const groups = groupModelsByProvider([
+      model,
+      { ...model, provider: "anthropic", providerName: "Anthropic", id: "claude-test", name: "Claude Test" },
+      { ...model, id: "gpt-test-mini", name: "GPT Test Mini" },
+    ]);
+
+    expect(groups.map((group) => ({
+      provider: group.provider,
+      providerName: group.providerName,
+      models: group.models.map((item) => item.name),
+    }))).toEqual([
+      { provider: "openai", providerName: "OpenAI", models: ["GPT Test", "GPT Test Mini"] },
+      { provider: "anthropic", providerName: "Anthropic", models: ["Claude Test"] },
+    ]);
+  });
+});
+
+describe("ModelSelector interaction", () => {
+  let root: ReturnType<typeof createRoot>, container: HTMLDivElement;
+  const reasoningModel: AgentModel = { ...model, reasoningLevels: ["low", "medium", "high", "xhigh", "max"] };
+  beforeEach(() => {
+    vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+    container = document.createElement("div"); document.body.append(container); root = createRoot(container);
+  });
+  afterEach(async () => {
+    await act(async () => root.unmount());
+    window.dispatchEvent(new Event(MODELS_CHANGED_EVENT));
+    container.remove();
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  it("shows model namespaces without changing titles, search, or selection IDs", async () => {
+    vi.stubGlobal("fetch", async () => new Response(null, { status: 404 }));
+    const models: AgentModel[] = [
+      { ...model, provider: "opencode-cli", providerName: "OpenCode", id: "github-copilot/gpt-5", name: "GPT 5" },
+      { ...model, provider: "opencode-cli", providerName: "OpenCode", id: "openrouter/openai/gpt-5", name: "GPT 5" },
+      { ...model, provider: "plugin.ohmygame.modelscope.modelscope", providerName: "ModelScope", id: "deepseek-ai/DeepSeek-V4-Pro", name: "deepseek-ai/DeepSeek-V4-Pro" },
+      { ...model, provider: "plugin.ohmygame.siliconflow-cn.siliconflow-cn", providerName: "SiliconFlow CN", id: "MiniMaxAI/MiniMax-H3", name: "MiniMaxAI/MiniMax-H3" },
+      { ...model, id: "org/custom", name: "Custom title" },
+      { ...model, id: "projects/local/model", name: "projects/local/model" },
+      { ...model, id: "plain-model", name: "plain-model" },
+      { ...model, provider: "agent.example.plugin.cli", providerName: "Example", id: "models/gemini", name: "models/gemini" },
+    ];
+    const onChange = vi.fn();
+    await act(async () => root.render(<ModelSelector models={models} onChange={onChange} onReasoningChange={() => {}} />));
+    await act(async () => container.querySelector<HTMLButtonElement>(".model-selector-trigger")!.click());
+    const rows = [...document.querySelectorAll<HTMLButtonElement>('[role="menuitemradio"]')];
+    expect(rows.map((row) => [
+      row.querySelector(".model-picker-item-name")?.textContent,
+      row.querySelector(".model-picker-item-source")?.textContent,
+    ])).toEqual([
+      ["GPT 5", "github-copilot"],
+      ["GPT 5", "openrouter"],
+      ["DeepSeek-V4-Pro", "deepseek-ai"],
+      ["MiniMax-H3", "MiniMaxAI"],
+      ["Custom title", undefined],
+      ["projects/local/model", undefined],
+      ["plain-model", undefined],
+      ["models/gemini", undefined],
+    ]);
+    expect(filterModels(models, "deepseek-ai")).toEqual([models[2]]);
+    await act(async () => rows[2]!.click());
+    expect(onChange.mock.calls[0]?.[0]).toBe(models[2]);
+  });
+
+  it("shows the saved model on a cold start while matching pickers share discovery", async () => {
+    vi.useFakeTimers();
+    const stored = { provider: "codex-cli", id: "saved-model" };
+    const native = { ...stored, providerName: "Codex", name: "Saved Model", reasoningLevels: [] };
+    const initial = deferred<AgentModelCatalog>();
+    const fetchModels = vi.fn()
+      .mockReturnValueOnce(initial.promise)
+      .mockResolvedValueOnce({ models: [model, native], defaultReasoningLevel: "medium" });
+    vi.stubGlobal("fetch", async (url: string) => {
+      if (url.endsWith("/health")) return Response.json({ status: "ok" });
+      const query = new URL(url, window.location.origin).searchParams;
+      expect(query.get("background")).toBe("1");
+      expect(JSON.parse(query.get("profiles")!)).toEqual({ "codex-cli": "work" });
+      return Response.json(await fetchModels());
+    });
+    function Picker() {
+      const catalog = useAgentModels({ agentRuntimes: true, accountProfiles: { "codex-cli": "work" } });
+      return <ModelSelector models={catalog.models} status={catalog.status} value={stored} onChange={() => {}} onReasoningChange={() => {}} />;
+    }
+    await act(async () => root.render(<><Picker /><Picker /></>));
+    const buttons = [...container.querySelectorAll<HTMLButtonElement>(".model-selector-trigger")];
+    expect(buttons.map((button) => button.textContent)).toEqual(["saved-model", "saved-model"]);
+    expect(fetchModels).toHaveBeenCalledOnce();
+
+    await act(async () => initial.resolve({ models: [model], defaultReasoningLevel: "medium", loadingRuntimes: ["codex-cli"] }));
+    await act(async () => buttons[0]!.click());
+    const search = document.querySelector<HTMLInputElement>(".model-picker input");
+    expect(document.activeElement).toBe(search);
+    expect(document.querySelector(".model-picker-list")?.textContent).toContain("GPT Test");
+    await act(async () => vi.advanceTimersByTimeAsync(3_000));
+
+    expect(buttons.map((button) => button.textContent)).toEqual(["Saved Model", "Saved Model"]);
+    expect(document.activeElement).toBe(search);
+    expect(document.querySelector(".model-picker-list")?.textContent).toContain("Saved Model");
+    expect(fetchModels).toHaveBeenCalledTimes(2);
+  });
+
+  it("reuses catalogs across conversations and keeps a late response with its own account", async () => {
+    const personal = deferred<AgentModelCatalog>();
+    const workModel = { ...model, provider: "codex-cli", id: "work-model", name: "Work Model" };
+    const personalModel = { ...model, provider: "codex-cli", id: "personal-model", name: "Personal Model" };
+    const personalModelRef = { provider: personalModel.provider, id: personalModel.id };
+    const read = vi.fn((id: string) => id === "personal" ? personal.promise : Promise.resolve({
+      models: [workModel], defaultReasoningLevel: "medium",
+    }));
+    vi.stubGlobal("fetch", async (url: string) => {
+      if (url.endsWith("/health")) return Response.json({ status: "ok" });
+      const query = new URL(url, window.location.origin).searchParams;
+      return Response.json(await read(JSON.parse(query.get("profiles")!)["codex-cli"]));
+    });
+    function Chat({ account, selected }: { account: string; selected: AgentModelRef }) {
+      const catalog = useAgentModels({ agentRuntimes: true, accountProfiles: { "codex-cli": account } });
+      return <ModelSelector models={catalog.models} status={catalog.status} value={selected} onChange={() => {}} onReasoningChange={() => {}} />;
+    }
+    await act(async () => root.render(<Chat key="first" account="personal" selected={personalModelRef} />));
+    expect(container.querySelector(".model-selector-name")?.textContent).toBe("personal-model");
+    await act(async () => root.render(<Chat key="second" account="work" selected={{ provider: workModel.provider, id: workModel.id }} />));
+    expect(container.querySelector(".model-selector-name")?.textContent).toBe("Work Model");
+    await act(async () => personal.resolve({ models: [personalModel], defaultReasoningLevel: "medium" }));
+    expect(container.querySelector(".model-selector-name")?.textContent).toBe("Work Model");
+    await act(async () => container.querySelector<HTMLButtonElement>(".model-selector-trigger")!.click());
+    expect(document.querySelector(".model-picker-list")?.textContent).not.toContain("Personal Model");
+
+    await act(async () => root.render(<Chat key="third" account="personal" selected={personalModelRef} />));
+    expect(container.querySelector(".model-selector-name")?.textContent).toBe("Personal Model");
+    await act(async () => root.render(<Chat key="fourth" account="personal" selected={personalModelRef} />));
+    expect(container.querySelector(".model-selector-name")?.textContent).toBe("Personal Model");
+    expect(read.mock.calls).toEqual([["personal"], ["work"]]);
+  });
+
+  it("discards an in-flight catalog after settings change", async () => {
+    const previous = deferred<AgentModelCatalog>();
+    const replacement = { ...model, id: "new", name: "New default" };
+    const read = vi.fn()
+      .mockReturnValueOnce(previous.promise)
+      .mockResolvedValueOnce({ models: [replacement], defaultReasoningLevel: "medium" });
+    vi.stubGlobal("fetch", async (url: string) => Response.json(url.endsWith("/health") ? { status: "ok" } : await read()));
+    function Catalog() {
+      return <output>{useAgentModels().models.map((item) => item.name).join(", ")}</output>;
+    }
+    await act(async () => root.render(<Catalog />));
+    await act(async () => { window.dispatchEvent(new Event(MODELS_CHANGED_EVENT)); });
+    expect(container.textContent).toBe("New default");
+    await act(async () => previous.resolve({ models: [model], defaultReasoningLevel: "medium" }));
+    expect(container.textContent).toBe("New default");
+    expect(read).toHaveBeenCalledTimes(2);
+  });
+
+  it("quietly reloads a pending Pi catalog while keeping existing models available", async () => {
+    vi.useFakeTimers();
+    const next = { ...model, id: "new-model", name: "New model" };
+    const fetchModels = vi.fn().mockResolvedValueOnce({ models: [model], defaultReasoningLevel: "medium", loadingProviders: ["openai"] })
+      .mockResolvedValueOnce({ models: [model, next], defaultReasoningLevel: "medium" });
+    vi.stubGlobal("fetch", async (url: string) => Response.json(url.endsWith("/health") ? { status: "ok" } : await fetchModels()));
+    function Catalog() {
+      const catalog = useAgentModels();
+      return <output>{catalog.status}: {catalog.models.map((item) => item.name).join(", ")}</output>;
+    }
+    await act(async () => root.render(<Catalog />));
+    expect(container.textContent).toBe("ready: GPT Test");
+    await act(async () => vi.advanceTimersByTimeAsync(3_000));
+    expect(container.textContent).toBe("ready: GPT Test, New model");
+    expect(fetchModels).toHaveBeenCalledTimes(2);
+    await act(async () => vi.advanceTimersByTimeAsync(3_000));
+    expect(fetchModels).toHaveBeenCalledTimes(2);
+  });
+
+  it("shows each provider's logo in its heading and on the model button", async () => {
+    const available: AgentModel[] = [
+      model,
+      { ...model, provider: "codex-cli", providerName: "Codex" },
+      { ...model, provider: "claude-code-cli", providerName: "Claude Code" },
+      { ...model, provider: "custom-1234", providerName: "My Gateway" },
+    ];
+    function Selector() {
+      const [selected, setSelected] = useState(model);
+      return <ModelSelector models={available} value={selected} onChange={setSelected} onReasoningChange={() => {}} />;
+    }
+    await act(async () => root.render(<Selector />));
+    const trigger = container.querySelector<HTMLButtonElement>(".model-selector-trigger")!;
+    expect(trigger.querySelector("img")?.getAttribute("src")).toBe(PROVIDER_ICONS.openai?.src);
+    for (const selected of [...available.slice(1), model]) {
+      await act(async () => trigger.click());
+      const headings = [...document.querySelectorAll(".model-picker-heading")];
+      expect(headings.map((heading) => heading.textContent)).toEqual(available.map((item) => item.provider.startsWith("custom") ? `M${item.providerName}` : item.providerName));
+      expect(headings.slice(0, 3).map((heading) => heading.querySelector("img")?.getAttribute("src")))
+        .toEqual(available.slice(0, 3).map((item) => PROVIDER_ICONS[item.provider]?.src));
+      await act(async () => document.querySelector<HTMLButtonElement>(`[title="${selected.provider}/${selected.id}"]`)!.click());
+      const icon = trigger.querySelector("img");
+      if (selected.provider.startsWith("custom")) {
+        expect(icon).toBeNull();
+        expect(trigger.querySelector(".provider-mark.is-initial")?.textContent).toBe("M");
+      } else {
+        expect(icon?.getAttribute("src")).toBe(PROVIDER_ICONS[selected.provider]?.src);
+        expect(icon?.getAttribute("width")).toBe("14");
+        expect(icon?.getAttribute("alt")).toBe("");
+        expect(icon?.getAttribute("aria-hidden")).toBe("true");
+      }
+      expect(trigger.querySelector(".model-selector-name")?.textContent).toBe(selected.name);
+    }
+  });
+
+  it("selects an arbitrary native variant without changing Pi reasoning", async () => {
+    const native: AgentModel = { ...model, provider: "opencode-cli", reasoningLevels: [], nativeReasoningLevels: ["low", "balanced-custom"] };
+    const onNativeReasoningChange = vi.fn(), onReasoningChange = vi.fn();
+    await act(async () => root.render(<ModelSelector models={[native]} value={native} nativeReasoningLevel="low" onChange={() => {}} onReasoningChange={onReasoningChange} onNativeReasoningChange={onNativeReasoningChange} />));
+    await act(async () => container.querySelector<HTMLButtonElement>("button")!.click());
+    await act(async () => document.querySelector<HTMLButtonElement>(".model-picker-depth")!.click());
+    const custom = [...document.querySelectorAll<HTMLButtonElement>('[role="menuitemradio"]')].find((option) => option.textContent === "balanced-custom")!;
+    expect(custom).toBeDefined();
+    await act(async () => custom.click());
+    expect(onNativeReasoningChange).toHaveBeenCalledExactlyOnceWith("balanced-custom");
+    expect(onReasoningChange).not.toHaveBeenCalled();
+  });
+
+  it.each(["chat", "canvas"] as const)("shows the model and reasoning in one button and changes depth from the picker's last row in the %s variant", async (variant) => {
+    const onChange = vi.fn(), onReasoningChange = vi.fn();
+    function Selector() {
+      const [level, setLevel] = useState<AgentReasoningLevel>("high");
+      return <ModelSelector variant={variant} models={[reasoningModel]} value={reasoningModel} reasoningLevel={level} onChange={onChange} onReasoningChange={(next) => { onReasoningChange(next); setLevel(next); }} />;
+    }
+    await act(async () => root.render(<Selector />));
+    expect(container.querySelectorAll("button")).toHaveLength(1);
+    const button = container.querySelector<HTMLButtonElement>("button")!;
+    expect(button.textContent).toContain(model.name);
+    expect(button.querySelector(".model-selector-reasoning-value")?.textContent).toBe("High");
+    await act(async () => button.click());
+    expect(document.querySelector('[role="menu"]')?.getAttribute("aria-label")).toBe("Models");
+    expect(document.querySelector('[role="menu"]')?.parentElement?.id).toBe(button.getAttribute("aria-controls"));
+    expect(document.activeElement?.getAttribute("aria-label")).toBe("Search models");
+    const entry = document.querySelector<HTMLButtonElement>(".model-picker-depth")!;
+    expect(entry.textContent).toBe("Thinking depthHigh");
+    await act(async () => entry.click());
+    const menu = document.querySelector('[role="menu"]')!;
+    expect(menu.getAttribute("aria-label")).toBe("Thinking depth");
+    const options = menu.querySelectorAll<HTMLButtonElement>('[role="menuitemradio"]');
+    expect(options).toHaveLength(reasoningModel.reasoningLevels.length);
+    expect(options[2]!.getAttribute("aria-checked")).toBe("true");
+    expect(document.activeElement).toBe(options[2]);
+    // ArrowLeft goes back to the models with the depth row focused.
+    await act(async () => options[2]!.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowLeft", bubbles: true })));
+    expect(document.activeElement).toBe(document.querySelector(".model-picker-depth"));
+    await act(async () => document.querySelector<HTMLButtonElement>(".model-picker-depth")!.click());
+    const next = document.querySelectorAll<HTMLButtonElement>('[role="menuitemradio"]')[3]!;
+    const nextLabel = next.textContent;
+    await act(async () => next.click());
+    expect(onReasoningChange).toHaveBeenCalledExactlyOnceWith("xhigh");
+    expect(onChange).not.toHaveBeenCalled();
+    expect(button.getAttribute("aria-expanded")).toBe("false");
+    expect(document.activeElement).toBe(button);
+    expect(button.querySelector(".model-selector-reasoning-value")?.textContent).toBe(nextLabel);
+    expect(button.getAttribute("aria-description")).toBe(`Reasoning: ${nextLabel}`);
+  });
+
+  it("keeps the depth levels beside the button when the picker changes height", async () => {
+    // Models 400px tall and depth 200px, opened from a button at y=700.
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
+      if (this.classList.contains("model-picker")) return { width: 240, height: this.querySelector(".model-picker-search") ? 400 : 200 } as DOMRect;
+      return { top: 700, bottom: 726, left: 300, right: 500 } as DOMRect;
+    });
+    vi.stubGlobal("innerHeight", 800);
+    vi.stubGlobal("innerWidth", 1000);
+    await act(async () => root.render(<ModelSelector models={[reasoningModel]} value={reasoningModel} onChange={() => {}} onReasoningChange={() => {}} />));
+    await act(async () => container.querySelector<HTMLButtonElement>("button")!.click());
+    const picker = document.querySelector<HTMLElement>(".model-picker")!;
+    expect(picker.style.top).toBe("296px");
+    await act(async () => document.querySelector<HTMLButtonElement>(".model-picker-depth")!.click());
+    expect(picker.style.top).toBe("496px");
+    // The separator spans the popup, so inside the scrolling list it would add a horizontal scrollbar.
+    expect(document.querySelector(".model-picker-list .ui-menu-separator")).toBeNull();
+    expect(document.querySelector(".model-picker-back")!.closest('[role="menu"]')?.getAttribute("aria-label")).toBe("Thinking depth");
+    expect(document.querySelectorAll('[role="menu"]')).toHaveLength(1);
+    await act(async () => document.querySelector<HTMLButtonElement>(".model-picker-back")!.click());
+    expect(picker.style.top).toBe("296px");
+  });
+
+  it("closes with Escape or a click outside and restores focus", async () => {
+    await act(async () => root.render(<ModelSelector models={[reasoningModel]} value={reasoningModel} onChange={() => {}} onReasoningChange={() => {}} />));
+    const button = container.querySelector<HTMLButtonElement>("button")!;
+    await act(async () => button.click());
+    await act(async () => document.activeElement!.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true })));
+    expect(document.activeElement?.getAttribute("role")).toBe("menuitemradio");
+    await act(async () => document.activeElement!.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })));
+    expect(document.querySelector('[role="menu"]')).toBeNull();
+    expect(document.activeElement).toBe(button);
+    await act(async () => button.click());
+    await act(async () => document.body.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true })));
+    expect(button.getAttribute("aria-expanded")).toBe("false");
+  });
+
+  it("clamps the level when switching models and hides reasoning for a single supported level", async () => {
+    const limited: AgentModel = { ...model, id: "limited", name: "Limited", reasoningLevels: ["off", "low", "high"] };
+    const fixed: AgentModel = { ...model, id: "fixed", name: "Fixed", reasoningLevels: ["off"] };
+    const onChange = vi.fn();
+    function Selector() {
+      const [selected, setSelected] = useState(reasoningModel);
+      const [level, setLevel] = useState<AgentReasoningLevel>("xhigh");
+      return <ModelSelector models={[reasoningModel, limited, fixed]} value={selected} reasoningLevel={level} onReasoningChange={() => {}} onChange={(next, reasoning) => {
+        onChange(next, reasoning); setSelected(next); setLevel(reasoning);
+      }} />;
+    }
+    await act(async () => root.render(<Selector />));
+    const modelButton = container.querySelector<HTMLButtonElement>('[aria-label="Model"]')!;
+    await act(async () => modelButton.click());
+    await act(async () => document.querySelector<HTMLButtonElement>('[title="openai/limited"]')!.click());
+    expect(onChange).toHaveBeenLastCalledWith(limited, "high");
+    expect(modelButton.querySelector(".model-selector-reasoning-value")?.textContent).toBe("High");
+    expect(document.activeElement).toBe(modelButton);
+    await act(async () => modelButton.click());
+    await act(async () => document.querySelector<HTMLButtonElement>('[title="openai/fixed"]')!.click());
+    expect(onChange).toHaveBeenLastCalledWith(fixed, "off");
+    expect(container.querySelectorAll("button")).toHaveLength(1);
+    expect(modelButton.querySelector(".model-selector-reasoning-value")).toBeNull();
+    await act(async () => modelButton.click());
+    expect(document.querySelector(".model-picker-depth")).toBeNull();
+  });
+
+  it("disables the button and closes an open picker while the composer is busy", async () => {
+    const props = { models: [reasoningModel], value: reasoningModel, onChange: () => {}, onReasoningChange: () => {} };
+    await act(async () => root.render(<ModelSelector {...props} />));
+    await act(async () => container.querySelector<HTMLButtonElement>("button")!.click());
+    await act(async () => root.render(<ModelSelector {...props} disabled />));
+    expect(document.querySelector('[role="menu"]')).toBeNull();
+    expect([...container.querySelectorAll<HTMLButtonElement>("button")].every((button) => button.disabled)).toBe(true);
+  });
+});

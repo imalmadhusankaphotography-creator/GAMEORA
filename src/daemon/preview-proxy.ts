@@ -1,0 +1,964 @@
+import type { GameTuningScalar } from "../shared/game-tuning.js";
+import type { GamepadKeyMap } from "../shared/preview-input.js";
+import type { PreviewPick } from "../shared/contracts.js";
+import {
+  PREVIEW_CLIENT_QUERY,
+  PREVIEW_SOURCE_QUERY,
+  previewPagePath,
+  type PreviewPageSource,
+} from "../shared/preview-page.js";
+import {
+  createServer,
+  request,
+  type IncomingMessage,
+  type ServerResponse,
+} from "node:http";
+import type { Socket } from "node:net";
+import {
+  MAX_PREVIEW_DIAGNOSTIC_LENGTH,
+  previewDiagnostic,
+  type PreviewDiagnostic,
+} from "../shared/preview-diagnostics.js";
+import { annotatePlayableSourceLocations } from "../shared/playable-source-locations.js";
+
+const BRIDGE_PATH = "/__ohmygame_preview_bridge__.js";
+/** The web story editor bridge, served beside the preview bridge for Interactive Story pages. */
+const STORY_BRIDGE_PATH = "/__ohmygame_story_bridge__.js";
+const SCENE_HTML_PATH = /^\/(nodes\/[^/]+\/index\.html)$/;
+const MAX_HTML_BYTES = 2 * 1024 * 1024;
+
+export interface PreviewProxy {
+  url: string;
+  close(): Promise<void>;
+  reload(): void;
+  /** Turns a page's next click into a pick, or stops picking there. */
+  setPicking(client: string, active: boolean): void;
+  /** The values the person's pages of the game should use; AI tests keep what is saved. */
+  setTuning(values: Record<string, GameTuningScalar>): void;
+  /** The gamepad map the person's pages press keys with; AI tests get none. */
+  setInputMap(map: GamepadKeyMap | undefined): void;
+}
+
+/** A separate loopback origin preserves asset paths and HMR without changing project files. */
+export async function createPreviewProxy(
+  targetUrl: string,
+  onDiagnostic: (
+    diagnostic?: PreviewDiagnostic,
+    diagnostics?: PreviewDiagnostic[],
+  ) => void,
+  options: {
+    port?: number;
+    onActivity?: (id: string, active: boolean) => void;
+    onNavigation?: (
+      client: string,
+      source: PreviewPageSource,
+      path: string,
+    ) => void;
+    /** Whether any of the person's pages of the game listens for tuned values. */
+    onTuningConnected?: (connected: boolean) => void;
+    /** A page reported a pick, or that picking was cancelled. */
+    onPick?: (client: string, pick?: PreviewPick) => void;
+    /**
+     * Serves a web story's editor tools: every page gets the story editor
+     * bridge, and Scene HTML the page fetches gets source locations for
+     * picking and text editing.
+     */
+    story?: { bridge: () => Promise<string> };
+  } = {},
+): Promise<PreviewProxy> {
+  const target = new URL(targetUrl);
+  const failures = new Map<string, PreviewDiagnostic>();
+  const sockets = new Set<Socket>();
+  const upstreamRequests = new Set<ReturnType<typeof request>>();
+  let closed = false;
+  let documentId = 0;
+  let reloadRevision = 0;
+  let origin = "";
+  const documents = new Map<
+    number,
+    {
+      client: string;
+      source: PreviewPageSource;
+      path: string;
+      /** Fixed when the page opens: a page can report a new `source` itself. */
+      playtest: boolean;
+    }
+  >();
+  const clients = new Map<string, number>();
+  const resources = new Map<string, number>();
+  const reloadStreams = new Map<number, ServerResponse>();
+  /** Clients whose page is picking. */
+  const picking = new Set<string>();
+  let tuning: Record<string, GameTuningScalar> = {};
+  let inputMap: GamepadKeyMap | null = null;
+  /** Documents whose game listens for tuned values. */
+  const tuningDocuments = new Set<number>();
+  const tuningDocumentGone = (document: number) => {
+    if (tuningDocuments.delete(document) && !tuningDocuments.size) options.onTuningConnected?.(false);
+  };
+  const closeReloadStream = (document: number) => {
+    reloadStreams.get(document)?.end();
+    reloadStreams.delete(document);
+    tuningDocumentGone(document);
+  };
+  const upstreamHeaders = (incoming: IncomingMessage) => {
+    const headers = { ...incoming.headers, host: target.host };
+    if (headers.origin === origin) headers.origin = target.origin;
+    if (headers.referer) {
+      const referer = new URL(headers.referer);
+      if (referer.origin === origin) {
+        referer.searchParams.delete(PREVIEW_CLIENT_QUERY);
+        referer.searchParams.delete(PREVIEW_SOURCE_QUERY);
+        headers.referer = `${target.origin}${referer.pathname}${referer.search}`;
+      }
+    }
+    return headers;
+  };
+  const publish = () => {
+    const diagnostics = [...failures.values()];
+    if (diagnostics.every((item) => !item.client))
+      onDiagnostic(diagnostics.at(-1));
+    else onDiagnostic(diagnostics.at(-1), diagnostics);
+  };
+  const clearDiagnostics = (document: number) => {
+    const context = documents.get(document);
+    if (!context || clients.get(context.client) !== document) return;
+    let changed = false;
+    for (const key of failures.keys())
+      if (key.startsWith(`${context.client}:`)) {
+        failures.delete(key);
+        changed = true;
+      }
+    if (changed) publish();
+  };
+  const report = (
+    document: number,
+    pathname: string,
+    diagnostic?: PreviewDiagnostic,
+  ) => {
+    const context = documents.get(document);
+    if (
+      closed ||
+      (document > 0 && !context) ||
+      (context && clients.get(context.client) !== document)
+    )
+      return;
+    const client = context?.client ?? "default";
+    const key = `${client}:${new URL(pathname, target).pathname}`;
+    if (diagnostic) {
+      failures.set(
+        key,
+        client === "default"
+          ? diagnostic
+          : {
+              ...diagnostic,
+              client,
+              source: context?.source,
+              path: context?.path,
+            },
+      );
+      if (failures.size > 32) failures.delete(failures.keys().next().value!);
+    } else if (!failures.delete(key)) return;
+    publish();
+  };
+  const requestDocument = (incoming: IncomingMessage): number => {
+    const url = new URL(incoming.url ?? "/", target);
+    const direct = url.searchParams.get(PREVIEW_CLIENT_QUERY);
+    if (direct && clients.has(direct)) return clients.get(direct)!;
+    const referer = incoming.headers.referer;
+    if (referer) {
+      const ref = new URL(referer, target);
+      const client = ref.searchParams.get(PREVIEW_CLIENT_QUERY);
+      if (client && clients.has(client)) return clients.get(client)!;
+      const document = resources.get(`${ref.pathname}${ref.search}`);
+      if (document !== undefined) return document;
+    }
+    return documentId;
+  };
+  const server = createServer((incoming, outgoing) => {
+    try {
+      if (options.story && incoming.url?.split("?")[0] === STORY_BRIDGE_PATH) {
+        void options.story.bridge().then(
+          (script) => outgoing.writeHead(200, { "content-type": "text/javascript", "cache-control": "no-store" }).end(script),
+          (error: Error) => outgoing.writeHead(500, { "content-type": "text/plain" }).end(error.message),
+        );
+        return;
+      }
+      if (incoming.url?.split("?")[0] === BRIDGE_PATH) {
+        if (
+          incoming.method === "GET" &&
+          new URL(incoming.url, target).searchParams.get("events") === "1"
+        ) {
+          const document = Number(
+            new URL(incoming.url, target).searchParams.get("document"),
+          );
+          const context = documents.get(document);
+          if (closed || !context || clients.get(context.client) !== document) {
+            outgoing.writeHead(404).end();
+            return;
+          }
+          closeReloadStream(document);
+          outgoing.writeHead(200, {
+            "content-type": "text/event-stream",
+            "cache-control": "no-store",
+            connection: "keep-alive",
+          });
+          outgoing.write(
+            `data: ${JSON.stringify({ reload: reloadRevision, pick: picking.has(context.client), ...(context.playtest ? {} : { tuning, inputMap }) })}\n\n`,
+          );
+          reloadStreams.set(document, outgoing);
+          outgoing.once("close", () => {
+            if (reloadStreams.get(document) === outgoing) {
+              reloadStreams.delete(document);
+              tuningDocumentGone(document);
+            }
+          });
+          return;
+        }
+        if (incoming.method === "POST") {
+          if (incoming.headers.origin !== origin) {
+            incoming.resume();
+            outgoing.writeHead(403).end();
+            return;
+          }
+          const document = Number(
+            new URL(incoming.url, target).searchParams.get("document"),
+          );
+          void receiveBridgeMessage(incoming)
+            .then((message) => {
+              const context = documents.get(document);
+              if (message.type === "resume" && context)
+                clients.set(context.client, document);
+              if (
+                !closed &&
+                context &&
+                clients.get(context.client) === document
+              ) {
+                options.onActivity?.(
+                  String(document),
+                  message.type !== "close",
+                );
+                if (message.type === "source" && message.source) {
+                  context.source = message.source;
+                  for (const diagnostic of failures.values()) {
+                    if (diagnostic.client === context.client) diagnostic.source = message.source;
+                  }
+                  publish();
+                }
+                // Only a pick the editor asked for: a page can't put text in the next message by itself.
+                if (message.type === "pick" && picking.delete(context.client))
+                  options.onPick?.(context.client, message.pick ?? undefined);
+                if (message.type === "tuning" && !context.playtest && reloadStreams.has(document) && !tuningDocuments.has(document)) {
+                  tuningDocuments.add(document);
+                  if (tuningDocuments.size === 1) options.onTuningConnected?.(true);
+                }
+                if (message.type === "diagnostic") {
+                  if (message.diagnostic === null) clearDiagnostics(document);
+                  else if (message.diagnostic)
+                    report(document, BRIDGE_PATH, message.diagnostic);
+                }
+                if (
+                  typeof message.path === "string" &&
+                  message.path.startsWith("/") &&
+                  !message.path.startsWith("//") &&
+                  message.path.length <= 2_000
+                ) {
+                  context.path = previewPagePath(message.path);
+                  options.onNavigation?.(
+                    context.client,
+                    context.source,
+                    context.path,
+                  );
+                }
+                if (message.type === "close") {
+                  clearDiagnostics(document);
+                  closeReloadStream(document);
+                }
+              }
+              outgoing
+                .writeHead(200, {
+                  "content-type": "application/json",
+                  "cache-control": "no-store",
+                })
+                .end(JSON.stringify({ reload: reloadRevision }));
+            })
+            .catch(() => outgoing.writeHead(400).end());
+          return;
+        }
+        outgoing.writeHead(200, {
+          "content-type": "text/javascript; charset=utf-8",
+          "cache-control": "no-store",
+        });
+        const document = Number(
+          new URL(incoming.url!, target).searchParams.get("document") ??
+            documentId,
+        );
+        outgoing.end(previewBridgeScript(document, documents.get(document)));
+        return;
+      }
+      let document = requestDocument(incoming);
+      const incomingUrl = new URL(incoming.url ?? "/", target);
+      const requestedPath = `${incomingUrl.pathname}${incomingUrl.search}`;
+      incomingUrl.searchParams.delete(PREVIEW_CLIENT_QUERY);
+      incomingUrl.searchParams.delete(PREVIEW_SOURCE_QUERY);
+      const upstream = request(target, {
+        path: `${incomingUrl.pathname}${incomingUrl.search}`,
+        method: incoming.method,
+        headers: {
+          ...upstreamHeaders(incoming),
+          "accept-encoding": "identity",
+        },
+      });
+      upstreamRequests.add(upstream);
+      upstream.once("close", () => upstreamRequests.delete(upstream));
+      incoming.once("aborted", () => upstream.destroy());
+      outgoing.once("close", () => {
+        if (!outgoing.writableFinished) upstream.destroy();
+      });
+      upstream.on("error", (error) => {
+        if (closed) return;
+        report(document, incoming.url ?? "/", {
+          kind: "load",
+          message: `The preview server could not be reached: ${error.message}`,
+        });
+        if (!outgoing.headersSent)
+          outgoing.writeHead(502, { "content-type": "text/plain" });
+        outgoing.end("The preview server could not be reached.");
+      });
+      upstream.on("response", (response) => {
+        response.on("error", () => outgoing.destroy());
+        const status = response.statusCode ?? 502;
+        const contentType = String(response.headers["content-type"] ?? "");
+        const destination = incoming.headers["sec-fetch-dest"];
+        if (response.headers.location) {
+          try {
+            const redirect = new URL(response.headers.location, target);
+            if (redirect.origin === target.origin) {
+              if (
+                !destination ||
+                destination === "document" ||
+                destination === "iframe"
+              ) {
+                const client = incomingUrlClient(
+                  incoming.url,
+                  incoming.headers.referer,
+                  target,
+                );
+                if (client) {
+                  redirect.searchParams.set(PREVIEW_CLIENT_QUERY, client);
+                  redirect.searchParams.set(
+                    PREVIEW_SOURCE_QUERY,
+                    new URL(incoming.url ?? "/", target).searchParams.get(
+                      PREVIEW_SOURCE_QUERY,
+                    ) ??
+                      documents.get(document)?.source ??
+                      "external",
+                  );
+                }
+              }
+              response.headers.location = `${origin}${redirect.pathname}${redirect.search}${redirect.hash}`;
+            }
+          } catch {
+            /* Preserve invalid redirects as project responses. */
+          }
+        }
+        const moduleRequest =
+          destination === "script" ||
+          /\.(?:[cm]?[jt]sx?|css)(?:\?|$)/i.test(incoming.url ?? "");
+        if (
+          !moduleRequest &&
+          incoming.method === "GET" &&
+          contentType.includes("text/html") &&
+          (!destination ||
+            destination === "document" ||
+            destination === "iframe")
+        ) {
+          const previous = documents.get(document);
+          const client =
+            incomingUrlClient(incoming.url, incoming.headers.referer, target) ??
+            previous?.client ??
+            "default";
+          const querySource = new URL(
+            incoming.url ?? "/",
+            target,
+          ).searchParams.get(PREVIEW_SOURCE_QUERY);
+          const source: PreviewPageSource =
+            querySource === "editor" ||
+            querySource === "player" ||
+            querySource === "playtest" ||
+            querySource === "external"
+              ? querySource
+              : (previous?.source ?? "external");
+          const old = clients.get(client);
+          if (old !== undefined) {
+            clearDiagnostics(old);
+            closeReloadStream(old);
+            options.onActivity?.(String(old), false);
+          }
+          document = ++documentId;
+          documents.set(document, {
+            client,
+            source,
+            path: previewPagePath(incoming.url ?? "/"),
+            playtest: querySource === "playtest" || (previous?.client === client && previous.playtest),
+          });
+          clients.set(client, document);
+          options.onActivity?.(String(document), true);
+          while (documents.size > 64) {
+            const oldest = documents.keys().next().value!;
+            const oldContext = documents.get(oldest)!;
+            clearDiagnostics(oldest);
+            closeReloadStream(oldest);
+            if (clients.get(oldContext.client) === oldest)
+              clients.delete(oldContext.client);
+            options.onActivity?.(String(oldest), false);
+            documents.delete(oldest);
+          }
+        }
+        resources.set(requestedPath, document);
+        if (resources.size > 512)
+          resources.delete(resources.keys().next().value!);
+        const html =
+          contentType.includes("text/html") &&
+          incoming.method !== "HEAD" &&
+          !response.headers["content-encoding"];
+        const failedModule = status >= 500 && (html || moduleRequest);
+        if (!html && !failedModule) {
+          if (status < 400) report(document, incoming.url ?? "/");
+          outgoing.writeHead(status, response.headers);
+          response.pipe(outgoing);
+          return;
+        }
+        // Scene HTML a story page fetches is part of the page, not a page of its own.
+        const scene = options.story && destination === "empty"
+          ? SCENE_HTML_PATH.exec(decodeURIComponent(new URL(incoming.url ?? "/", target).pathname))?.[1]
+          : undefined;
+        void relayBuffered(
+          incoming,
+          outgoing,
+          response,
+          html,
+          failedModule,
+          document,
+          (diagnostic) => report(document, incoming.url ?? "/", diagnostic),
+          scene ? { scene } : options.story ? { bridge: true } : undefined,
+        ).catch((error) => {
+          report(document, incoming.url ?? "/", {
+            kind: "load",
+            message: `The preview response failed: ${error.message}`,
+          });
+          outgoing.destroy();
+        });
+      });
+      incoming.pipe(upstream);
+    } catch {
+      incoming.resume();
+      outgoing.writeHead(400).end("Invalid preview request.");
+    }
+  });
+  server.on("connection", (socket) => {
+    sockets.add(socket);
+    socket.once("close", () => sockets.delete(socket));
+  });
+  // Vite and other development servers retain their own WebSocket protocols.
+  server.on("upgrade", (incoming, socket, head) => {
+    try {
+      const upstream = request(target, {
+        path: incoming.url,
+        headers: upstreamHeaders(incoming),
+      });
+      upstreamRequests.add(upstream);
+      upstream.once("close", () => upstreamRequests.delete(upstream));
+      upstream.on("error", () => socket.destroy());
+      socket.on("error", () => upstream.destroy());
+      socket.once("close", () => upstream.destroy());
+      upstream.on("response", () => socket.destroy());
+      upstream.on("upgrade", (response, upstreamSocket, upstreamHead) => {
+        sockets.add(upstreamSocket);
+        upstreamSocket.once("close", () => {
+          sockets.delete(upstreamSocket);
+          socket.destroy();
+        });
+        upstreamSocket.on("error", () => socket.destroy());
+        socket.once("close", () => upstreamSocket.destroy());
+        socket.write(
+          `HTTP/1.1 ${response.statusCode} ${response.statusMessage}\r\n${Object.entries(
+            response.headers,
+          )
+            .flatMap(([name, values]) =>
+              (Array.isArray(values) ? values : [values]).map(
+                (value) => `${name}: ${value}\r\n`,
+              ),
+            )
+            .join("")}\r\n`,
+        );
+        if (head.length) upstreamSocket.write(head);
+        if (upstreamHead.length) socket.write(upstreamHead);
+        socket.pipe(upstreamSocket).pipe(socket);
+      });
+      upstream.end();
+    } catch {
+      socket.destroy();
+    }
+  });
+  const listen = (port: number) =>
+    new Promise<void>((resolve, reject) => {
+      const fail = (cause: Error) => {
+        server.removeListener("listening", ready);
+        reject(cause);
+      };
+      const ready = () => {
+        server.removeListener("error", fail);
+        resolve();
+      };
+      server.once("error", fail);
+      server.once("listening", ready);
+      server.listen(port, "127.0.0.1");
+    });
+  try {
+    await listen(options.port ?? 0);
+  } catch (cause) {
+    if (!options.port || (cause as NodeJS.ErrnoException).code !== "EADDRINUSE")
+      throw cause;
+    await listen(0);
+  }
+  // Consume subsequent errors too; a proxy failure must never kill the daemon.
+  server.on("error", (error) => {
+    if (!closed) onDiagnostic({ kind: "load", message: error.message });
+  });
+  const address = server.address();
+  if (!address || typeof address === "string")
+    throw new Error("Could not allocate preview proxy port");
+  origin = `http://127.0.0.1:${address.port}`;
+  return {
+    url: origin,
+    setPicking: (client, active) => {
+      if (active) picking.add(client);
+      else picking.delete(client);
+      const document = clients.get(client);
+      const stream = document === undefined ? undefined : reloadStreams.get(document);
+      stream?.write(`data: ${JSON.stringify({ reload: reloadRevision, pick: active })}\n\n`);
+    },
+    setTuning: (values) => {
+      if (JSON.stringify(values) === JSON.stringify(tuning)) return;
+      tuning = values;
+      for (const [document, stream] of reloadStreams)
+        if (!documents.get(document)?.playtest)
+          stream.write(`data: ${JSON.stringify({ reload: reloadRevision, tuning })}\n\n`);
+    },
+    setInputMap: (map) => {
+      const next = map ?? null;
+      if (JSON.stringify(next) === JSON.stringify(inputMap)) return;
+      inputMap = next;
+      for (const [document, stream] of reloadStreams)
+        if (!documents.get(document)?.playtest)
+          stream.write(`data: ${JSON.stringify({ reload: reloadRevision, inputMap })}\n\n`);
+    },
+    reload: () => {
+      reloadRevision += 1;
+      for (const stream of reloadStreams.values())
+        stream.write(`data: ${JSON.stringify({ reload: reloadRevision })}\n\n`);
+    },
+    async close() {
+      if (closed) return;
+      closed = true;
+      for (const document of reloadStreams.keys()) closeReloadStream(document);
+      for (const document of documents.keys())
+        options.onActivity?.(String(document), false);
+      for (const upstream of upstreamRequests) upstream.destroy();
+      for (const socket of sockets) socket.destroy();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    },
+  };
+}
+
+async function relayBuffered(
+  incoming: IncomingMessage,
+  outgoing: ServerResponse,
+  response: IncomingMessage,
+  html: boolean,
+  failedModule: boolean,
+  document: number,
+  report: (diagnostic?: PreviewDiagnostic) => void,
+  story?: { scene?: string; bridge?: true },
+): Promise<void> {
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of response) {
+    const buffer = Buffer.from(chunk);
+    size += buffer.length;
+    chunks.push(buffer);
+    if (size > MAX_HTML_BYTES) {
+      // Large pages keep streaming and retain their original representation.
+      outgoing.writeHead(response.statusCode ?? 502, response.headers);
+      for (const buffered of chunks) outgoing.write(buffered);
+      for await (const remaining of response) outgoing.write(remaining);
+      outgoing.end();
+      return;
+    }
+  }
+  const bytes = Buffer.concat(chunks);
+  let body = bytes.toString("utf8");
+  if (failedModule)
+    report({
+      kind: "compile",
+      message: compilationMessage(body, incoming.url ?? "/"),
+    });
+  else if ((response.statusCode ?? 502) < 400) report();
+  const headers = { ...response.headers };
+  if (html && story?.scene) {
+    body = annotatePlayableSourceLocations(body, story.scene);
+    delete headers["content-length"];
+    delete headers.etag;
+    headers["cache-control"] = "no-store";
+  } else if (html) {
+    const nonce = body.match(/<script[^>]+nonce=("[^"]*"|'[^']*')/i)?.[1];
+    const bridge = `<script ${nonce ? `nonce=${nonce} ` : ""}src="${BRIDGE_PATH}?document=${document}"></script>`
+      + (story?.bridge ? `<script ${nonce ? `nonce=${nonce} ` : ""}src="${STORY_BRIDGE_PATH}"></script>` : "");
+    body = /<head(?:\s[^>]*)?>/i.test(body)
+      ? body.replace(/<head(?:\s[^>]*)?>/i, (head) => `${head}${bridge}`)
+      : `${bridge}${body}`;
+    delete headers["content-length"];
+    delete headers.etag;
+    headers["cache-control"] = "no-store";
+  }
+  outgoing.writeHead(response.statusCode ?? 502, headers);
+  outgoing.end(html ? body : bytes);
+}
+
+function compilationMessage(body: string, pathname: string): string {
+  // Vite serializes the original diagnostic into its error page.
+  const serialized = body.match(/\bconst error = (\{[^\r\n]+\})/);
+  try {
+    const error = JSON.parse(serialized?.[1] ?? body) as {
+      message?: string;
+      frame?: string;
+      stack?: string;
+    };
+    if (typeof error.message === "string")
+      return [error.message, error.frame]
+        .filter(Boolean)
+        .join("\n\n")
+        .slice(0, MAX_PREVIEW_DIAGNOSTIC_LENGTH);
+  } catch {}
+  return `The preview could not compile ${pathname}. Check the preview's error details and project code.`;
+}
+
+type BridgeMessage = {
+  type: "heartbeat" | "resume" | "navigation" | "close" | "diagnostic" | "source" | "pick" | "tuning";
+  source?: "editor" | "player";
+  path?: string;
+  diagnostic?: PreviewDiagnostic | null;
+  pick?: PreviewPick | null;
+};
+async function receiveBridgeMessage(
+  incoming: IncomingMessage,
+): Promise<BridgeMessage> {
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of incoming) {
+    size += chunk.length;
+    if (size > MAX_PREVIEW_DIAGNOSTIC_LENGTH * 6 + 2_256)
+      throw new Error("Preview report is too large");
+    chunks.push(Buffer.from(chunk));
+  }
+  const value = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  if (
+    !value ||
+    !["heartbeat", "resume", "navigation", "close", "diagnostic", "source", "pick", "tuning"].includes(
+      value.type,
+    )
+  )
+    throw new Error("Invalid preview message");
+  const pick = value.type === "pick" ? previewPick(value.pick, value.path) : undefined;
+  if (value.type === "pick" && pick === undefined) throw new Error("Invalid preview pick");
+  if (value.type === "source" && value.source !== "editor" && value.source !== "player") throw new Error("Invalid preview source");
+  const diagnostic =
+    value.diagnostic === null ? null : previewDiagnostic(value.diagnostic);
+  if (value.diagnostic !== undefined && diagnostic === undefined)
+    throw new Error("Invalid preview diagnostic");
+  return {
+    type: value.type,
+    source: value.type === "source" ? value.source : undefined,
+    path:
+      typeof value.path === "string" ? value.path.slice(0, 2_000) : undefined,
+    diagnostic,
+    ...(pick !== undefined ? { pick } : {}),
+  };
+}
+
+/** A pick as the bridge sent it, bounded; null when picking was cancelled. */
+function previewPick(value: unknown, path: unknown): PreviewPick | null | undefined {
+  if (value === null) return null;
+  if (!value || typeof value !== "object") return undefined;
+  const item = value as Record<string, unknown>;
+  const box = item.box as Record<string, unknown> | undefined;
+  const number = (field: unknown) => typeof field === "number" && Number.isFinite(field) ? Math.round(field) : undefined;
+  const x = number(box?.x), y = number(box?.y), width = number(box?.width), height = number(box?.height);
+  if (typeof item.tag !== "string" || !/^[a-z][a-z0-9-]{0,40}$/.test(item.tag) || typeof item.selector !== "string" || !item.selector
+    || x === undefined || y === undefined || width === undefined || height === undefined) return undefined;
+  const text = typeof item.text === "string" ? item.text.replace(/\s+/g, " ").trim().slice(0, 120) : "";
+  return {
+    tag: item.tag,
+    ...(text ? { text } : {}),
+    selector: item.selector.slice(0, 500),
+    box: { x, y, width, height },
+    path: typeof path === "string" ? previewPagePath(path.slice(0, 2_000)) : "/",
+  };
+}
+
+function incomingUrlClient(
+  value: string | undefined,
+  referer: string | undefined,
+  base: URL,
+): string | undefined {
+  const client =
+    new URL(value ?? "/", base).searchParams.get(PREVIEW_CLIENT_QUERY) ??
+    (referer
+      ? new URL(referer, base).searchParams.get(PREVIEW_CLIENT_QUERY)
+      : undefined);
+  return client && /^[a-zA-Z0-9-]{1,100}$/.test(client) ? client : undefined;
+}
+
+export function previewBridgeScript(
+  documentId: number,
+  context?: { client: string; source: PreviewPageSource },
+): string {
+  return `
+(() => {
+const limit = ${MAX_PREVIEW_DIAGNOSTIC_LENGTH};
+const endpoint = ${JSON.stringify(`${BRIDGE_PATH}?document=${documentId}`)};
+const context = ${JSON.stringify(context ?? { client: "default", source: "external" })};
+let pending = Promise.resolve();
+let revision;
+const path = () => {
+  const url = new URL(location.href);
+  url.searchParams.delete(${JSON.stringify(PREVIEW_CLIENT_QUERY)});
+  url.searchParams.delete(${JSON.stringify(PREVIEW_SOURCE_QUERY)});
+  url.searchParams.delete('ohmygamePlaytest');
+  return url.pathname + url.search + url.hash;
+};
+const send = (message) => {
+  pending = pending.then(async () => {
+    const response = await fetch(endpoint, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ...message, path: path() }) });
+    if (!response.ok) return;
+    const state = await response.json();
+    if (revision !== undefined && revision !== state.reload) location.reload();
+    revision = state.reload;
+  }).catch(() => {});
+  return pending;
+};
+const preserveContext = (url) => {
+  const next = new URL(url || location.href, location.href);
+  if (context.client !== 'default' && next.origin === location.origin) {
+    next.searchParams.set(${JSON.stringify(PREVIEW_CLIENT_QUERY)}, context.client);
+    next.searchParams.set(${JSON.stringify(PREVIEW_SOURCE_QUERY)}, context.source);
+  }
+  return next.href;
+};
+const replaceState = history.replaceState.bind(history);
+for (const method of ['pushState', 'replaceState']) {
+  const original = history[method];
+  history[method] = function(state, unused, url) {
+    const result = original.call(this, state, unused, preserveContext(url));
+    send({ type: 'navigation' });
+    return result;
+  };
+}
+history.replaceState(history.state, '', preserveContext(location.href));
+window.addEventListener('ohmygame:preview-source', (event) => {
+  if (!['editor', 'player'].includes(event.detail) || context.source === event.detail) return;
+  context.source = event.detail;
+  replaceState(history.state, '', preserveContext(location.href));
+  send({ type: 'source', source: context.source });
+});
+window.addEventListener('popstate', () => send({ type: 'navigation' }));
+window.addEventListener('hashchange', () => send({ type: 'navigation' }));
+window.addEventListener('pageshow', () => { void send({ type: 'resume' }).then(connectReload); });
+window.addEventListener('pagehide', () => navigator.sendBeacon(endpoint, JSON.stringify({ type: 'close' })));
+setInterval(() => send({ type: 'heartbeat' }), 20_000);
+send({ type: 'heartbeat' });
+// Picking: the next click names an element for the agent instead of reaching the game.
+let picking = false;
+let outline;
+const pickTarget = (event) => {
+  const target = event.composedPath ? event.composedPath()[0] : event.target;
+  return target instanceof Element && target !== document.documentElement && target !== document.body ? target : undefined;
+};
+const selectorOf = (element) => {
+  const parts = [];
+  for (let node = element; node && node !== document.documentElement && parts.length < 5; node = node.parentElement) {
+    if (node.id) { parts.unshift('#' + CSS.escape(node.id)); break; }
+    let part = node.tagName.toLowerCase();
+    const classes = [...node.classList].slice(0, 2);
+    if (classes.length) part += classes.map((name) => '.' + CSS.escape(name)).join('');
+    const siblings = node.parentElement ? [...node.parentElement.children].filter((child) => child.tagName === node.tagName) : [];
+    if (siblings.length > 1) part += ':nth-of-type(' + (siblings.indexOf(node) + 1) + ')';
+    parts.unshift(part);
+  }
+  return parts.join(' > ');
+};
+const describe = (element) => {
+  const bounds = element.getBoundingClientRect();
+  const label = element.getAttribute('aria-label') || element.getAttribute('alt') || element.getAttribute('title') || element.textContent || '';
+  return { tag: element.tagName.toLowerCase(), text: label.replace(/\\s+/g, ' ').trim().slice(0, 120), selector: selectorOf(element), box: { x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height } };
+};
+const showOutline = (element) => {
+  if (!outline) {
+    outline = document.createElement('div');
+    outline.style.cssText = 'position:fixed;z-index:2147483647;pointer-events:none;border:2px solid #7c8cff;border-radius:3px;background:rgba(124,140,255,.12);transition:all 60ms ease-out';
+  }
+  if (!element) { outline.remove(); return; }
+  const bounds = element.getBoundingClientRect();
+  Object.assign(outline.style, { left: bounds.x - 2 + 'px', top: bounds.y - 2 + 'px', width: bounds.width + 4 + 'px', height: bounds.height + 4 + 'px' });
+  if (!outline.isConnected) document.documentElement.append(outline);
+};
+const swallow = (event) => { event.preventDefault(); event.stopImmediatePropagation(); };
+const onPickOver = (event) => showOutline(pickTarget(event));
+const onPickClick = (event) => {
+  swallow(event);
+  const target = pickTarget(event);
+  setPicking(false);
+  send({ type: 'pick', pick: target ? describe(target) : null });
+};
+const onPickKey = (event) => {
+  if (event.key !== 'Escape') return;
+  swallow(event);
+  setPicking(false);
+  send({ type: 'pick', pick: null });
+};
+const blocked = ['pointerdown', 'pointerup', 'mousedown', 'mouseup', 'touchstart', 'touchend', 'contextmenu'];
+const setPicking = (active) => {
+  if (active === picking) return;
+  picking = active;
+  const method = active ? 'addEventListener' : 'removeEventListener';
+  window[method]('pointermove', onPickOver, true);
+  window[method]('click', onPickClick, true);
+  window[method]('keydown', onPickKey, true);
+  for (const type of blocked) window[method](type, swallow, true);
+  document.documentElement.style.cursor = active ? 'crosshair' : '';
+  if (!active) showOutline(undefined);
+};
+// The game's own setter, which may appear long after the page loads or be
+// replaced when the game restarts itself. Only ids and values reach it.
+const tuningWanted = new Map();
+let tuningApplied = new Map();
+let tuningGame;
+let tuningSetter;
+let tuningReported = false;
+let tuningTimer;
+const applyTuning = () => {
+  const game = window.__OHMYGAME_TUNING__;
+  if (!game || typeof game.set !== 'function') return;
+  if (game !== tuningGame || game.set !== tuningSetter) { tuningGame = game; tuningSetter = game.set; tuningApplied = new Map(); }
+  if (!tuningReported) { tuningReported = true; send({ type: 'tuning' }); }
+  for (const [id, value] of tuningWanted) {
+    if (tuningApplied.get(id) === value) continue;
+    tuningApplied.set(id, value);
+    try { game.set(id, value); } catch (error) {
+      send({ type: 'diagnostic', diagnostic: { kind: 'runtime', message: text(error) } });
+    }
+  }
+};
+const wantTuning = (values) => {
+  tuningWanted.clear();
+  for (const [id, value] of Object.entries(values)) tuningWanted.set(id, value);
+  applyTuning();
+  if (!tuningTimer && tuningWanted.size) tuningTimer = setInterval(applyTuning, 500);
+};
+// A plugin's gamepad map presses keys for a game that only reads the
+// keyboard: only while the page has focus, and every key goes on blur, on
+// disconnect and when the map changes. A game that reads the pad itself gets
+// it as it is, and the map stops, so no input arrives twice.
+const readPads = navigator.getGamepads ? navigator.getGamepads.bind(navigator) : undefined;
+let padMap;
+let padFrame;
+let gameReadsPads = false;
+const heldKeys = new Set();
+const KEY_CODES = { Space: 32, Enter: 13, Escape: 27, Tab: 9, Backspace: 8, ArrowLeft: 37, ArrowUp: 38, ArrowRight: 39, ArrowDown: 40, ShiftLeft: 16, ShiftRight: 16, ControlLeft: 17, ControlRight: 17, AltLeft: 18, AltRight: 18 };
+const keyOf = (code) => {
+  if (code.startsWith('Key')) return [code.slice(3).toLowerCase(), code.charCodeAt(3)];
+  if (code.startsWith('Digit')) return [code.slice(5), code.charCodeAt(5)];
+  if (/^F[0-9]+$/.test(code)) return [code, 111 + Number(code.slice(1))];
+  if (code === 'Space') return [' ', 32];
+  const modifier = code.startsWith('Arrow') ? code : code.replace(/(Left|Right)$/, '');
+  return [modifier, KEY_CODES[code]];
+};
+const pressKey = (code, down) => {
+  const [key, keyCode] = keyOf(code);
+  const side = code.startsWith('Arrow') ? 0 : code.endsWith('Left') ? 1 : code.endsWith('Right') ? 2 : 0;
+  const held = (name) => [...heldKeys].some((item) => item.startsWith(name));
+  const event = new KeyboardEvent(down ? 'keydown' : 'keyup', { code, key, location: side, shiftKey: held('Shift'), ctrlKey: held('Control'), altKey: held('Alt'), bubbles: true, cancelable: true, composed: true });
+  // Older games read keyCode, which the constructor can't set.
+  for (const name of ['keyCode', 'which']) Object.defineProperty(event, name, { get: () => keyCode });
+  (document.activeElement || document.body || document.documentElement).dispatchEvent(event);
+};
+const releaseKeys = () => {
+  for (const code of heldKeys) pressKey(code, false);
+  heldKeys.clear();
+};
+if (readPads) navigator.getGamepads = function () {
+  if (!gameReadsPads) {
+    gameReadsPads = true;
+    releaseKeys();
+    if (padMap) console.info('OhMyGame: this game reads the gamepad itself, so the input map is off.');
+  }
+  return readPads();
+};
+const pollPad = () => {
+  padFrame = undefined;
+  if (!padMap || gameReadsPads) return;
+  const pad = document.hasFocus() ? [...readPads()].find((item) => item && item.connected && item.mapping === 'standard') : undefined;
+  const wanted = new Set();
+  if (pad) {
+    for (const [index, code] of padMap.buttons) if (pad.buttons[index] && pad.buttons[index].pressed) wanted.add(code);
+    for (const [axis, direction, code] of padMap.axes) if ((pad.axes[axis] || 0) * direction > padMap.deadZone) wanted.add(code);
+  }
+  for (const code of [...heldKeys]) if (!wanted.has(code)) { heldKeys.delete(code); pressKey(code, false); }
+  // Modifiers go down first, so the keys pressed with them carry them.
+  const modifier = (code) => /^(Shift|Control|Alt)/.test(code) ? 0 : 1;
+  for (const code of [...wanted].sort((a, b) => modifier(a) - modifier(b))) if (!heldKeys.has(code)) { heldKeys.add(code); pressKey(code, true); }
+  padFrame = requestAnimationFrame(pollPad);
+};
+const usePadMap = (map) => {
+  releaseKeys();
+  padMap = readPads && map ? map : undefined;
+  if (padMap && padFrame === undefined) padFrame = requestAnimationFrame(pollPad);
+};
+window.addEventListener('blur', releaseKeys);
+window.addEventListener('gamepaddisconnected', releaseKeys);
+let reloadEvents;
+const connectReload = () => {
+  if (reloadEvents && reloadEvents.readyState !== EventSource.CLOSED) return;
+  reloadEvents = new EventSource(endpoint + '&events=1');
+  // The daemon forgets who listens when the stream drops, so say it again.
+  reloadEvents.onopen = () => { tuningReported = false; };
+  reloadEvents.onmessage = (event) => {
+    const state = JSON.parse(event.data);
+    if (revision !== undefined && revision !== state.reload) location.reload();
+    revision = state.reload;
+    if (typeof state.pick === 'boolean') setPicking(state.pick);
+    if (state.tuning) wantTuning(state.tuning);
+    if (state.inputMap !== undefined) usePadMap(state.inputMap);
+  };
+};
+connectReload();
+window.addEventListener('pagehide', () => reloadEvents?.close());
+const text = (error) => String(error?.stack || error?.message || error || 'Unknown preview error').slice(0, limit);
+window.addEventListener('error', (event) => {
+  if (event.message) send({ type: 'diagnostic', diagnostic: { kind: 'runtime', message: text(event.error || event.message) } });
+}, true);
+window.addEventListener('unhandledrejection', (event) => send({ type: 'diagnostic', diagnostic: { kind: 'runtime', message: text(event.reason) } }));
+const connectVite = () => {
+if (document.querySelector('script[src*="/@vite/client"]')) {
+  import('/@vite/client').then(({ createHotContext }) => {
+    const hot = createHotContext(${JSON.stringify(BRIDGE_PATH)});
+    hot.on('vite:error', (event) => send({ type: 'diagnostic', diagnostic: { kind: 'compile', message: text(event.err) } }));
+    hot.on('vite:afterUpdate', () => send({ type: 'diagnostic', diagnostic: null }));
+  }).catch(() => {});
+}
+};
+if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', connectVite, { once: true }); else connectVite();
+})();
+`;
+}

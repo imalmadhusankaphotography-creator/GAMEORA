@@ -1,0 +1,392 @@
+import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { Type, type TSchema } from "typebox";
+import { Check } from "typebox/value";
+import {
+  ACT_TOGETHER_MAX_PLAYERS,
+  ACT_TOGETHER_MAX_SAMPLE_MS,
+  ACT_TOGETHER_MAX_SAMPLES,
+  ACT_TOGETHER_MIN_PLAYERS,
+  GAME_USE_OPERATIONS,
+  MAX_CAPTURE_FRAME,
+  supportsGameUseOperation,
+  type GameRuntimeAdapter,
+  type GameUseInputCapability,
+  type GameUseObservationCapability,
+  type GameUseOpenTarget,
+  type GameUseOperation,
+  type GameUseSnapshot,
+  type PlaytestAction,
+  type PlaytestCapture,
+  type PlaytestPlayerActions,
+  type PlaytestSnapshot,
+  type PlaytestStateSample,
+  type PlaytestTogetherTiming,
+} from "../shared/playtest.js";
+
+const viewportSchema = Type.Object({
+  width: Type.Integer({ minimum: 240, maximum: 4096 }),
+  height: Type.Integer({ minimum: 240, maximum: 4096 }),
+}, { additionalProperties: false });
+
+export const targetSchema = Type.Union([
+  Type.Object({ selector: Type.String({ minLength: 1, maxLength: 500 }) }, { additionalProperties: false }),
+  Type.Object({ testId: Type.String({ minLength: 1, maxLength: 200 }) }, { additionalProperties: false }),
+  Type.Object({ text: Type.String({ minLength: 1, maxLength: 300 }) }, { additionalProperties: false }),
+  Type.Object({
+    role: Type.String({ minLength: 1, maxLength: 100 }),
+    name: Type.Optional(Type.String({ minLength: 1, maxLength: 300 })),
+  }, { additionalProperties: false }),
+  Type.Object({
+    x: Type.Number({ minimum: 0, maximum: 8192 }),
+    y: Type.Number({ minimum: 0, maximum: 8192 }),
+  }, { additionalProperties: false }),
+]);
+
+export const semanticTargetSchema = Type.Union([
+  Type.Object({ selector: Type.String({ minLength: 1, maxLength: 500 }) }, { additionalProperties: false }),
+  Type.Object({ testId: Type.String({ minLength: 1, maxLength: 200 }) }, { additionalProperties: false }),
+  Type.Object({ text: Type.String({ minLength: 1, maxLength: 300 }) }, { additionalProperties: false }),
+  Type.Object({
+    role: Type.String({ minLength: 1, maxLength: 100 }),
+    name: Type.Optional(Type.String({ minLength: 1, maxLength: 300 })),
+  }, { additionalProperties: false }),
+]);
+
+const resetBridgeAction = Type.Object({ type: Type.Literal("bridge"), method: Type.Literal("reset") }, { additionalProperties: false });
+const valueBridgeAction = Type.Object({ type: Type.Literal("bridge"), method: Type.Union([Type.Literal("setSeed"), Type.Literal("step")]), value: Type.Number() }, { additionalProperties: false });
+
+const clickAction = Type.Object({ type: Type.Literal("click"), target: targetSchema }, { additionalProperties: false });
+/** A runtime without page elements clicks at a point. */
+const pointClickAction = Type.Object({
+  type: Type.Literal("click"),
+  target: Type.Object({ x: Type.Number({ minimum: 0, maximum: 8192 }), y: Type.Number({ minimum: 0, maximum: 8192 }) }, { additionalProperties: false }),
+}, { additionalProperties: false });
+
+const inputActions = [
+  clickAction,
+  Type.Object({ type: Type.Literal("type"), target: semanticTargetSchema, text: Type.String({ maxLength: 10_000 }) }, { additionalProperties: false }),
+  Type.Object({
+    type: Type.Literal("press"),
+    key: Type.String({ minLength: 1, maxLength: 40 }),
+    duration: Type.Optional(Type.Integer({ minimum: 0, maximum: 5_000, description: "How long to hold the key before releasing it, in milliseconds" })),
+  }, { additionalProperties: false }),
+  Type.Object({ type: Type.Literal("touch"), x: Type.Number({ minimum: 0, maximum: 8192 }), y: Type.Number({ minimum: 0, maximum: 8192 }) }, { additionalProperties: false }),
+  Type.Object({ type: Type.Literal("wait"), milliseconds: Type.Integer({ minimum: 0, maximum: 5_000 }) }, { additionalProperties: false }),
+  Type.Object({ type: Type.Literal("resize"), viewport: viewportSchema }, { additionalProperties: false }),
+] as const;
+
+const actionSchema = Type.Union([...inputActions, resetBridgeAction, valueBridgeAction]);
+
+/** Every operation but captureFrame, which only a plugin's runtime has: the web runtime's tool as before. */
+const WEB_OPERATIONS = GAME_USE_OPERATIONS.filter((operation) => operation !== "captureFrame");
+
+/** The tool's input as the code reads it: every field any runtime's schema has. */
+const fullParameters = Type.Object({
+  operation: Type.Union(GAME_USE_OPERATIONS.map((operation) => Type.Literal(operation)) as [ReturnType<typeof Type.Literal<GameUseOperation>>]),
+  path: Type.Optional(Type.String()),
+  viewport: Type.Optional(viewportSchema),
+  sessionId: Type.Optional(Type.String()),
+  actions: Type.Optional(Type.Array(actionSchema)),
+  players: Type.Optional(Type.Array(Type.Object({ sessionId: Type.String(), actions: Type.Array(actionSchema) }))),
+  samples: Type.Optional(Type.Array(Type.Integer())),
+  frame: Type.Optional(Type.Integer()),
+});
+type GameUseToolInput = typeof fullParameters;
+
+const parameters = gameUseParameters(actionSchema, WEB_OPERATIONS, { path: true });
+
+/**
+ * The Playable Nodes player's bridge only resets, so its agent is not offered
+ * setSeed or step; a web game may implement all of them.
+ */
+const resetOnlyParameters = gameUseParameters(Type.Union([...inputActions, resetBridgeAction]), WEB_OPERATIONS, { path: true });
+
+/** What an outside agent's catalog lists: every operation any runtime has, checked again when called. */
+const catalogParameters = gameUseParameters(actionSchema, GAME_USE_OPERATIONS, { path: true, frame: MAX_CAPTURE_FRAME });
+
+function gameUseParameters(
+  action: TSchema,
+  operations: readonly GameUseOperation[],
+  { path, frame }: { path?: boolean; frame?: number } = {},
+): GameUseToolInput {
+  return Type.Object({
+    operation: Type.Union(operations.map((operation) => Type.Literal(operation))),
+    ...(path ? { path: Type.Optional(Type.String({ maxLength: 1_000, description: "Path, query, or hash within a web game target; used only by open" })) } : {}),
+    viewport: Type.Optional(viewportSchema),
+    sessionId: Type.Optional(Type.String({ minLength: 1, maxLength: 100, description: "Session returned by open; required for every operation but open and actTogether" })),
+    ...(operations.includes("act") ? { actions: Type.Optional(Type.Array(action, { minItems: 1, maxItems: 20, description: "Actions to run; required for act" })) } : {}),
+    ...(operations.includes("actTogether") ? {
+      players: Type.Optional(Type.Array(Type.Object({
+        sessionId: Type.String({ minLength: 1, maxLength: 100 }),
+        actions: Type.Array(action, { minItems: 1, maxItems: 20 }),
+      }, { additionalProperties: false }), {
+        minItems: ACT_TOGETHER_MIN_PLAYERS,
+        maxItems: ACT_TOGETHER_MAX_PLAYERS,
+        description: "One entry per player, each its own open session; their actions all start at once. Required for actTogether",
+      })),
+      samples: Type.Optional(Type.Array(Type.Integer({ minimum: 0, maximum: ACT_TOGETHER_MAX_SAMPLE_MS }), {
+        maxItems: ACT_TOGETHER_MAX_SAMPLES,
+        description: "For actTogether: increasing milliseconds after the start at which to read every session's game state from __OHMYGAME_PLAYTEST__.snapshot(), while the players act",
+      })),
+    } : {}),
+    ...(frame ? { frame: Type.Optional(Type.Integer({ minimum: 1, maximum: frame, description: "The frame captureFrame runs the game to from its start; required for captureFrame" })) } : {}),
+  }, { additionalProperties: false }) as unknown as GameUseToolInput;
+}
+
+/**
+ * The tool's input for a plugin's runtime: only the operations and input it
+ * declares, clicks at a point, and no bridge.
+ */
+function pluginParameters(driver: GameRuntimeAdapter, maxFrame: number | undefined) {
+  const operations = GAME_USE_OPERATIONS.filter((operation) => supportsGameUseOperation(driver.capabilities, operation));
+  const input = driver.capabilities.input;
+  const actions = [
+    ...(input.includes("pointer") ? [pointClickAction] : []),
+    ...inputActions.slice(2).filter((action) => {
+      const type = (action.properties.type as { const?: string }).const;
+      return type === "wait" || (type === "press" && input.includes("keyboard")) || (type === "touch" && input.includes("touch")) || (type === "resize" && input.includes("resize"));
+    }),
+  ];
+  return gameUseParameters(Type.Union(actions), operations, { frame: operations.includes("captureFrame") ? maxFrame ?? 1 : undefined });
+}
+
+export function createGameUseTool(
+  driver: GameRuntimeAdapter,
+  resolveOpenTarget: (signal?: AbortSignal) => Promise<GameUseOpenTarget>,
+  {
+    bridge = "full",
+    catalog = false,
+    maxFrame,
+  }: {
+    bridge?: "full" | "reset";
+    /** List every operation any runtime has, as an outside agent's catalog does. */
+    catalog?: boolean;
+    /** The highest frame a plugin's captureFrame takes. */
+    maxFrame?: number;
+  } = {},
+): ToolDefinition<GameUseToolInput> {
+  const plugin = driver.capabilities.runtime === "plugin";
+  const frames = plugin && supportsGameUseOperation(driver.capabilities, "captureFrame");
+  return defineTool<GameUseToolInput, unknown>({
+    name: "game_use",
+    label: "Game Use",
+    description: plugin
+      ? `Use the current game, which its engine's plugin runs outside OhMyGame: open a session${frames ? ", capture a frame of a fresh run" : ""}${supportsGameUseOperation(driver.capabilities, "capture") ? ", capture the current frame" : ""}${supportsGameUseOperation(driver.capabilities, "act") ? ", send input" : ""}, and close the session when finished. Reuse the returned sessionId.`
+      : "Use the current game runtime as a player: open and control the game, inspect interactive elements and canvas state, capture screenshots, review console and network failures, and call an optional deterministic game bridge. Open and act return a fresh state snapshot. Reuse the returned sessionId and close the session when finished.",
+    promptSnippet: plugin
+      ? "Use the current game through its engine's plugin, including screenshots"
+      : "Use the current game with real player input, runtime inspection, and screenshots",
+    promptGuidelines: plugin
+      ? [
+          "Use game_use to see the game after changing it; a successful build alone is not a playtest",
+          ...(frames ? ["captureFrame runs the game again from its start and captures that frame; it does not show what an open session shows now, and two runs may differ. Pick a frame after the game has loaded, and try a later one if the capture is blank or still loading"] : []),
+          "Close game sessions when finished",
+        ]
+      : [
+          "Use game_use for game runtime or visual verification; a successful build alone is not a playtest",
+          "Batch adjacent input and wait steps into one act call; open and act already return fresh state, so inspect only when a separate refresh is needed",
+          "For a multiplayer game, open one session per player: each is a separate browser and so a separate guest. Use actTogether to give several players input at the same time, such as moving toward each other, and samples to compare every player's game state while they move; act moves one player while the others wait",
+          "Capture screenshots for Canvas or WebGL verification and close playtest sessions when finished",
+          "Record video only when the person asks for a clip or a video of the game: recordStart, then act, then recordStop. A recording lasts at most 60 seconds, goes to the Library, and is not something you can watch, so use screenshots for your own verification",
+        ],
+    parameters: catalog ? catalogParameters : plugin ? pluginParameters(driver, maxFrame) : bridge === "reset" ? resetOnlyParameters : parameters,
+    executionMode: "sequential",
+    execute: async (_toolCallId, input, signal) => {
+      if (!driver.available) throw new Error("Game use is not available in this environment");
+      if (!supportsGameUseOperation(driver.capabilities, input.operation)) {
+        // Say what's missing, as when a runtime that supports recording has no video.
+        if (input.operation === "recordStart" || input.operation === "recordStop") requireCapability(driver, "video", "observation");
+        if (input.operation === "capture" || input.operation === "captureFrame") requireCapability(driver, "screenshot", "observation");
+        throw new Error(`This project's game runtime does not support ${input.operation}`);
+      }
+      if (input.operation === "open") {
+        const target = await resolveOpenTarget(signal);
+        signal?.throwIfAborted();
+        if (target.runtime !== driver.capabilities.runtime) {
+          throw new Error(`Game target runtime ${target.runtime} does not match adapter runtime ${driver.capabilities.runtime}`);
+        }
+        const resolvedTarget = input.path
+          ? withOpenPath(target, input.path)
+          : target;
+        const result = await driver.request({
+          operation: "open",
+          target: resolvedTarget,
+          // A plugin's game runs at its own size unless asked for another.
+          ...(input.viewport ? { viewport: input.viewport } : plugin ? {} : { viewport: { width: 1280, height: 720 } }),
+        }, signal);
+        if (result.operation !== "open") throw new Error("Unexpected game use response");
+        return snapshotResult(result.snapshot);
+      }
+      if (input.operation === "capture") {
+        requireCapability(driver, "screenshot", "observation");
+        const result = await driver.request({ operation: "capture", sessionId: requiredSessionId(input.operation, input.sessionId) }, signal);
+        if (result.operation !== "capture") throw new Error("Unexpected game use response");
+        return captureResult(result.capture);
+      }
+      if (input.operation === "captureFrame") {
+        if (input.frame === undefined) throw new Error("frame is required for captureFrame");
+        const result = await driver.request({ operation: "captureFrame", sessionId: requiredSessionId(input.operation, input.sessionId), frame: input.frame }, signal);
+        if (result.operation !== "captureFrame") throw new Error("Unexpected game use response");
+        return captureResult(result.capture);
+      }
+      if (input.operation === "recordStart") {
+        requireCapability(driver, "video", "observation");
+        const result = await driver.request({ operation: "recordStart", sessionId: requiredSessionId(input.operation, input.sessionId) }, signal);
+        if (result.operation !== "recordStart") throw new Error("Unexpected game use response");
+        return { content: [{ type: "text", text: JSON.stringify(result) }], details: undefined };
+      }
+      if (input.operation === "recordStop") {
+        requireCapability(driver, "video", "observation");
+        const result = await driver.request({ operation: "recordStop", sessionId: requiredSessionId(input.operation, input.sessionId) }, signal);
+        if (result.operation !== "recordStop") throw new Error("Unexpected game use response");
+        return { content: [{ type: "text", text: `Saved the recording to the Library: ${JSON.stringify(result.recording)}` }], details: undefined };
+      }
+      if (input.operation === "close") {
+        const sessionId = requiredSessionId(input.operation, input.sessionId);
+        await driver.request({ operation: "close", sessionId }, signal);
+        return { content: [{ type: "text", text: `Closed game session ${sessionId}` }], details: undefined };
+      }
+      if (input.operation === "actTogether") {
+        const players = requiredPlayers(input.players).map((player) => ({ sessionId: player.sessionId, actions: supportedActions(driver, requiredActions(player.actions)) }));
+        const result = await driver.request({ operation: "actTogether", players, ...(input.samples?.length ? { samples: input.samples } : {}) }, signal);
+        if (result.operation !== "actTogether") throw new Error("Unexpected game use response");
+        return playersResult(result.snapshots, result.timing, result.samples);
+      }
+      const sessionId = requiredSessionId(input.operation, input.sessionId);
+      const result = input.operation === "inspect"
+        ? await driver.request({ operation: "inspect", sessionId }, signal)
+        : await driver.request({ operation: "act", sessionId, actions: supportedActions(driver, requiredActions(input.actions)) }, signal);
+      if (result.operation !== "inspect" && result.operation !== "act") throw new Error("Unexpected game use response");
+      return snapshotResult(result.snapshot);
+    },
+  });
+}
+
+function captureResult(capture: PlaytestCapture) {
+  return {
+    content: [
+      { type: "text" as const, text: JSON.stringify({
+        sessionId: capture.sessionId,
+        width: capture.width,
+        height: capture.height,
+        ...(capture.source ? { source: capture.source, frame: capture.frame } : {}),
+        ...(capture.sourceWidth ? { sourceWidth: capture.sourceWidth, sourceHeight: capture.sourceHeight } : {}),
+        ...(capture.notes ? { notes: capture.notes } : {}),
+        analysis: capture.analysis,
+      }) },
+      { type: "image" as const, data: capture.data, mimeType: capture.mediaType },
+    ],
+    details: { playtestCapture: { ...capture, data: undefined } },
+  };
+}
+
+function requiredSessionId(operation: string, sessionId?: string): string {
+  if (!sessionId) throw new Error(`sessionId is required for ${operation}`);
+  return sessionId;
+}
+
+function requiredPlayers(players?: PlaytestPlayerActions[]): PlaytestPlayerActions[] {
+  if (!players || players.length < ACT_TOGETHER_MIN_PLAYERS || players.length > ACT_TOGETHER_MAX_PLAYERS) {
+    throw new Error(`players are required for actTogether: ${ACT_TOGETHER_MIN_PLAYERS} to ${ACT_TOGETHER_MAX_PLAYERS} open sessions`);
+  }
+  return players;
+}
+
+function requiredActions(actions?: PlaytestAction[]): PlaytestAction[] {
+  if (!actions?.length) throw new Error("actions are required for act");
+  return actions;
+}
+
+export function previewUrl(baseValue: string, relativeValue?: string): string {
+  const base = new URL(baseValue);
+  const resolved = relativeValue ? new URL(relativeValue, base) : base;
+  if (resolved.origin !== base.origin) throw new Error("Playtest path must stay inside the current project preview");
+  return resolved.href;
+}
+
+function withOpenPath(target: GameUseOpenTarget, path: string): GameUseOpenTarget {
+  if (target.runtime !== "web") throw new Error("path is only supported by the web game runtime");
+  return { ...target, url: previewUrl(target.url, path) };
+}
+
+const actionsSchema = Type.Array(actionSchema, { minItems: 1, maxItems: 20 });
+
+/** Actions from outside the tool, such as a plugin's: checked like the agent's, and against what the runtime takes. */
+export function checkedActions(driver: GameRuntimeAdapter, actions: unknown): PlaytestAction[] {
+  if (!Check(actionsSchema, actions)) throw new Error("act takes 1 to 20 actions of the kinds game_use takes");
+  return supportedActions(driver, actions as PlaytestAction[]);
+}
+
+function supportedActions(driver: GameRuntimeAdapter, actions: PlaytestAction[]): PlaytestAction[] {
+  for (const action of actions) {
+    const required = actionCapabilities(action);
+    const missingInput = required.input.filter((capability) => !driver.capabilities.input.includes(capability));
+    if (missingInput.length > 0) throw new Error(`Game runtime does not support ${missingInput.join(" and ")} input for ${action.type}`);
+    const missingObservation = required.observation.filter((capability) => !driver.capabilities.observation.includes(capability));
+    if (missingObservation.length > 0) throw new Error(`Game runtime does not support ${missingObservation.join(" and ")} observation for ${action.type}`);
+  }
+  return actions;
+}
+
+function actionCapabilities(action: PlaytestAction): { input: GameUseInputCapability[]; observation: GameUseObservationCapability[] } {
+  switch (action.type) {
+    case "click": return { input: ["pointer"], observation: "x" in action.target ? [] : ["dom"] };
+    case "type": return { input: ["text"], observation: ["dom"] };
+    case "press": return { input: ["keyboard"], observation: [] };
+    case "touch": return { input: ["touch"], observation: [] };
+    case "resize": return { input: ["resize"], observation: [] };
+    case "wait":
+    case "bridge": return { input: [], observation: [] };
+  }
+}
+
+function requireCapability(
+  driver: GameRuntimeAdapter,
+  capability: GameUseInputCapability | GameUseObservationCapability,
+  kind: "input" | "observation",
+): void {
+  const available: readonly string[] = kind === "input" ? driver.capabilities.input : driver.capabilities.observation;
+  if (!available.includes(capability)) throw new Error(`Game runtime does not support ${capability} ${kind}`);
+}
+
+function snapshotResult(snapshot: GameUseSnapshot) {
+  const compact = compactSnapshot(snapshot);
+  return {
+    // Stays in the model's context and is resent with every later request, so no indentation.
+    content: [{ type: "text" as const, text: JSON.stringify(compact) }],
+    details: { playtest: snapshot },
+  };
+}
+
+function playersResult(snapshots: GameUseSnapshot[], timing: PlaytestTogetherTiming, samples?: PlaytestStateSample[]) {
+  const compact = {
+    timing,
+    players: snapshots.map(compactSnapshot),
+    ...(samples ? { samples: samples.map((sample) => ({ ...sample, states: boundedJson(sample.states, 20_000) })) } : {}),
+  };
+  return {
+    content: [{ type: "text" as const, text: JSON.stringify(compact) }],
+    details: { playtests: snapshots, timing, ...(samples ? { samples } : {}) },
+  };
+}
+
+function compactSnapshot(snapshot: GameUseSnapshot) {
+  const webSnapshot = isPlaytestSnapshot(snapshot) ? snapshot : undefined;
+  return {
+    ...snapshot,
+    ...(webSnapshot ? { elements: webSnapshot.elements.slice(0, 80) } : {}),
+    ...(webSnapshot ? { logs: webSnapshot.logs.slice(-30).map((log) => ({ ...log, message: log.message.slice(0, 1_000) })) } : {}),
+    ...(webSnapshot ? { failedRequests: webSnapshot.failedRequests.slice(-30) } : {}),
+    ...(snapshot.gameState === undefined ? {} : { gameState: boundedJson(snapshot.gameState, 20_000) }),
+  };
+}
+
+function isPlaytestSnapshot(snapshot: GameUseSnapshot): snapshot is PlaytestSnapshot {
+  return "url" in snapshot && "elements" in snapshot && "logs" in snapshot && "failedRequests" in snapshot;
+}
+
+function boundedJson(value: unknown, limit: number): unknown {
+  const serialized = JSON.stringify(value);
+  if (serialized === undefined || serialized.length <= limit) return value;
+  return { truncated: true, preview: serialized.slice(0, limit) };
+}

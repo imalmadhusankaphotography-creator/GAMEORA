@@ -1,0 +1,327 @@
+import type { MediaMigrationState } from "./media-model-migration.js";
+import { isCanvasTable, type CanvasTableDetail } from "../shared/canvas-table.js";
+import { randomUUID } from "node:crypto";
+import { readFile } from "node:fs/promises";
+import path from "node:path";
+import type { FastifyInstance, FastifyReply } from "fastify";
+import type { CanvasMarkdownDocument } from "../shared/canvas-document.js";
+import { isCanvasDocument } from "../shared/canvas-document-schema.js";
+import { isCanvasBoard, type CanvasBoard } from "../shared/canvas-workspace.js";
+import { MAX_ASSET_CANVAS_NODES } from "../shared/asset-canvas-schema.js";
+import { CanvasError, CanvasStore, type CanvasPluginRunner } from "./canvas-workspace.js";
+import { ProjectAssetError, type ProjectManager } from "./projects.js";
+import type { AssetLibrary } from "./asset-library.js";
+import { ToolRunError, type ToolRunner } from "./tools.js";
+import { composeGif, composeImageLayers, composeVideo, cropImage, extractGifFrames, extractVideoStrip, splitImageGrid, MediaLimitError, withMediaTask, type ImageLayer } from "./media-tools.js";
+import { fixPixelArt, PixelArtFixerError } from "./pixel-art-fixer.js";
+import { checkPixelArtImages, PixelArtCheckError } from "./pixel-art-check.js";
+import type { PixelArtCheckBatch, PixelArtCheckExpectations } from "../shared/pixel-art-check.js";
+import { MAX_MEDIA_FRAMES, type CanvasMediaOperation } from "../shared/media-tools.js";
+import { ensureCanvasAssets, readCanvasAssets } from "./canvas-assets.js";
+import { getWorkspaceMedia } from "./workspace.js";
+import { AudioGenerationError, type AudioGenerator } from "./audio-generation.js";
+
+export function registerCanvasRoutes(app: FastifyInstance, options: {
+  projects: ProjectManager; library: AssetLibrary; tools: ToolRunner; plugins?: CanvasPluginRunner; audio?: AudioGenerator; mediaMigrations?: MediaMigrationState;
+}): CanvasStore {
+  const store = new CanvasStore(options.projects, options.library, options.tools, options.plugins, options.mediaMigrations);
+  const failure = (cause: unknown, reply: FastifyReply) => reply.code(cause instanceof CanvasError || cause instanceof ToolRunError || cause instanceof MediaLimitError || cause instanceof PixelArtFixerError || cause instanceof PixelArtCheckError ? cause.statusCode : 500).send({ error: cause instanceof Error ? cause.message : String(cause) });
+  const base = "/projects/:projectId/canvas";
+  const documentId = (query: unknown): string | undefined => {
+    const value = (query as { documentId?: unknown })?.documentId;
+    if (value === undefined) return undefined;
+    if (typeof value !== "string" || !/^[a-zA-Z0-9_-]{1,100}$/.test(value)) throw new CanvasError("Invalid document ID");
+    return value;
+  };
+  app.get<{ Params: { projectId: string }; Querystring: { knownRevision?: string } }>(`${base}/workspace`, async (request, reply) => {
+    try {
+      const detail = await store.workspace(request.params.projectId);
+      if (detail.revision && request.query.knownRevision === detail.revision) return reply.code(204).send();
+      return detail;
+    } catch (cause) { return failure(cause, reply); }
+  });
+  app.post<{ Params: { projectId: string; assetId: string } }>(`${base}/assets/:assetId/library`, async (request, reply) => {
+    try { return await store.exportAsset(request.params.projectId, request.params.assetId); } catch (cause) { return failure(cause, reply); }
+  });
+  const projectFailure = (cause: unknown, reply: FastifyReply) => cause instanceof ProjectAssetError ? reply.code(cause.statusCode).send({ error: cause.message }) : failure(cause, reply);
+  app.post<{ Params: { projectId: string }; Querystring: { name: string; directory?: string }; Body: Buffer }>(`${base}/files`, {
+    schema: { querystring: { type: "object", additionalProperties: false, required: ["name"], properties: { name: { type: "string", minLength: 1, maxLength: 200 }, directory: { type: "string", minLength: 1, maxLength: 1000 } } } },
+  }, async (request, reply) => {
+    const contents = request.body ?? Buffer.alloc(0);
+    if (!Buffer.isBuffer(contents)) return reply.code(415).send({ error: "Send the file as application/octet-stream" });
+    try { return reply.code(201).send({ path: await options.projects.importWorkspaceFile(request.params.projectId, request.query.name, contents, request.query.directory) }); }
+    catch (cause) { return projectFailure(cause, reply); }
+  });
+  app.post<{ Params: { projectId: string }; Body: { name: string } }>(`${base}/folders`, {
+    schema: { body: { type: "object", additionalProperties: false, required: ["name"], properties: { name: { type: "string", minLength: 1, maxLength: 200 } } } },
+  }, async (request, reply) => {
+    try { return reply.code(201).send({ path: await options.projects.createImportFolder(request.params.projectId, request.body.name) }); }
+    catch (cause) { return projectFailure(cause, reply); }
+  });
+  app.post<{ Params: { projectId: string }; Body: { title: string } }>(`${base}/documents`, {
+    schema: { body: { type: "object", additionalProperties: false, required: ["title"], properties: { title: { type: "string", maxLength: 200 } } } },
+  }, async (request, reply) => {
+    try { return reply.code(201).send(await store.createDocument(request.params.projectId, request.body.title)); } catch (cause) { return failure(cause, reply); }
+  });
+  app.post<{ Params: { projectId: string }; Body: { title: string } }>(`${base}/tables`, {
+    schema: { body: { type: "object", additionalProperties: false, required: ["title"], properties: { title: { type: "string", maxLength: 200 } } } },
+  }, async (request, reply) => {
+    try { return reply.code(201).send(await store.createTable(request.params.projectId, request.body.title)); } catch (cause) { return failure(cause, reply); }
+  });
+  app.get<{ Params: { projectId: string; tableId: string } }>(`${base}/tables/:tableId`, async (request, reply) => {
+    try { return await store.table(request.params.projectId, request.params.tableId); } catch (cause) { return failure(cause, reply); }
+  });
+  app.put<{ Params: { projectId: string; tableId: string }; Body: CanvasTableDetail }>(`${base}/tables/:tableId`, { bodyLimit: 4 * 1024 * 1024 }, async (request, reply) => {
+    if (!isCanvasTable(request.body?.table) || request.body.table.id !== request.params.tableId || typeof request.body.revision !== "string") return reply.code(400).send({ error: "Invalid canvas table update" });
+    try { return await store.saveTable(request.params.projectId, request.body.table, request.body.revision); } catch (cause) { return failure(cause, reply); }
+  });
+  app.put<{ Params: { projectId: string }; Body: { documentId: string } }>(`${base}/main-document`, {
+    schema: { body: { type: "object", additionalProperties: false, required: ["documentId"], properties: { documentId: { type: "string", pattern: "^[a-zA-Z0-9_-]{1,100}$" } } } },
+  }, async (request, reply) => {
+    try { await store.setMainDocument(request.params.projectId, request.body.documentId); return reply.code(204).send(); } catch (cause) { return failure(cause, reply); }
+  });
+  app.post<{ Params: { projectId: string }; Body: { name: string } }>(`${base}/boards`, {
+    schema: { body: { type: "object", additionalProperties: false, required: ["name"], properties: { name: { type: "string", minLength: 1, maxLength: 120 } } } },
+  }, async (request, reply) => {
+    try { return reply.code(201).send(await store.changeBoards(request.params.projectId, { type: "create", name: request.body.name })); } catch (cause) { return failure(cause, reply); }
+  });
+  const boardRoute = `${base}/boards/:boardId`;
+  app.get<{ Params: { projectId: string; boardId: string }; Querystring: { knownRevision?: string } }>(boardRoute, async (request, reply) => {
+    try {
+      const detail = await store.board(request.params.projectId, request.params.boardId);
+      if (detail.revision && request.query.knownRevision === detail.revision) return reply.code(204).send();
+      return detail;
+    } catch (cause) { return failure(cause, reply); }
+  });
+  app.put<{ Params: { projectId: string; boardId: string }; Body: { board: CanvasBoard; revision: string } }>(boardRoute, { bodyLimit: 4 * 1024 * 1024 }, async (request, reply) => {
+    if (!isCanvasBoard(request.body?.board) || request.body.board.id !== request.params.boardId || typeof request.body.revision !== "string") return reply.code(400).send({ error: "Invalid canvas board update" });
+    try { return await store.saveBoard(request.params.projectId, request.body.board, request.body.revision); } catch (cause) { return failure(cause, reply); }
+  });
+  app.patch<{ Params: { projectId: string; boardId: string }; Body: { name?: string; direction?: number } }>(boardRoute, {
+    schema: { body: { type: "object", additionalProperties: false, properties: { name: { type: "string", minLength: 1, maxLength: 120 }, direction: { enum: [-1, 1] } }, oneOf: [{ required: ["name"] }, { required: ["direction"] }] } },
+  }, async (request, reply) => {
+    try { return await store.changeBoards(request.params.projectId, { type: request.body.name !== undefined ? "rename" : "move", boardId: request.params.boardId, ...request.body }); } catch (cause) { return failure(cause, reply); }
+  });
+  app.delete<{ Params: { projectId: string; boardId: string } }>(boardRoute, async (request, reply) => {
+    try { return await store.changeBoards(request.params.projectId, { type: "delete", boardId: request.params.boardId }); } catch (cause) { return failure(cause, reply); }
+  });
+  app.post<{ Params: { projectId: string; boardId: string; nodeId: string } }>(`${boardRoute}/nodes/:nodeId/generate`, async (request, reply) => {
+    try { return reply.code(202).send(await store.generateNode(request.params.projectId, request.params.boardId, request.params.nodeId)); } catch (cause) { return failure(cause, reply); }
+  });
+  // Runs the node and what comes after it; the jobs show the progress.
+  app.post<{ Params: { projectId: string; boardId: string; nodeId: string } }>(`${boardRoute}/nodes/:nodeId/regenerate`, async (request, reply) => {
+    try { return reply.code(202).send(await store.regenerateFrom(request.params.projectId, request.params.boardId, request.params.nodeId)); } catch (cause) { return failure(cause, reply); }
+  });
+  app.get<{ Params: { projectId: string } }>(base, async (request, reply) => {
+    try { return await store.read(request.params.projectId, documentId(request.query)) ?? null; } catch (cause) { return failure(cause, reply); }
+  });
+  app.put<{ Params: { projectId: string }; Body: { document: CanvasMarkdownDocument; revision: string } }>(base, { bodyLimit: 2 * 1024 * 1024 }, async (request, reply) => {
+    const input = request.body;
+    if (!input || !isCanvasDocument(input.document) || typeof input.revision !== "string") return reply.code(400).send({ error: "Invalid canvas document update" });
+    try { return await store.save(request.params.projectId, input.document, input.revision, documentId(request.query)); } catch (cause) { return failure(cause, reply); }
+  });
+  app.post<{ Params: { projectId: string; documentId: string }; Body: { assetId: string } }>(`${base}/documents/:documentId/images`, {
+    schema: { body: { type: "object", additionalProperties: false, required: ["assetId"], properties: { assetId: { type: "string", minLength: 1, maxLength: 120 } } } },
+  }, async (request, reply) => {
+    try { return await store.insertAsset(request.params.projectId, request.params.documentId, request.body.assetId); } catch (cause) { return failure(cause, reply); }
+  });
+  app.post<{ Params: { projectId: string }; Body: CanvasMediaRequest }>(`${base}/media`, {
+    bodyLimit: 64 * 1024,
+  }, async (request, reply) => {
+    // Transcription waits on the provider rather than this machine, so it doesn't hold a media slot.
+    const run = () => runCanvasMedia({ ...options, store }, request.params.projectId, request.body);
+    try { return reply.code(200).send(await (request.body?.operation === "transcribe-audio" ? run() : withMediaTask(run))); } catch (cause) { return failure(cause, reply); }
+  });
+  app.get<{ Params: { projectId: string } }>(`${base}/jobs`, async (request, reply) => {
+    try { return await store.jobs(request.params.projectId); } catch (cause) { return failure(cause, reply); }
+  });
+  for (const action of ["cancel", "retry"] as const) app.post<{ Params: { projectId: string; jobId: string } }>(`${base}/jobs/:jobId/${action}`, async (request, reply) => {
+    try { return await store[action](request.params.projectId, request.params.jobId); } catch (cause) { return failure(cause, reply); }
+  });
+  return store;
+}
+
+interface CanvasMediaRequest {
+  boardId?: string;
+  operation: CanvasMediaOperation;
+  assetIds: string[];
+  options?: {
+    width?: number;
+    height?: number;
+    columns?: number;
+    rows?: number;
+    selectedFrames?: number[];
+    layers?: ImageLayer[];
+    fps?: number;
+    startTime?: number;
+    duration?: number;
+    left?: number;
+    top?: number;
+    format?: "png" | "jpg" | "jpeg" | "webp" | "mp4" | "gif";
+    /** The spoken language for transcribe-audio, as an ISO 639 code; detected when absent. */
+    language?: string;
+    /** check-pixel-art: settings to compare against (`width` and `height` above give the size). */
+    colors?: number;
+    baseline?: number;
+    outline?: string;
+  };
+}
+
+type CanvasMediaResult =
+  | { kind: "asset"; assetId: string; name: string; mediaType: string }
+  | { kind: "assets"; assets: Array<{ assetId: string; name: string; mediaType: string }> }
+  | { kind: "download"; path: string; name: string; mediaType: string; frameCount?: number }
+  | { kind: "text"; text: string }
+  | { kind: "pixel-check"; checks: PixelArtCheckBatch };
+
+async function runCanvasMedia(
+  options: { projects: ProjectManager; library: AssetLibrary; tools: ToolRunner; store: CanvasStore; audio?: AudioGenerator },
+  projectId: string,
+  request: CanvasMediaRequest,
+): Promise<CanvasMediaResult> {
+  const project = options.projects.get(projectId);
+  if (!project) throw new CanvasError("Project not found", 404);
+  const boardId = request.boardId ?? (await options.store.workspace(projectId)).boards[0]?.id;
+  if (!boardId) throw new CanvasError("Canvas board not found", 404);
+  const availableNodes = async () => MAX_ASSET_CANVAS_NODES - (await options.store.board(projectId, boardId)).board.nodes.length;
+  if (!Array.isArray(request.assetIds) || request.assetIds.length < 1 || request.assetIds.length > MAX_MEDIA_FRAMES || request.assetIds.some((id) => typeof id !== "string" || !id)) {
+    throw new CanvasError("Choose at least one canvas asset", 400);
+  }
+  // A node can be acted on immediately after it is added, before the board
+  // save that normally registers its library asset in canvas/assets.json.
+  // Materialize any missing library assets here so the operation does not
+  // fail silently because the save request is still in flight.
+  let manifest = await readCanvasAssets(project.workspacePath);
+  const missingAssetIds = request.assetIds.filter((id) => !manifest.assets[id]);
+  if (missingAssetIds.length) {
+    await ensureCanvasAssets(project, options.projects, options.library, missingAssetIds);
+    manifest = await readCanvasAssets(project.workspacePath);
+  }
+  const sources = await Promise.all(request.assetIds.map(async (id) => {
+    const asset = manifest.assets[id];
+    if (!asset) throw new CanvasError(`Canvas asset not found: ${id}`, 404);
+    return getWorkspaceMedia(project.workspacePath, asset.path);
+  }));
+  const input = request.options ?? {};
+  if (project.type === "asset-canvas") {
+    const expectedNodes = request.operation === "split-image-grid"
+      ? input.selectedFrames?.length ?? (input.columns ?? 2) * (input.rows ?? 2)
+      : request.operation === "video-frame-strip" && input.selectedFrames
+        ? input.selectedFrames.length
+        : request.operation === "check-pixel-art" ? 0 : 1;
+    if (expectedNodes > await availableNodes()) throw new CanvasError("Canvas is full", 409);
+  }
+  const first = sources[0]!;
+  if (request.operation === "transcribe-audio") return { kind: "text", text: await transcribe(options.audio, first, input.language) };
+  if (request.operation === "check-pixel-art") {
+    for (const source of sources) requireMedia(source.contentType, "image");
+    return { kind: "pixel-check", checks: await checkPixelArtImages(await Promise.all(sources.map((source) => readFile(source.absolutePath))), pixelArtExpectations(input)) };
+  }
+  let output: { name: string; bytes: Buffer; mediaType: string } | undefined;
+  let outputs: Awaited<ReturnType<typeof splitImageGrid>> | undefined;
+  if (request.operation === "split-image-grid") {
+    requireMedia(first.contentType, "image");
+    const columns = input.columns ?? 2;
+    const rows = input.rows ?? 2;
+    const cellCount = columns * rows;
+    if (!validInteger(columns, 1, 100) || !validInteger(rows, 1, 100) || cellCount > MAX_MEDIA_FRAMES) throw new CanvasError("Invalid grid size", 400);
+    if (input.selectedFrames !== undefined && (!Array.isArray(input.selectedFrames) || !input.selectedFrames.length || input.selectedFrames.some((index, position) => !validInteger(index, 0, cellCount - 1) || (position > 0 && index <= input.selectedFrames![position - 1]!)))) throw new CanvasError("Invalid selected frames", 400);
+    outputs = await splitImageGrid({ inputPath: first.absolutePath, columns: input.columns ?? 2, rows: input.rows ?? 2, selectedFrames: input.selectedFrames, format: input.format === "jpeg" ? "jpeg" : input.format === "webp" ? "webp" : "png" });
+  } else if (request.operation === "compose-image-layers") {
+    if (sources.some((source) => !source.contentType.startsWith("image/"))) throw new CanvasError("Layer composition requires image assets", 400);
+    if (!Array.isArray(input.layers) || input.layers.length !== sources.length || input.layers.length > 100 || input.layers.some((layer) => !layer || !validInteger(layer.x, -16_384, 16_384) || !validInteger(layer.y, -16_384, 16_384) || !validRange(layer.scale, 0.05, 8) || !validRange(layer.opacity, 0, 1) || typeof layer.visible !== "boolean") || !validInteger(input.width, 1, 16_384) || !validInteger(input.height, 1, 16_384) || input.width * input.height > 100_000_000) throw new CanvasError("Invalid layer settings or canvas dimensions", 400);
+    output = await composeImageLayers({ inputPaths: sources.map((source) => source.absolutePath), layers: input.layers, width: input.width, height: input.height });
+  } else if (request.operation === "video-frame-strip") {
+    requireMedia(first.contentType, "video");
+    if (input.selectedFrames !== undefined && (!Array.isArray(input.selectedFrames) || !input.selectedFrames.length || input.selectedFrames.some((index, position) => !validInteger(index, 0, MAX_MEDIA_FRAMES - 1) || (position > 0 && index <= input.selectedFrames![position - 1]!)))) throw new CanvasError("Invalid selected video frames", 400);
+    outputs = await extractVideoStrip({ inputPath: first.absolutePath, fps: input.fps, startTime: input.startTime, duration: input.duration, selectedFrames: input.selectedFrames, format: input.format === "jpg" ? "jpg" : "png" });
+  } else if (request.operation === "compose-video") {
+    if (sources.some((source) => !source.contentType.startsWith("image/"))) throw new CanvasError("Video composition requires image frame assets", 400);
+    output = await composeVideo({ framePaths: sources.map((source) => source.absolutePath), fps: input.fps, format: input.format === "gif" ? "gif" : "mp4" });
+  } else if (request.operation === "fix-pixel-art") {
+    requireMedia(first.contentType, "image");
+    const fixed = await fixPixelArt(await readFile(first.absolutePath));
+    output = { name: "pixel-art-fixed.png", bytes: fixed.bytes, mediaType: fixed.mediaType };
+  } else if (request.operation === "crop-image" || request.operation === "extract-gif-frames") {
+    requireMedia(first.contentType, "image");
+    const imageInput = { inputPath: first.absolutePath, format: input.format === "jpg" ? "jpeg" as const : input.format as "png" | "jpeg" | "webp" | undefined };
+    if (request.operation === "crop-image") {
+      if (input.width === undefined || input.height === undefined) throw new CanvasError("Crop width and height are required", 400);
+      output = await cropImage({ ...imageInput, left: input.left ?? 0, top: input.top ?? 0, width: input.width, height: input.height });
+    } else {
+      if (first.contentType !== "image/gif") throw new CanvasError("GIF extraction requires a GIF asset", 400);
+      outputs = await extractGifFrames({ inputPath: first.absolutePath });
+    }
+  } else if (request.operation === "compose-gif") {
+    if (sources.some((source) => !source.contentType.startsWith("image/"))) throw new CanvasError("GIF composition requires image frame assets", 400);
+    output = await composeGif(sources.map((source) => source.absolutePath), input.fps);
+  } else {
+    throw new CanvasError("Unsupported media operation", 400);
+  }
+  if (outputs) {
+    const frameOutputs = outputs.filter((item) => item.mediaType.startsWith("image/") || item.mediaType.startsWith("video/"));
+    if (!frameOutputs.length) throw new CanvasError("Media operation produced no frame assets", 500);
+    if (project.type === "asset-canvas" && frameOutputs.length > await availableNodes()) throw new CanvasError("Canvas is full", 409);
+    const assets = [];
+    for (const frame of frameOutputs) assets.push(await options.library.add(frame.name, frame.bytes, {
+      origin: "generated",
+      sourceKey: `canvas-media:${projectId}:${randomUUID()}`,
+    }));
+    await ensureCanvasAssets(project, options.projects, options.library, assets.map((asset) => asset.id));
+    return {
+      kind: "assets",
+      assets: assets.map((asset) => ({
+        assetId: asset.id,
+        name: asset.name,
+        mediaType: asset.mediaType,
+      })),
+    };
+  }
+  if (!output) throw new CanvasError("Media operation produced no output", 500);
+  if (project.type === "asset-canvas" && await availableNodes() < 1) throw new CanvasError("Canvas is full", 409);
+  const asset = await options.library.add(output.name, output.bytes, { origin: "generated", sourceKey: `canvas-media:${projectId}:${randomUUID()}` });
+  await ensureCanvasAssets(project, options.projects, options.library, [asset.id]);
+  return { kind: "asset", assetId: asset.id, name: asset.name, mediaType: asset.mediaType };
+}
+
+/** What a pixel-art check compares against: only valid settings the request names. */
+function pixelArtExpectations(input: { width?: unknown; height?: unknown; colors?: unknown; baseline?: unknown; outline?: unknown }): PixelArtCheckExpectations {
+  const whole = (value: unknown, min: number) => typeof value === "number" && Number.isInteger(value) && value >= min ? value : undefined;
+  const width = whole(input.width, 1);
+  const height = whole(input.height, 1);
+  const colors = whole(input.colors, 1);
+  const baseline = whole(input.baseline, 0);
+  return {
+    ...(width && height ? { width, height } : {}),
+    ...(colors ? { colors } : {}),
+    ...(baseline === undefined ? {} : { baseline }),
+    ...(typeof input.outline === "string" && /^#[0-9a-f]{6}$/i.test(input.outline) ? { outline: input.outline } : {}),
+  };
+}
+
+/** The words spoken in an audio asset, for a Text node beside it. */
+async function transcribe(audio: AudioGenerator | undefined, source: { absolutePath: string; contentType: string }, language: unknown): Promise<string> {
+  requireMedia(source.contentType, "audio");
+  if (!audio?.transcribe) throw new CanvasError("Audio transcription is not available", 503);
+  if (language !== undefined && (typeof language !== "string" || !/^[A-Za-z]{2,3}(?:[-_][A-Za-z0-9]{2,8})?$/.test(language))) throw new CanvasError("Invalid language code", 400);
+  try {
+    const { text } = await audio.transcribe({ bytes: await readFile(source.absolutePath), mediaType: source.contentType, name: path.basename(source.absolutePath), ...(language ? { language } : {}) });
+    if (!text) throw new CanvasError("No speech was found in this audio", 422);
+    return text;
+  } catch (cause) {
+    if (cause instanceof AudioGenerationError) throw new CanvasError(cause.message, cause.statusCode);
+    throw cause;
+  }
+}
+
+function requireMedia(contentType: string, expected: "image" | "video" | "audio"): void {
+  if (!contentType.startsWith(`${expected}/`)) throw new CanvasError(`This operation requires a ${expected}`, 400);
+}
+
+function validInteger(value: unknown, minimum: number, maximum: number): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= minimum && value <= maximum;
+}
+
+function validRange(value: unknown, minimum: number, maximum: number): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= minimum && value <= maximum;
+}

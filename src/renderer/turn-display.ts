@@ -1,0 +1,169 @@
+import { terminalAgentItemId } from "../shared/turns.js";
+import type { ThreadItem, ToolArtifact, Turn } from "../shared/contracts.js";
+import { projectWorkItems, type WorkDisplayItem } from "./work-items.js";
+
+type AssistantItem = Extract<ThreadItem, { type: "agentMessage" }>;
+const compactionMerges = new WeakMap<Turn, WeakMap<Turn, Turn>>();
+
+export interface TurnDisplay {
+  user?: Extract<ThreadItem, { type: "userMessage" }>;
+  work: WorkDisplayItem[];
+  messages: ThreadItem[];
+  finalMessages: AssistantItem[];
+  working: boolean;
+  activeRetryId?: string;
+  status: Turn["status"];
+  hadThinking: boolean;
+  durationMs: number;
+}
+
+export function mergeCompletedCompactionTurns(turns: readonly Turn[]): Turn[] {
+  const result: Turn[] = [];
+  for (const turn of turns) {
+    const compactionOnly = turn.status === "completed" && turn.items.length > 0 &&
+      turn.items.every((item) => item.type === "contextCompaction" && item.status === "completed");
+    const previousIndex = compactionOnly ? result.findLastIndex((candidate) =>
+      candidate.conversationId === turn.conversationId && !candidate.steering &&
+      candidate.items.some((item) => item.type !== "contextCompaction" && item.type !== "modelChange")) : -1;
+    if (previousIndex < 0) {
+      result.push(turn);
+      continue;
+    }
+    // Compaction has its own runtime turn for cancellation, but belongs to the preceding work in history.
+    const previous = result[previousIndex];
+    const mergedForPrevious = compactionMerges.get(previous) ?? new WeakMap<Turn, Turn>();
+    let merged = mergedForPrevious.get(turn);
+    if (!merged) {
+      merged = { ...previous, items: [...previous.items, ...turn.items.map((item) => ({ ...item, turnId: previous.id }))] };
+      mergedForPrevious.set(turn, merged);
+      compactionMerges.set(previous, mergedForPrevious);
+    }
+    result[previousIndex] = merged;
+  }
+  return result;
+}
+
+export function projectTurnDisplay(turn: Turn, now = Date.now(), waitingForInput = false): TurnDisplay {
+  const active = turn.status === "inProgress";
+  const user = turn.items.find((item): item is Extract<ThreadItem, { type: "userMessage" }> => item.type === "userMessage");
+  // A request still waiting is answered in its card above the composer; once answered it is part of the work.
+  const items = turn.items.filter((item) => item !== user && !(item.type === "userInputRequest" && item.status === "inProgress") && !(item.type === "approvalRequest" && item.status === "inProgress") && !isCancelledStatusMessage(item) &&
+    !(item.type === "retry" && item.status === "completed"));
+  const finalStarted = items.some(isFinalAnswer);
+  const finalMessages = active ? [] : items.filter(isFinalAnswer);
+  const processItems = active ? items : items.filter((item) => !isFinalAnswer(item));
+  const activityItems = processItems.filter((item) => item.type !== "plan");
+  const workStarted = activityItems.some((item) => item.type !== "reasoning" && isWorkItem(item));
+  const durationMs = turnDurationMs(turn.items);
+  const hadThinking = activityItems.some((item) => item.type === "reasoning");
+
+  if (!active) {
+    // Reasoning stays in the work so a finished turn keeps its thinking to re-read.
+    const workItems = activityItems.filter((item) => isWorkItem(item));
+    return {
+      user,
+      work: projectWorkItems(workItems),
+      messages: activityItems.filter((item) => !isWorkItem(item)),
+      finalMessages,
+      working: false,
+      status: turn.status,
+      hadThinking,
+      durationMs,
+    };
+  }
+
+  const visibleItems = activityItems;
+  const live = !finalStarted;
+  const working = workStarted || hasVisibleAssistantText(visibleItems);
+  // Retry attempts update the same row, which may precede older activity in the array.
+  const latestActivity = activityItems.reduce<ThreadItem | undefined>((latest, item) => {
+    // A failed attempt can share the retry's timestamp and does not signal resumed work.
+    if (item.type === "agentMessage" && item.status === "failed") return latest;
+    return !latest || (item.timestamp ?? 0) >= (latest.timestamp ?? 0) ? item : latest;
+  }, undefined);
+  const activeRetryId = live && latestActivity?.type === "retry" && latestActivity.status === "inProgress" ? latestActivity.id : undefined;
+  const waiting = !activeRetryId && !waitingForInput && live && working && shouldShowWaiting(visibleItems, now);
+  const work = projectWorkItems(visibleItems, { active: live, waiting });
+  return {
+    user,
+    work,
+    messages: [],
+    finalMessages,
+    working,
+    activeRetryId,
+    status: turn.status,
+    hadThinking,
+    durationMs,
+  };
+}
+
+function turnDurationMs(items: ThreadItem[]): number {
+  const finishedAt = items.findLast(isFinalAnswer)?.timestamp ?? items.findLast((item) => item.type !== "contextCompaction")?.timestamp;
+  const timestamps = items.filter((item) => item.type !== "contextCompaction" || finishedAt === undefined || item.timestamp === undefined || item.timestamp <= finishedAt)
+    .map((item) => item.timestamp)
+    .filter((value): value is number => typeof value === "number" && Number.isFinite(value));
+  return timestamps.length >= 2 ? Math.max(...timestamps) - Math.min(...timestamps) : 0;
+}
+
+/** Each file the tools made, once, in the order it was made. */
+export function collectArtifacts(items: readonly ThreadItem[]): ToolArtifact[] {
+  const seen = new Set<string>();
+  return items.flatMap((item) => {
+    if ((item.type !== "dynamicToolCall" && item.type !== "mcpToolCall") || !item.artifact || seen.has(item.artifact.path)) return [];
+    seen.add(item.artifact.path);
+    return [item.artifact];
+  });
+}
+
+function hasVisibleAssistantText(items: ThreadItem[]): boolean {
+  return items.some((item) => item.type === "agentMessage" && Boolean(item.text.trim()));
+}
+
+function isWorkItem(item: ThreadItem): boolean {
+  return item.type === "reasoning" || item.type === "dynamicToolCall" || item.type === "mcpToolCall" || item.type === "retry" || item.type === "imageRead" || item.type === "approvalRequest" || item.type === "userInputRequest" ||
+    (item.type === "contextCompaction" && (item.status === "inProgress" || item.status === "completed")) ||
+    (item.type === "agentMessage" && item.phase !== "final_answer");
+}
+
+function isFinalAnswer(item: ThreadItem): item is AssistantItem {
+  return item.type === "agentMessage" && item.phase === "final_answer";
+}
+
+function isCancelledStatusMessage(item: ThreadItem): item is AssistantItem {
+  return item.type === "agentMessage" && item.status === "cancelled" && !item.text.trim();
+}
+
+function shouldShowWaiting(items: ThreadItem[], now: number): boolean {
+  const latest = items.at(-1);
+  if (!latest || (latest.type === "agentMessage" && latest.status === "inProgress" && !hasStalledAssistantText(items, now))) return false;
+  if (latest.type === "retry" || latest.id === terminalAgentItemId(latest.turnId) ||
+    (latest.type === "contextCompaction" && latest.status === "inProgress")) return false;
+  return !items.some((item) => (item.type === "dynamicToolCall" || item.type === "mcpToolCall") && (item.status === "preparing" || item.status === "inProgress")) &&
+    !items.some((item) => item.type === "reasoning" && item.status === "inProgress");
+}
+
+const STALLED_TEXT_MS = 1_000;
+
+function hasStalledAssistantText(items: ThreadItem[], now: number): boolean {
+  const latest = items.at(-1);
+  return latest?.type === "agentMessage" && latest.status === "inProgress" && Boolean(latest.text.trim()) &&
+    latest.timestamp !== undefined && now - latest.timestamp >= STALLED_TEXT_MS;
+}
+
+/**
+ * The display compares the time only with an item's timestamp plus a second,
+ * so every time between two of those thresholds builds the same display.
+ * `time` is the last threshold passed and `next` the one to wait for, which
+ * lets an active turn rebuild its display only when it can change.
+ */
+export function turnDisplayClock(turn: Turn, now: number): { time: number; next?: number } {
+  let time = 0;
+  let next: number | undefined;
+  for (const item of turn.items) {
+    if (item.timestamp === undefined) continue;
+    const threshold = item.timestamp + STALLED_TEXT_MS;
+    if (threshold <= now) time = Math.max(time, threshold);
+    else next = Math.min(next ?? threshold, threshold);
+  }
+  return { time, next };
+}

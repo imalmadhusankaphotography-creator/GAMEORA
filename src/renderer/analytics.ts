@@ -1,0 +1,113 @@
+import type { PostHog } from "posthog-js/dist/module.no-external.js";
+import { AnalyticsUrlScrubber } from "./analytics-url.js";
+
+const USAGE_DATA_STORAGE_KEY = "ohmygame:usage-data";
+let configured = false;
+let enabled = storedUsageDataEnabled();
+let client: PostHog | undefined;
+let loading: Promise<void> | undefined;
+// Undefined until sign-in state is known; null while signed out.
+let accountId: string | null | undefined;
+
+export function initializeAnalytics(): void {
+  configured = true;
+  if (enabled) void loadClient();
+}
+
+export function readUsageDataEnabled(): boolean {
+  return enabled;
+}
+
+function storedUsageDataEnabled(): boolean {
+  try {
+    return localStorage.getItem(USAGE_DATA_STORAGE_KEY) !== "off";
+  } catch {
+    return true;
+  }
+}
+
+export async function initializeUsageData(mainWindow = true): Promise<void> {
+  const desktop = window.ohMyGameDesktop;
+  if (!desktop) return;
+  try {
+    if (mainWindow && desktop.updateUsageData) {
+      applyUsageDataEnabled(await desktop.updateUsageData(enabled, true));
+    } else if (!mainWindow && desktop.readUsageData) {
+      let receivedChange = false;
+      desktop.onUsageDataChanged?.((value) => {
+        receivedChange = true;
+        applyUsageDataEnabled(value, false);
+      });
+      const stored = await desktop.readUsageData();
+      if (!receivedChange) applyUsageDataEnabled(stored, false);
+    }
+  } catch {
+    // Keep the stored choice for the next launch if desktop storage fails.
+    enabled = false;
+  }
+}
+
+export async function setUsageDataEnabled(value: boolean): Promise<void> {
+  const update = window.ohMyGameDesktop?.updateUsageData;
+  applyUsageDataEnabled(update ? await update(value, false) : value);
+}
+
+function applyUsageDataEnabled(value: boolean, persist = true): void {
+  enabled = value;
+  if (persist) {
+    try {
+      localStorage.setItem(USAGE_DATA_STORAGE_KEY, value ? "on" : "off");
+    } catch { /* Browser storage can be unavailable. */ }
+  }
+  if (!value) client?.opt_out_capturing();
+  else if (configured) void loadClient().then(synchronize);
+}
+
+/** Links usage data to the signed-in OhMyGame account, by account id only. */
+export function setAnalyticsAccount(id: string | null): void {
+  accountId = id;
+  synchronize();
+}
+
+function loadClient(): Promise<void> {
+  if (client) return Promise.resolve();
+  if (loading) return loading;
+  const key = import.meta.env.VITE_POSTHOG_KEY?.trim();
+  const host = import.meta.env.VITE_POSTHOG_HOST?.trim();
+  if (!enabled || !key || !host) return Promise.resolve();
+  const scrubber = new AnalyticsUrlScrubber(window.location.pathname);
+  // Keep PostHog out of the startup bundle and never load remote scripts.
+  loading = import("posthog-js/dist/module.no-external.js").then(({ posthog }) => {
+    // The person may have turned usage data off while the import was pending.
+    if (!enabled) return;
+    posthog.init(key, {
+      api_host: host,
+      autocapture: true,
+      capture_pageview: { hash: true },
+      capture_pageleave: true,
+      disable_session_recording: true,
+      person_profiles: "identified_only",
+      capture_exceptions: false,
+      before_send: (event) => {
+        if (!event || !enabled) return null;
+        scrubber.scrub(event, window.location.href);
+        event.properties.app_version = __APP_VERSION__;
+        return event;
+      },
+    });
+    client = posthog;
+    synchronize();
+  }).finally(() => { loading = undefined; });
+  return loading;
+}
+
+function synchronize(): void {
+  if (!enabled || !client) return;
+  if (client.has_opted_out_capturing()) client.opt_in_capturing({ captureEventName: false });
+  if (accountId) {
+    if (client.get_distinct_id() !== accountId) client.identify(accountId);
+  } else if (accountId === null && client.get_property("$user_state") === "identified") {
+    // A new anonymous id keeps the next person's use apart from this account.
+    client.reset();
+  }
+}

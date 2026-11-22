@@ -1,0 +1,1572 @@
+import type { SettingsWrites } from "./settings-writes.js";
+import type { PluginConfigurationValues } from "../shared/extension-host-protocol.js";
+import { isPluginSettingsCommand } from "../shared/plugin-settings.js";
+import { createHash, randomUUID } from "node:crypto";
+import { CANVAS_PRESET_MAX_BYTES, canvasPresetIssue, type CanvasPresetBoard } from "../shared/canvas-plugin-nodes.js";
+import { migrateLegacyAudioNodes } from "../shared/audio-legacy.js";
+import { watch, type FSWatcher } from "node:fs";
+import { cp, lstat, mkdir, readFile, readdir, rename, rm } from "node:fs/promises";
+import path from "node:path";
+import type {
+  AgentToolResult,
+  ToolDefinition,
+} from "@earendil-works/pi-coding-agent";
+import type { TSchema } from "typebox";
+import { Check, Errors } from "typebox/value";
+import { agentToolName, configReferences, fillConfigReferences, isAppWidePlugin, isPluginId, mcpServerSyntaxIssue, PERSONAL_PUBLISHER, mcpUrlIssue, OHMYGAME_PUBLISHER, RESERVED_PUBLISHERS, PLUGIN_DATA_ENV, pluginApiIssue, type PluginManifestV2 } from "../shared/plugin-manifest.js";
+import { isNewerPluginVersion, PLUGIN_NPM_REGISTRIES, type McpServerDefinition, type PluginLogView, type PluginOrigin, type PluginUninstallPreview, type ProjectPluginCanvas, type ProjectPluginPreview, type PluginMcpResult, type ProjectPreviewDevice, type StorePlugin } from "../shared/plugins.js";
+import { compileInputMap } from "../shared/preview-input.js";
+import type { PluginUiCapabilities } from "../shared/plugin-ui-protocol.js";
+import type { LibrarySource } from "../shared/contracts.js";
+import type { PluginBrowserShortcut } from "../shared/browser.js";
+import { PROJECT_FILE_NAME, projectTypePlugin } from "../shared/project-file.js";
+import { appWidePluginSuits } from "../shared/project-runtime.js";
+import {
+  ExtensionHosts,
+  type ExtensionHostOptions,
+} from "./extension-hosts.js";
+import { NativePlugins, type PluginCallOptions } from "./native-plugins.js";
+import {
+  indexPluginPackage,
+  localizePluginString,
+  PluginIndex,
+  type PluginIndexEntry,
+  type PluginLocale,
+  type PluginPackageResult,
+} from "./plugin-index.js";
+import { PluginValues } from "./plugin-values.js";
+import { PluginLogs, redactCredentials } from "./plugin-logs.js";
+import { manifestHooks } from "../shared/plugin-hooks.js";
+import {
+  capabilityGrants,
+  missingGrants,
+  onInEveryProject,
+  PluginGrants,
+  projectFolderKey,
+  projectSkills,
+  resolveProjectPlugins,
+  setProjectPlugin,
+  type PluginScope,
+  type ProjectKind,
+  type ProjectPlugins,
+} from "./project-plugins.js";
+import type { PluginSkillRegistration } from "./plugin-runtime.js";
+import { libraryEmbedHosts } from "../shared/library-embeds.js";
+
+// The plugin services the daemon holds: the index of installed
+// packages, the person's decisions, and the hosts that run native code. They
+// load on first use, so the app starts the same with no plugins installed.
+//
+// Plugin tools are registered here once, as Pi tool definitions. OhMyGame's
+// agent uses them directly; the coding agents get the same definitions
+// through `ToolBridge`, and agents outside the app through external MCP. One
+// schema, one permission check (`NativePlugins`), one result shape.
+
+/** Model-facing text past this length is cut; `structuredContent` keeps the whole result. */
+const TOOL_TEXT_MAX_CHARS = 100_000;
+
+/** A tool's input or result that doesn't match the schema its manifest names. */
+export class PluginToolSchemaError extends Error {
+  /** Bad input is the caller's to fix; a bad result is the plugin's. */
+  readonly statusCode: 400 | 502;
+  constructor(id: string, side: "input" | "output", schema: TSchema, value: unknown) {
+    const problems = [...Errors(schema, value)]
+      .slice(0, 3)
+      .map((error) => `${error.instancePath || "/"} ${error.message}`)
+      .join("; ");
+    super(
+      side === "input"
+        ? `${id} was given input that doesn't match its input schema: ${problems}`
+        : `${id} returned a result that doesn't match its output schema: ${problems}`,
+    );
+    this.statusCode = side === "input" ? 400 : 502;
+  }
+}
+
+/** A command was asked to run in a way it can't. */
+/** How long a project type's `ready` command may take before the prompt goes ahead. */
+const READY_TIMEOUT_MS = 20_000;
+
+export class PluginCommandInputError extends Error {
+  readonly statusCode = 400;
+}
+
+type Contributions = NonNullable<PluginIndexEntry["manifest"]["contributes"]>;
+type PluginCommand = NonNullable<Contributions["commands"]>[number];
+
+export interface ProjectCommand {
+  /** `publisher/name:command`. */
+  id: string;
+  plugin: string;
+  title: string;
+  slash?: string;
+  slots: NonNullable<NonNullable<Contributions["commands"]>[number]["slots"]>;
+  run: NonNullable<Contributions["commands"]>[number]["run"];
+}
+
+/** What a Plugin Builder draft runs: a tool, a command by its id, or a hook with a made-up event. */
+export type DraftRunTarget = { tool: string } | { command: string } | { hook: string };
+
+export interface ProjectPanel {
+  id: string;
+  plugin: string;
+  version: string;
+  /** The package's digest, which changes only when a plugin in development changes under the same version. */
+  revision: string;
+  title: string;
+  area: "left" | "center" | "right" | "bottom";
+  when?: string;
+  capabilities: PluginUiCapabilities;
+  /** The plugin's command ids, the only ones its page may run. */
+  commands: string[];
+  /** The plugin's brand colour, which the app checks before using. */
+  accent?: string | { light?: string; dark?: string };
+}
+
+/**
+ * A package's commands as a project lists them, without the one that opens
+ * its connection settings. `plugin` is the id they go by, as for `entryPanels`.
+ */
+export function entryCommands(entry: PluginIndexEntry, locale: PluginLocale, plugin = entry.id): ProjectCommand[] {
+  return (entry.manifest.contributes?.commands ?? []).flatMap((command) => isPluginSettingsCommand(entry.manifest, command.id) ? [] : [{
+    id: `${plugin}:${command.id}`,
+    plugin,
+    title: localizePluginString(entry, command.title, locale),
+    ...(command.slash ? { slash: command.slash } : {}),
+    slots: command.slots ?? [],
+    run: command.run,
+  }]);
+}
+
+/**
+ * A package's panels, with what their pages may ask the host for. `plugin` is
+ * the id they go by, the package's own unless it runs as something else, as a
+ * draft does in its workspace.
+ */
+export function entryPanels(entry: PluginIndexEntry, locale: PluginLocale, plugin = entry.id): ProjectPanel[] {
+  const capabilities = entry.manifest.capabilities ?? {};
+  return (entry.manifest.contributes?.panels ?? []).map((panel) => ({
+    id: panel.id,
+    plugin,
+    version: entry.version,
+    revision: entry.digest,
+    title: localizePluginString(entry, panel.title, locale),
+    area: panel.area,
+    ...(panel.when ? { when: panel.when } : {}),
+    capabilities: {
+      ...(capabilities["project.selection"] ? { "project.selection": true } : {}),
+      ...(capabilities.composer ? { composer: true } : {}),
+      ...(capabilities["project.files"] ? { "project.files": capabilities["project.files"] } : {}),
+      ...(capabilities["project.history"] ? { "project.history": true } : {}),
+      ...(capabilities["project.usage"] ? { "project.usage": true } : {}),
+      ...(capabilities.models ? { models: true } : {}),
+      ...(capabilities.library ? { library: true } : {}),
+    },
+    commands: (entry.manifest.contributes?.commands ?? []).map((command) => command.id),
+    ...(entry.manifest.ui?.accent ? { accent: entry.manifest.ui.accent } : {}),
+  }));
+}
+
+/**
+ * The engine files OhMyGame's own engine plugins recognize, for their
+ * versions from before `activation`. The app pins versions that declare it,
+ * but an installed copy that runs code (Godot) updates only when the person
+ * updates it.
+ *
+ * compat: since beta.5.9, remove from beta.7 and 2027-01-12, once such copies
+ * have had a release to update (#968).
+ */
+const ENGINE_FILES_BEFORE_ACTIVATION: Readonly<Record<string, readonly string[]>> = {
+  "ohmygame/unity": ["ProjectSettings/ProjectVersion.txt"],
+  "ohmygame/unreal-engine": ["*.uproject"],
+  "ohmygame/cocos-creator": ["settings/v2/packages/project.json", "settings/v2/packages/engine.json"],
+  "ohmygame/godot": ["project.godot"],
+};
+
+/** How long whether a folder has a plugin's `activation.files` is kept. */
+const FOLDER_MATCH_MS = 5_000;
+
+/**
+ * Bundled plugins that start off: those still in beta for a platform the
+ * person may not use. Their pinned versions declare `activation`, which
+ * decides instead, but an installed copy from before it stays until updated.
+ *
+ * compat: since beta.5.8, remove from beta.7 and 2027-01-12, once such copies
+ * have had a release to update (#968).
+ */
+export const BUNDLED_PLUGINS_OFF: readonly string[] = [
+  "ohmygame/taptap-maker",
+  "ohmygame/aseprite",
+  "ohmygame/cocos-creator",
+  "ohmygame/douyin-minigame",
+  "ohmygame/tiled",
+  "ohmygame/unity",
+  "ohmygame/unreal-engine",
+  "ohmygame/wechat-minigame",
+];
+
+/** Runs a tool a panel's page answers, for a project folder. */
+export type PageToolRunner = (
+  entry: PluginIndexEntry,
+  tool: { name: string; panel: string; timeoutSeconds?: number },
+  options: Omit<PluginCallOptions, "version">,
+) => Promise<unknown>;
+
+export interface PluginServicesOptions {
+  /** Shared owner for app settings loads and writes. */
+  settingsWrites?: SettingsWrites;
+  /** The folder for the index and decisions, inside the app's data folder. */
+  directory: string;
+  hosts?: ExtensionHostOptions;
+  /** The plugins that ship with the app, indexed by `ready()` before anything is served. */
+  bundled?: string;
+  /** IDs moving to preinstalled packages retain state but no longer load from bundled folders. */
+  bundledReplacements?: () => Promise<ReadonlySet<string>>;
+  /** Told when the bundled plugins can't be indexed; everything else still loads. */
+  onBundledError?: (error: unknown) => void;
+  /** Bundled plugins that start off in every project, such as one in beta, until the person turns them on. */
+  bundledOff?: readonly string[];
+  /** What the project in a folder (its real path) is, for matching plugins' `appliesTo`. */
+  projectKind?: PluginScope["kind"];
+  /** Runs no plugin: each reads as turned off, while what the person chose is kept for a normal start. */
+  safeMode?: boolean;
+  /** The person's project folders, so a new version can replace the older ones none of them uses; undefined when some couldn't be read. */
+  projectFolders?: () => readonly string[] | undefined;
+}
+
+/** A plugin's Skill as agent sessions load it. Plugins have no marketplace; their publisher stands in. */
+/** How agent sessions name a plugin's MCP server: unique to the plugin and server, and short. */
+export function pluginMcpServerName(id: string, server: string): string {
+  return `plugin-${createHash("sha256").update(id).digest("hex").slice(0, 12)}-v2-${server}`;
+}
+
+/** The bytes of the files under a folder, not following links; 0 when it doesn't exist. */
+async function folderBytes(folder: string): Promise<number> {
+  const entries = await readdir(folder, { withFileTypes: true, recursive: true }).catch(() => []);
+  let bytes = 0;
+  for (const entry of entries)
+    if (entry.isFile()) bytes += (await lstat(path.join(entry.parentPath, entry.name)).catch(() => undefined))?.size ?? 0;
+  return bytes;
+}
+
+function skillRegistration(entry: PluginIndexEntry, file: string): PluginSkillRegistration {
+  return {
+    path: file,
+    pluginDisplayName: localizePluginString(entry, entry.manifest.displayName, "en"),
+    marketplaceDisplayName: entry.id.split("/")[0]!,
+  };
+}
+
+/**
+ * Publishers whose names only the app and the Plugin Builder can give out.
+ * OhMyGame's own also comes from npm, where its `@ohmygame` scope vouches for
+ * it (npmjs, or npmmirror, which copies it), and from a folder the person
+ * develops. Never from GitHub, a file or another registry: any package there
+ * can claim it.
+ */
+export function assertAddablePlugin(id: string, origin?: PluginOrigin): void {
+  const publisher = id.slice(0, id.indexOf("/"));
+  if (publisher === OHMYGAME_PUBLISHER && (origin?.type === "development" || (origin?.type === "npm" && (PLUGIN_NPM_REGISTRIES as readonly string[]).includes(origin.registry)))) return;
+  if (RESERVED_PUBLISHERS.has(publisher))
+    throw new Error(`Plugins added from outside the app can't use the publisher "${publisher}"${publisher === OHMYGAME_PUBLISHER ? " unless they come from its npm scope" : ""}: ${id}`);
+}
+
+export class PluginServices {
+  readonly index: PluginIndex;
+  readonly grants: PluginGrants;
+  readonly hosts: ExtensionHosts;
+  readonly native: NativePlugins;
+  /** The person's values for plugins' `configuration` fields. */
+  readonly values: PluginValues;
+  /** Started in safe mode, so no plugin runs. */
+  readonly safeMode: boolean;
+  /** What each plugin printed and what of its failed, since the app started. */
+  readonly logs = new PluginLogs((plugin) => this.values.secrets(plugin));
+  /** Where signed releases are unpacked; uninstalling deletes its folders. */
+  readonly packagesDirectory: string;
+  #packageChanges: Promise<unknown> = Promise.resolve();
+  readonly #bundledOff: ReadonlySet<string>;
+  readonly #folderMatches = new Map<string, { at: number; has: boolean }>();
+  readonly #projectKind: PluginScope["kind"];
+  readonly #projectFolders: (() => readonly string[] | undefined) | undefined;
+  /** Holds each plugin's data folder, `<publisher>/<name>`. */
+  readonly dataDirectory: string;
+  readonly #bundled: Pick<PluginServicesOptions, "bundled" | "onBundledError" | "bundledReplacements">;
+  #files: Promise<void> | undefined;
+  #loaded: Promise<void> | undefined;
+  readonly #listeners = new Set<(folder?: string) => void>();
+  /**
+   * Project folders whose `ohmygame.json` is watched, for edits made outside
+   * OhMyGame, each with the report it is waiting to send and the last one
+   * it sent.
+   */
+  readonly #watchers = new Map<
+    string,
+    {
+      watcher: FSWatcher;
+      timer?: ReturnType<typeof setTimeout>;
+      report?: Promise<void>;
+    }
+  >();
+
+  constructor(options: PluginServicesOptions) {
+    this.index = new PluginIndex(path.join(options.directory, "index.json"));
+    this.safeMode = options.safeMode ?? false;
+    this.grants = new PluginGrants(path.join(options.directory, "grants.json"), { safeMode: this.safeMode });
+    this.hosts = new ExtensionHosts({ ...options.hosts, onLog: (plugin, entry) => this.logs.add(plugin, entry) });
+    this.values = new PluginValues(
+      path.join(options.directory, "configuration.json"),
+      options.settingsWrites,
+    );
+    this.packagesDirectory = path.join(options.directory, "packages");
+    this.#bundledOff = new Set(options.bundledOff);
+    this.#projectKind = options.projectKind;
+    this.#projectFolders = options.projectFolders;
+    this.dataDirectory = path.join(options.directory, "data");
+    this.#bundled = options;
+    this.native = new NativePlugins({
+      index: this.index,
+      resolve: (folder) => this.resolve(folder),
+      appPlugin: (id) => this.appPlugin(id),
+      settingsPlugin: (id) => this.settingsPlugin(id),
+      hosts: this.hosts,
+      configuration: (entry) => this.values.forNative(entry),
+      configure: (id, changes, expected) => this.configure(id, changes, expected),
+      dataFolder: (id) => this.dataFolder(id),
+    });
+  }
+
+  /**
+   * Loads the index and the decisions, then indexes the bundled plugins,
+   * once; later calls wait for the same load, so no caller misses a bundled
+   * plugin on a fresh start.
+   */
+  ready(): Promise<void> {
+    const { bundled, onBundledError } = this.#bundled;
+    this.#loaded ??= this.#load().then(async () => {
+      if (bundled) await this.addBundled(bundled).catch((error: unknown) => onBundledError?.(error));
+    });
+    this.#loaded.catch(() => (this.#loaded = undefined));
+    return this.#loaded;
+  }
+
+  #load(): Promise<void> {
+    this.#files ??= Promise.all([
+      this.index.load(),
+      this.grants.load(),
+      this.values.load(),
+    ]).then(() => {
+      // What installed plugins asked for, which older grants left waiting. The
+      // agent's own installs (`personal/`) still wait until the person turns them on.
+      const installed = new Map<string, string[]>();
+      for (const entry of this.index.entries())
+        if (!entry.id.startsWith(`${PERSONAL_PUBLISHER}/`))
+          installed.set(entry.id, [...installed.get(entry.id) ?? [], ...capabilityGrants(entry.manifest)]);
+      return this.grants.upgrade(installed);
+    });
+    this.#files.catch(() => (this.#files = undefined));
+    return this.#files;
+  }
+
+  /**
+   * The tools of a project's active plugins, run by their native code or
+   * their panel's page, as agent tools named `publisher__name__tool`. Empty
+   * when the folder has no `ohmygame.json`.
+   */
+  async agentTools(
+    folder: string,
+    options: { turn?: () => string | undefined } = {},
+  ): Promise<ToolDefinition[]> {
+    await this.ready();
+    this.#watch(folder);
+    const resolved = await this.resolve(folder).catch(() => undefined);
+    if (!resolved?.ok) return [];
+    const tools: ToolDefinition[] = [];
+    for (const plugin of resolved.plugins) {
+      if (plugin.status === "active" && plugin.entry)
+        tools.push(...this.entryTools(plugin.entry, folder, options));
+    }
+    return tools;
+  }
+
+  /** Builds the tools of an already resolved plugin. Its own assistant uses their manifest names. */
+  entryTools(entry: PluginIndexEntry, folder: string, options: { turn?: () => string | undefined; localNames?: boolean } = {}): ToolDefinition[] {
+    const native = Boolean(entry.manifest.entrypoints?.native);
+    const tools: ToolDefinition[] = [];
+    for (const tool of entry.manifest.contributes?.tools ?? []) {
+      if (!native && !tool.panel) continue;
+      const name = options.localNames ? tool.name : agentToolName(entry.id, tool.name);
+      try {
+        tools.push(this.#tool(entry, tool, name, folder, options.turn));
+      } catch (error) {
+        tools.push(this.#broken(entry, tool.name, name, error));
+      }
+    }
+    return tools;
+  }
+
+  /** What deciding which plugins are on in a project needs. */
+  get scope(): PluginScope {
+    return { index: this.index, grants: this.grants, startsOff: this.#bundledOff, kind: this.#projectKind, folderHas: (folder, files) => this.#folderHas(folder, files) };
+  }
+
+  /** Every plugin on in the project in a folder, or that its file asks for, and whether each runs. */
+  async resolve(folder: string): Promise<ProjectPlugins> {
+    await this.ready();
+    return resolveProjectPlugins({ folder, ...this.scope });
+  }
+
+  /** Whether a plugin is on in every project it suits. */
+  onInEveryProject(id: string): boolean {
+    return onInEveryProject(this.scope, id);
+  }
+
+  /**
+   * The plugins on in every project, each at its newest version, that run
+   * without anything left to allow; with a kind, only those that suit it. A
+   * new project starts with these.
+   */
+  async everyProject(kind?: ProjectKind): Promise<PluginIndexEntry[]> {
+    await this.ready();
+    return [...new Set(this.index.entries().map((entry) => entry.id))].sort().flatMap((id) => {
+      const entry = this.index.get(id);
+      if (!entry || !this.#mayRun(entry) || !this.onInEveryProject(id)) return [];
+      return !kind || appWidePluginSuits(entry.manifest.appliesTo, kind) ? [entry] : [];
+    });
+  }
+
+  /**
+   * Whether an installed plugin recognizes a folder as its kind of project by
+   * the files its `activation` names, such as a Unity project's
+   * `ProjectSettings/ProjectVersion.txt`.
+   */
+  async recognizesFolder(folder: string): Promise<boolean> {
+    await this.ready();
+    const key = await projectFolderKey(folder).catch(() => undefined);
+    if (!key) return false;
+    for (const id of new Set(this.index.entries().map((entry) => entry.id))) {
+      const entry = this.index.get(id);
+      if (!entry || pluginApiIssue(entry.manifest) || this.grants.plugin(id)?.enabled === false) continue;
+      const activation = entry.manifest.activation;
+      const files = typeof activation === "object" ? activation.files : activation ? undefined : ENGINE_FILES_BEFORE_ACTIVATION[id];
+      if (files && await this.#folderHas(key, files)) return true;
+    }
+    return false;
+  }
+
+  /**
+   * The newest version of each installed plugin that this app can run and
+   * whose switch is on. What a plugin adds to the app itself, such as model
+   * providers and agents, comes from these, whatever projects turn on.
+   */
+  async installed(): Promise<PluginIndexEntry[]> {
+    await this.ready();
+    return [...new Set(this.index.entries().map((entry) => entry.id))].sort().flatMap((id) => {
+      const entry = this.index.get(id);
+      return entry && !pluginApiIssue(entry.manifest) && this.grants.plugin(id)?.enabled !== false && this.onInEveryProject(id) ? [entry] : [];
+    });
+  }
+
+  /**
+   * The newest version of a plugin whose code may run outside projects, as
+   * for the Library's sources: one the app can run, not turned off, and
+   * allowed everything it asks for when it was added.
+   */
+  async appPlugin(id: string): Promise<PluginIndexEntry | undefined> {
+    return (await this.everyProject()).find((entry) => entry.id === id);
+  }
+
+  /**
+   * Whether a project folder has any of these files: paths from its root, or
+   * `*.ext` for a file at the root. Answers are kept for a few seconds, as
+   * deciding a project's plugins happens on every turn and command.
+   */
+  async #folderHas(folder: string, files: readonly string[]): Promise<boolean> {
+    const key = `${folder}\0${files.join("\0")}`;
+    const cached = this.#folderMatches.get(key);
+    if (cached && Date.now() - cached.at < FOLDER_MATCH_MS) return cached.has;
+    let names: string[] | undefined;
+    let has = false;
+    for (const file of files) {
+      if (file.startsWith("*.")) {
+        // Files only, as for a path, and in any case, as Windows tools may name `Game.UPROJECT`.
+        names ??= (await readdir(folder, { withFileTypes: true }).catch(() => [])).flatMap((item) => item.isFile() ? [item.name.toLowerCase()] : []);
+        const extension = file.slice(1).toLowerCase();
+        has = names.some((name) => name.endsWith(extension) && name.length > extension.length);
+      } else has = Boolean((await lstat(path.join(folder, file)).catch(() => undefined))?.isFile());
+      if (has) break;
+    }
+    if (this.#folderMatches.size > 500) this.#folderMatches.clear();
+    this.#folderMatches.set(key, { at: Date.now(), has });
+    return has;
+  }
+
+  /**
+   * The newest version of a plugin whose Settings status and actions may run:
+   * on, and allowed everything it asks for. A connection plugin keeps its
+   * pairing in the app activation that runs only while it's on in every
+   * project; any other may be on in just some projects.
+   */
+  async settingsPlugin(id: string): Promise<PluginIndexEntry | undefined> {
+    await this.ready();
+    const entry = this.index.get(id);
+    if (!entry || !this.#mayRun(entry)) return undefined;
+    return entry.manifest.capabilities?.sessions && !this.onInEveryProject(id) ? undefined : entry;
+  }
+
+  /** The plugins whose `settingsPlugin` is their newest version, for listing them all at once. */
+  async settingsPlugins(): Promise<Set<string>> {
+    await this.ready();
+    const ids = new Set<string>();
+    for (const id of new Set(this.index.entries().map((entry) => entry.id)))
+      if (await this.settingsPlugin(id)) ids.add(id);
+    return ids;
+  }
+
+  /** Whether this app can run a version, the plugin isn't turned off, and the person allowed all it asks for. */
+  #mayRun(entry: PluginIndexEntry): boolean {
+    const grant = this.grants.plugin(entry.id);
+    return !pluginApiIssue(entry.manifest) && grant?.enabled !== false && !missingGrants(capabilityGrants(entry.manifest), grant?.allowed ?? []).length;
+  }
+
+  /**
+   * Home's ways to start (`home.starters`): prompt commands of the plugins a
+   * new project starts with, in `locale`, which only fill the prompt box; and
+   * those plugins, for `project.plugin()` in a starter's `when`.
+   */
+  async starters(locale: PluginLocale = "en"): Promise<{ plugins: string[]; commands: ProjectCommand[] }> {
+    const commands: ProjectCommand[] = [];
+    const entries = await this.everyProject();
+    for (const entry of entries)
+      for (const command of entry.manifest.contributes?.commands ?? []) {
+        const slots = (command.slots ?? []).filter((slot) => slot.slot === "home.starters");
+        if (!slots.length || !("prompt" in command.run)) continue;
+        commands.push({ id: `${entry.id}:${command.id}`, plugin: entry.id, title: localizePluginString(entry, command.title, locale), slots, run: command.run });
+      }
+    return { plugins: entries.map((entry) => entry.id), commands };
+  }
+
+  /** The Library's sources from plugins that may run outside projects, in `locale`. */
+  async assetSources(locale: PluginLocale = "en"): Promise<LibrarySource[]> {
+    const sources: LibrarySource[] = [];
+    for (const entry of await this.everyProject()) {
+      const text = (value: string) => localizePluginString(entry, value, locale);
+      const embedHosts = libraryEmbedHosts(entry.manifest.capabilities?.network);
+      for (const source of entry.manifest.contributes?.assetSources ?? [])
+        sources.push({
+          id: `${entry.id}:${source.id}`,
+          plugin: entry.id,
+          pluginName: text(entry.manifest.displayName),
+          title: text(source.title),
+          ...(source.description ? { description: text(source.description) } : {}),
+          media: [...source.media],
+          ...(source.cacheSeconds !== undefined ? { cacheSeconds: source.cacheSeconds } : {}),
+          ...(source.collections ? { collections: source.collections.map((collection) => ({ id: collection.id, title: text(collection.title) })) } : {}),
+          ...(embedHosts.length ? { embedHosts } : {}),
+        });
+    }
+    return sources;
+  }
+
+  /** Runs an asset source's `search` or `fetch`; secrets are taken out of what it says went wrong. */
+  runAssetSource(source: string, handler: "search" | "fetch", options: Omit<PluginCallOptions, "folder" | "version">): Promise<unknown> {
+    const plugin = source.slice(0, Math.max(0, source.lastIndexOf(":")));
+    return this.#redacting(plugin, this.native.runAssetSource(source, handler, options));
+  }
+
+  /** The Skills of `everyProject`, as a new project's agent would load them. */
+  async everyProjectSkills(kind?: ProjectKind): Promise<PluginSkillRegistration[]> {
+    return (await this.everyProject(kind)).flatMap((entry) => entry.skills.map((skill) => skillRegistration(entry, path.join(entry.root, skill.path))));
+  }
+
+  /**
+   * The Skills of a project's active plugins, for agent sessions to load.
+   */
+  /** Static manifest text, exactly as reviewed; never evaluated or localized. */
+  async instructions(folder: string): Promise<Array<{ plugin: string; text: string }>> {
+    const resolved = await this.resolve(folder);
+    if (!resolved.ok) throw new Error("Cannot read the project's plugin instructions");
+    return resolved.plugins.flatMap((plugin) => {
+      const text = plugin.status === "active" ? plugin.entry?.manifest.contributes?.instructions : undefined;
+      return text ? [{ plugin: plugin.id, text }] : [];
+    });
+  }
+
+  async skills(folder: string): Promise<PluginSkillRegistration[]> {
+    await this.ready();
+    this.#watch(folder);
+    const resolved = await this.resolve(folder).catch(() => undefined);
+    if (!resolved?.ok) return [];
+    return projectSkills(resolved).map((skill) => skillRegistration(this.index.get(skill.plugin)!, path.join(skill.root, skill.path)));
+  }
+
+  /** A plugin's data folder; ids are `publisher/name`, so it stays under `dataDirectory`. */
+  dataFolder(id: string): string {
+    // Ids come from routes too; only a real id names a folder inside the store.
+    if (!isPluginId(id)) throw new Error(`Not a plugin id: ${id}`);
+    return path.join(this.dataDirectory, ...id.split("/"));
+  }
+
+  /**
+   * The MCP servers of a project's active plugins, for agent sessions to
+   * start, keyed by a name unique to the plugin and server. A server is left out until the settings it names
+   * are filled in, and an HTTP server while its URL is outside
+   * `capabilities.network`.
+   */
+  async mcpServers(folder: string): Promise<Record<string, McpServerDefinition>> {
+    await this.ready();
+    this.#watch(folder);
+    const resolved = await this.resolve(folder).catch(() => undefined);
+    if (!resolved?.ok) return {};
+    const servers: Record<string, McpServerDefinition> = {};
+    for (const plugin of resolved.plugins) {
+      const entry = plugin.entry;
+      if (plugin.status !== "active" || !entry) continue;
+      for (const server of entry.manifest.contributes?.mcpServers ?? []) {
+        const definition = await this.#mcpDefinition(entry, server);
+        if (definition) servers[pluginMcpServerName(entry.id, server.id)] = definition;
+      }
+    }
+    return servers;
+  }
+
+  /** The installed plugin a session's MCP server name belongs to. */
+  mcpServerPlugin(name: string): string | undefined {
+    const prefix = /^plugin-[0-9a-f]{12}-v2-/.exec(name)?.[0];
+    if (!prefix) return undefined;
+    return this.index.entries().find((entry) => pluginMcpServerName(entry.id, "") === prefix)?.id;
+  }
+
+  /** How to start one of a plugin's MCP servers, unless a setting is missing or a value breaks a rule. */
+  async #mcpDefinition(
+    entry: PluginIndexEntry,
+    server: NonNullable<NonNullable<PluginManifestV2["contributes"]>["mcpServers"]>[number],
+    values: ReturnType<PluginValues["forNative"]> = this.values.forNative(entry),
+  ): Promise<McpServerDefinition | undefined> {
+    const made = await this.#mcpLaunch(entry, server, values);
+    return "definition" in made ? made.definition : undefined;
+  }
+
+  /** How to start one of a plugin's MCP servers, or why it can't start. */
+  async #mcpLaunch(
+    entry: PluginIndexEntry,
+    { setup: _setup, docs: _docs, ...server }: NonNullable<NonNullable<PluginManifestV2["contributes"]>["mcpServers"]>[number],
+    values: ReturnType<PluginValues["forNative"]> = this.values.forNative(entry),
+  ): Promise<{ definition: McpServerDefinition } | { problem: string; missing?: string[] }> {
+    const unset = configReferences(server).filter((name) => values[name] === undefined);
+    if (unset.length) return { problem: `Fill in ${unset.map((name) => localizePluginString(entry, entry.manifest.configuration?.[name]?.title ?? name, "en")).join(", ")} in the plugin's settings`, missing: unset };
+    const filled = fillConfigReferences(server, values);
+    const timeout = filled.timeoutSeconds ? { requestTimeoutMs: filled.timeoutSeconds * 1000 } : {};
+    if ("url" in filled) {
+      // A setting can move the endpoint, but not past what the person allowed.
+      const issue = mcpUrlIssue(filled.url, entry.manifest.capabilities?.network);
+      if (issue) return { problem: `${filled.url}: ${issue}` };
+      return { definition: {
+        url: filled.url,
+        ...(filled.headers ? { headers: filled.headers } : {}),
+        // The adapter keeps every request on this origin, uses the URL and
+        // headers as written, and turns off OAuth and redirects.
+        allowedOrigins: [new URL(filled.url).origin],
+        includeTools: filled.tools,
+        ...timeout,
+        disabled: false,
+      } };
+    }
+    const { id: _id, title: _title, tools, cwd, timeoutSeconds: _timeout, ...launch } = filled;
+    const definition = { ...launch, cwd: path.resolve(entry.root, cwd ?? ".") };
+    // A setting's value is checked as the manifest's own values were.
+    const issue = mcpServerSyntaxIssue(definition);
+    if (issue) return { problem: issue };
+    const dataFolder = this.dataFolder(entry.id);
+    await mkdir(dataFolder, { recursive: true, mode: 0o700 });
+    return { definition: {
+      ...definition,
+      env: { ...definition.env, [PLUGIN_DATA_ENV]: dataFolder },
+      literalEnv: true,
+      includeTools: tools,
+      ...timeout,
+      disabled: false,
+    } };
+  }
+
+  /** A plugin's MCP servers for its Settings: an HTTP server's URL with the saved settings (never a secret), and how to get each running. */
+  mcpServerViews(entry: PluginIndexEntry, text: (value: string) => string): NonNullable<StorePlugin["mcpServers"]> {
+    const values = this.values.forNative(entry);
+    return (entry.manifest.contributes?.mcpServers ?? []).map((server) => ({
+      id: server.id,
+      title: text(server.title),
+      ...("url" in server && configReferences({ url: server.url }).every((name) => values[name] !== undefined) ? { url: fillConfigReferences({ url: server.url }, values).url } : {}),
+      ...(server.setup ? { setup: text(server.setup) } : {}),
+      ...(server.docs ? { docs: server.docs } : {}),
+    }));
+  }
+
+  /**
+   * Tests one of an installed plugin's MCP servers from its Settings, with
+   * its saved settings, as a session would start it, through `probe`. Only
+   * once the person has allowed what the plugin asks for
+   * (`settingsPlugin`): testing a process server runs it. The result names
+   * the server by its title (and URL), not the session's name for it; one
+   * that can't start lists the settings to fill in (`missingSettings`, in
+   * `locale`); and the plugin's secrets are redacted, from failures too.
+   */
+  async testMcpServer(id: string, serverId: string, locale: PluginLocale, probe: (name: string, definition: McpServerDefinition) => Promise<PluginMcpResult>): Promise<PluginMcpResult> {
+    if (this.safeMode) throw new Error("Plugins stay off in safe mode. Restart OhMyGame normally to test this.");
+    const entry = await this.settingsPlugin(id);
+    if (!entry) throw new Error("Turn this plugin on in a project and allow what it asks for, then test it");
+    const server = entry.manifest.contributes?.mcpServers?.find((item) => item.id === serverId);
+    if (!server) throw new Error("This plugin has no such MCP server");
+    const made = await this.#mcpLaunch(entry, server);
+    if ("problem" in made) return {
+      status: "failed", toolCount: 0, message: made.problem,
+      ...(made.missing ? { missingSettings: made.missing.map((name) => localizePluginString(entry, entry.manifest.configuration?.[name]?.title ?? name, locale)) } : {}),
+    };
+    // Its own name, so a test never stands in for a session's server.
+    const name = `${pluginMcpServerName(id, serverId)}-test`;
+    const shown = `"${localizePluginString(entry, server.title, locale)}"${"url" in made.definition ? ` (${made.definition.url})` : ""}`;
+    const clean = (text: string) => redactCredentials(text.split(`${name}_`).join("").split(`"${name}"`).join(shown).split(name).join(shown), this.values.secrets(id));
+    try {
+      const result = await probe(name, made.definition);
+      return result.message ? { ...result, message: clean(result.message) } : result;
+    } catch (cause) {
+      throw new Error(clean(cause instanceof Error ? cause.message : String(cause)));
+    }
+  }
+
+  /**
+   * One MCP server of a draft, to try it. Saved settings, secrets included, are
+   * only for `withSaved`: a package the person installed, and so reviewed. Any
+   * other draft could name an installed plugin to send them somewhere else, so
+   * it gets the manifest's defaults.
+   */
+  async draftMcpServer(root: string, serverId: string, { withSaved }: { withSaved: boolean }): Promise<{ definition?: McpServerDefinition; problem?: string; secrets: string[] }> {
+    await this.ready();
+    // Trying it starts the server's command, which safe mode doesn't run.
+    if (this.safeMode) throw new Error("Plugins stay off in safe mode. Restart OhMyGame normally to test this.");
+    const checked = await indexPluginPackage(root);
+    if (!checked.ok) throw new Error("Prepare a valid draft before testing");
+    const server = checked.entry.manifest.contributes?.mcpServers?.find((item) => item.id === serverId);
+    if (!server) throw new Error("MCP server not found in this draft");
+    const fields = Object.entries(checked.entry.manifest.configuration ?? {});
+    const values = withSaved
+      ? this.values.forNative(checked.entry)
+      : Object.fromEntries(fields.flatMap(([name, field]) => field.default === undefined ? [] : [[name, field.default]]));
+    const secrets = fields.flatMap(([name, field]) => field.type === "secret" && typeof values[name] === "string" ? [values[name] as string] : []);
+    const made = await this.#mcpLaunch(checked.entry, server, values);
+    return { ...("definition" in made ? { definition: made.definition } : { problem: made.problem }), secrets };
+  }
+
+  /**
+   * The commands of a project's active plugins, for the host to place in
+   * their slots and `/`. Each says how it runs: the app runs prompts, URLs,
+   * panels and settings itself; tools and native calls go through the
+   * daemon's command route.
+   */
+  async commands(
+    folder: string,
+    locale: PluginLocale = "en",
+  ): Promise<ProjectCommand[]> {
+    await this.ready();
+    const resolved = await this.resolve(folder).catch(() => undefined);
+    if (!resolved?.ok) return [];
+    return resolved.plugins.flatMap((plugin) =>
+      plugin.status === "active" && plugin.entry ? entryCommands(plugin.entry, locale) : []);
+  }
+
+  /** What a project's active plugins add to its preview. */
+  async preview(
+    folder: string,
+    locale: PluginLocale = "en",
+  ): Promise<ProjectPluginPreview> {
+    await this.ready();
+    const resolved = await this.resolve(folder).catch(() => undefined);
+    const preview: ProjectPluginPreview = { devices: [], filters: [], inputMaps: [] };
+    if (!resolved?.ok) return preview;
+    for (const plugin of resolved.plugins) {
+      const entry = plugin.entry;
+      if (plugin.status !== "active" || !entry) continue;
+      for (const device of entry.manifest.contributes?.previewDevices ?? [])
+        preview.devices.push({
+          id: `${entry.id}:${device.id}` as ProjectPreviewDevice["id"],
+          plugin: entry.id,
+          title: localizePluginString(entry, device.title, locale),
+          width: device.width,
+          height: device.height,
+        });
+      for (const filter of entry.manifest.contributes?.previewFilters ?? [])
+        preview.filters.push({
+          id: `${entry.id}:${filter.id}`,
+          plugin: entry.id,
+          title: localizePluginString(entry, filter.title, locale),
+          source: localizePluginString(entry, filter.source, locale),
+          colorSpace: filter.colorSpace,
+          matrix: filter.matrix,
+          ...(filter.offset ? { offset: filter.offset } : {}),
+        });
+      for (const map of entry.manifest.contributes?.inputMaps ?? [])
+        preview.inputMaps.push({
+          id: `${entry.id}:${map.id}`,
+          plugin: entry.id,
+          title: localizePluginString(entry, map.title, locale),
+          map: compileInputMap(map),
+        });
+    }
+    return preview;
+  }
+
+  /** The sites a project's active plugins put on the Browser panel's new-tab page, in `locale`. */
+  async browserShortcuts(
+    folder: string,
+    locale: PluginLocale = "en",
+  ): Promise<PluginBrowserShortcut[]> {
+    await this.ready();
+    const resolved = await this.resolve(folder).catch(() => undefined);
+    if (!resolved?.ok) return [];
+    const shortcuts: PluginBrowserShortcut[] = [];
+    for (const plugin of resolved.plugins) {
+      const entry = plugin.entry;
+      if (plugin.status !== "active" || !entry) continue;
+      const pluginTitle = localizePluginString(entry, entry.manifest.displayName, locale);
+      for (const shortcut of entry.manifest.contributes?.browserShortcuts ?? [])
+        shortcuts.push({ plugin: entry.id, pluginTitle, title: localizePluginString(entry, shortcut.title, locale), url: shortcut.url });
+    }
+    return shortcuts;
+  }
+
+  /** What a project's active plugins add to Asset Canvas, in `locale`. */
+  async canvas(
+    folder: string,
+    locale: PluginLocale = "en",
+  ): Promise<ProjectPluginCanvas> {
+    await this.ready();
+    const resolved = await this.resolve(folder).catch(() => undefined);
+    const canvas: ProjectPluginCanvas = { nodes: [], presets: [] };
+    if (!resolved?.ok) return canvas;
+    for (const plugin of resolved.plugins) {
+      const entry = plugin.entry;
+      if (plugin.status !== "active" || !entry) continue;
+      const text = (value: string) => localizePluginString(entry, value, locale);
+      const pluginName = text(entry.manifest.displayName);
+      for (const node of entry.manifest.contributes?.canvasNodes ?? [])
+        canvas.nodes.push({
+          id: `${entry.id}:${node.id}`,
+          plugin: entry.id,
+          pluginName,
+          title: text(node.title),
+          ...(node.description ? { description: text(node.description) } : {}),
+          inputs: (node.inputs ?? []).map((input) => ({ ...input, title: text(input.title) })),
+          params: Object.entries(node.params ?? {}).map(([key, param]) => ({
+            key,
+            ...param,
+            title: text(param.title),
+            ...(param.description ? { description: text(param.description) } : {}),
+          })),
+          output: node.output,
+        });
+      for (const preset of entry.manifest.contributes?.canvasPresets ?? [])
+        canvas.presets.push({
+          id: `${entry.id}:${preset.id}`,
+          plugin: entry.id,
+          pluginName,
+          title: text(preset.title),
+          ...(preset.description ? { description: text(preset.description) } : {}),
+        });
+    }
+    return canvas;
+  }
+
+  /** A preset's nodes and edges, from an active plugin's package, checked again as it is read. */
+  async canvasPreset(folder: string, plugin: string, id: string): Promise<CanvasPresetBoard | undefined> {
+    await this.ready();
+    const resolved = await this.resolve(folder).catch(() => undefined);
+    const entry = resolved?.ok ? resolved.plugins.find((candidate) => candidate.status === "active" && candidate.entry?.id === plugin)?.entry : undefined;
+    const preset = entry?.manifest.contributes?.canvasPresets?.find((candidate) => candidate.id === id);
+    if (!entry || !preset) return undefined;
+    const file = path.join(entry.root, preset.board);
+    const bytes = await readFile(file);
+    if (bytes.length > CANVAS_PRESET_MAX_BYTES) throw new Error(`${preset.board} is too large`);
+    const value: unknown = JSON.parse(bytes.toString("utf8"));
+    const problem = canvasPresetIssue(value);
+    if (problem) throw new Error(`${preset.board} ${problem}`);
+    const board = migrateLegacyAudioNodes(value).value as Partial<CanvasPresetBoard>;
+    return { nodes: board.nodes!, edges: board.edges ?? [] };
+  }
+
+  /** The panels of a project's active plugins, with what their pages may ask the host for. */
+  async panels(
+    folder: string,
+    locale: PluginLocale = "en",
+  ): Promise<ProjectPanel[]> {
+    await this.ready();
+    const resolved = await this.resolve(folder).catch(() => undefined);
+    if (!resolved?.ok) return [];
+    return resolved.plugins.flatMap((plugin) =>
+      plugin.status === "active" && plugin.entry ? entryPanels(plugin.entry, locale) : []);
+  }
+
+  /** The active entry for a plugin, at the version the project uses. */
+  async projectPlugin(folder: string, id: string): Promise<PluginIndexEntry | undefined> {
+    const resolved = await this.resolve(folder);
+    const plugin = resolved.ok ? resolved.plugins.find((item) => item.id === id) : undefined;
+    return plugin?.status === "active" ? plugin.entry : undefined;
+  }
+
+  /** A command of a project's active plugin, at the version the project uses. */
+  async projectCommand(folder: string, id: string) {
+    const at = id.lastIndexOf(":");
+    const entry = await this.projectPlugin(folder, id.slice(0, at));
+    const command = entry?.manifest.contributes?.commands?.find((item) => item.id === id.slice(at + 1));
+    return entry && command ? { entry, command } : undefined;
+  }
+
+  /**
+   * Whether a project of a plugin type may take a prompt, from the type's
+   * `ready` command. Only an answer of `{ ready: false }` holds a prompt back:
+   * a plugin that is off, missing or failing never locks the project.
+   */
+  async projectReady(
+    folder: string,
+    type: string,
+    locale: PluginLocale = "en",
+  ): Promise<{ ready: true } | { ready: false; message?: string; panel: string }> {
+    const owner = projectTypePlugin(type);
+    if (!owner) return { ready: true };
+    await this.ready();
+    const resolved = await this.resolve(folder).catch(() => undefined);
+    const plugin = resolved?.ok ? resolved.plugins.find((item) => item.id === owner) : undefined;
+    const entry = plugin?.status === "active" ? plugin.entry : undefined;
+    const check = entry?.manifest.contributes?.projectTypes?.find((item) => `${owner}:${item.id}` === type)?.ready;
+    if (!entry || !check) return { ready: true };
+    let answer: unknown;
+    try {
+      answer = await this.native.runCommand(`${owner}:${check.command}`, {
+        folder,
+        version: entry.version,
+        timeoutMs: READY_TIMEOUT_MS,
+      });
+    } catch {
+      return { ready: true };
+    }
+    if (!answer || typeof answer !== "object" || (answer as { ready?: unknown }).ready !== false) return { ready: true };
+    const message = (answer as { message?: unknown }).message;
+    return {
+      ready: false,
+      // A `%key%` message comes from the plugin's locale files, in the person's language.
+      ...(typeof message === "string" && message.trim() ? { message: localizePluginString(entry, message, locale).slice(0, 500) } : {}),
+      panel: `${owner}:${check.panel}`,
+    };
+  }
+
+  /** Sets some of a plugin's configuration; the next call to its native code sees them. */
+  async configure(
+    id: string,
+    changes: Record<string, string | boolean | null>,
+    expected?: PluginConfigurationValues,
+  ): Promise<void> {
+    await this.ready();
+    const entry = this.index.get(id);
+    if (!entry) throw new Error(`${id} is not installed`);
+    await this.values.update(entry, changes, expected);
+    await this.changed();
+  }
+
+  /**
+   * Runs when what a project's plugins offer may have changed: after an
+   * install, a decision, or a change to `ohmygame.json`. Sessions listen to
+   * rebuild their tools; `folder` is undefined when every project may be
+   * affected.
+   */
+  onChange(listener: (folder?: string) => void): () => void {
+    this.#listeners.add(listener);
+    return () => this.#listeners.delete(listener);
+  }
+
+  /**
+   * Unloads what projects no longer allow and tells listeners. Every change
+   * to the index, the decisions or a project file goes through here, or
+   * through the methods below that call it.
+   */
+  async changed(folder?: string): Promise<void> {
+    await this.ready();
+    await this.#notify(folder);
+  }
+
+  async #notify(folder?: string): Promise<void> {
+    await (folder ? this.native.refreshProject(folder) : this.native.refresh());
+    for (const listener of this.#listeners) {
+      try {
+        listener(folder);
+      } catch {
+        // A listener failing doesn't stop the others.
+      }
+    }
+  }
+
+  async install(root: string) {
+    await this.ready();
+    const result = await this.index.add(root);
+    if (result.ok) await this.changed();
+    return result;
+  }
+
+  /**
+   * Indexes the plugins that ship with the app, in place. They are
+   * OhMyGame's own, so what they ask for is allowed at install; one that
+   * starts off is still off until the person turns it on.
+   */
+  async addBundled(directory: string): Promise<PluginPackageResult[]> {
+    // `ready()` runs this, so it waits only for the files.
+    await this.#load();
+    const folders = await readdir(directory, { withFileTypes: true }).catch(
+      () => [],
+    );
+    const replaced = await this.#bundled.bundledReplacements?.();
+    const results: PluginPackageResult[] = [];
+    for (const folder of folders) {
+      if (!folder.isDirectory()) continue;
+      const root = path.join(directory, folder.name);
+      if (replaced?.size) {
+        const checked = await indexPluginPackage(root);
+        if (checked.ok && replaced.has(checked.entry.id)) continue;
+      }
+      const result = await this.index.add(root);
+      results.push(result);
+      if (!result.ok || !result.entry.id.startsWith("ohmygame/")) continue;
+      // A version this folder used to hold, or a folder the app no longer has,
+      // goes; a version installed apart stays.
+      for (const other of this.index.versions(result.entry.id))
+        if (other.version !== result.entry.version) await this.index.verify(other.id, other.version);
+      await this.grants.consent(
+        result.entry.id,
+        // Cross-project session access always needs a person's explicit consent, even for bundled updates.
+        capabilityGrants(result.entry.manifest).filter((grant) => grant !== "sessions"),
+      );
+    }
+    // A plugin the app no longer brings goes too, not only an older version of
+    // one it does, wherever an earlier install of the app kept it. Outside the
+    // store only the app publishes as ohmygame/: one added from OhMyGame's npm
+    // scope is installed in the store.
+    const current = new Set(results.flatMap((result) => result.ok ? [`${result.entry.id}@${result.entry.version}`] : []));
+    const store = path.resolve(this.packagesDirectory) + path.sep;
+    for (const entry of this.index.entries())
+      if (entry.id.startsWith("ohmygame/") && !entry.root.startsWith(store) && !current.has(`${entry.id}@${entry.version}`))
+        await this.index.verify(entry.id, entry.version);
+    await this.#notify();
+    return results;
+  }
+
+  /**
+   * Copies a package into the store and, unless told not to, allows what it
+   * asks for; the caller vouches for it. The same version replaces its older
+   * copy, and a choice to turn the plugin off stays.
+   */
+  installManaged(source: string, { consent = true, before }: { consent?: boolean; before?: () => Promise<void> } = {}): Promise<PluginIndexEntry> {
+    return this.#onePackageChangeAtATime(async () => {
+      await before?.();
+      return this.#installManaged(source, consent);
+    });
+  }
+
+  async #installManaged(source: string, consent: boolean): Promise<PluginIndexEntry> {
+    await this.ready();
+    const checked = await indexPluginPackage(source);
+    if (!checked.ok) throw new Error(`Not a valid plugin: ${checked.issues.slice(0, 3).map((issue) => `${issue.path} ${issue.message}`).join("; ")}`);
+    const { id, version } = checked.entry;
+    const target = path.join(this.packagesDirectory, ...id.split("/"), version);
+    const staging = path.join(this.packagesDirectory, `.staging-${randomUUID()}`);
+    const previous = path.join(this.packagesDirectory, `.replaced-${randomUUID()}`);
+    await mkdir(this.packagesDirectory, { recursive: true });
+    let movedAside = false;
+    let placed = false;
+    let entry: PluginIndexEntry;
+    try {
+      await cp(source, staging, { recursive: true, verbatimSymlinks: true });
+      await mkdir(path.dirname(target), { recursive: true });
+      movedAside = await rename(target, previous).then(() => true, (cause: NodeJS.ErrnoException) => {
+        if (cause.code === "ENOENT") return false;
+        throw cause;
+      });
+      await rename(staging, target);
+      placed = true;
+      const result = await this.index.add(target);
+      if (!result.ok) throw new Error(`Not a valid plugin: ${result.issues.slice(0, 3).map((issue) => `${issue.path} ${issue.message}`).join("; ")}`);
+      entry = result.entry;
+    } catch (cause) {
+      // The copy it was replacing is still in use, so it goes back.
+      if (placed) await rm(target, { recursive: true, force: true });
+      if (movedAside) await rename(previous, target);
+      throw cause;
+    } finally {
+      await rm(staging, { recursive: true, force: true });
+      await rm(previous, { recursive: true, force: true });
+    }
+    if (consent) await this.grants.consent(id, capabilityGrants(entry.manifest));
+    await this.changed();
+    return entry;
+  }
+
+  /**
+   * Installs a package the person made. These are all `personal/<name>`, so
+   * one can't replace what the app or a publisher ships.
+   */
+  async installPersonal(source: string, options: { consent: boolean }): Promise<PluginIndexEntry> {
+    const checked = await indexPluginPackage(source);
+    if (checked.ok && !checked.entry.id.startsWith(`${PERSONAL_PUBLISHER}/`))
+      throw new Error(`The plugin's id must be ${PERSONAL_PUBLISHER}/<name>, not ${checked.entry.id}`);
+    return this.#replacingOlder(await this.installManaged(source, options));
+  }
+
+  /**
+   * Installs a package the person added from npm, GitHub or a file, after its
+   * review listed what it asks for, so adding it allows that and turns it on
+   * in every project it suits, unless the person turned it off before. It can't take a
+   * name the app or the Plugin Builder uses, unless
+   * `origin` vouches for it (`assertAddablePlugin`). `before` runs first, with
+   * no other package changing, to call the install off.
+   */
+  async installAdded(source: string, before?: () => Promise<void>, origin?: PluginOrigin): Promise<PluginIndexEntry> {
+    const checked = await indexPluginPackage(source);
+    if (checked.ok) assertAddablePlugin(checked.entry.id, origin);
+    const entry = await this.installManaged(source, { consent: true, before });
+    // One that says where it's on (`activation`) is left to that, as an engine's plugin is on only in its projects.
+    if (!entry.manifest.activation && this.grants.plugin(entry.id)?.everyProject === undefined) {
+      await this.grants.setEveryProject(entry.id, true);
+      await this.changed();
+    }
+    return this.#replacingOlder(entry);
+  }
+
+  /**
+   * Installs a newer version the app brought along, as the person's own update
+   * would, without changing switches or grants: what's allowed already covers it.
+   */
+  async installUpdate(source: string, before?: () => Promise<void>): Promise<PluginIndexEntry> {
+    const entry = await this.installManaged(source, { consent: false, before });
+    // Installed is installed: an older version that can't be removed now stays until a later update.
+    return this.#replacingOlder(entry).catch(() => entry);
+  }
+
+  /**
+   * A new version replaces its older versions. A plugin that only adds Skills
+   * replaces every other; any other replaces only older ones no project still
+   * runs, as one that names an older version keeps it. When a project or its
+   * plugins can't be read, every older version is kept.
+   */
+  async #replacingOlder(entry: PluginIndexEntry): Promise<PluginIndexEntry> {
+    const skillsOnly = isAppWidePlugin(entry.manifest);
+    const others = this.index.versions(entry.id).filter((item) => skillsOnly
+      ? item.version !== entry.version && isAppWidePlugin(item.manifest)
+      : isNewerPluginVersion(entry.version, item.version));
+    const used = new Set<string>();
+    let known = true;
+    if (!skillsOnly && others.length) {
+      const folders = this.#projectFolders?.();
+      known = Boolean(folders);
+      for (const folder of folders ?? []) {
+        const resolved = await this.resolve(folder).catch(() => undefined);
+        if (!resolved?.ok) { known = false; break; }
+        const state = resolved.plugins.find((item) => item.id === entry.id);
+        if (state) used.add(state.version);
+      }
+    }
+    for (const item of others) {
+      // Never the last one: something else may have removed the new version meanwhile.
+      if (!this.index.get(entry.id, entry.version)) break;
+      if (skillsOnly || (known && !used.has(item.version))) await this.uninstall(entry.id, item.version);
+    }
+    return entry;
+  }
+
+  /**
+   * Uninstalls a version, or every version. The last one takes the plugin's
+   * grants with it and, unless `keepData`, its settings and data folder;
+   * kept, a later install finds them again.
+   */
+  uninstall(id: string, version?: string, options: { keepData?: boolean; beforeLast?: () => Promise<void> } = {}): Promise<void> {
+    return this.#onePackageChangeAtATime(async () => {
+      await this.ready();
+      const versions = this.index.versions(id);
+      if (versions.length && (version === undefined || (versions.length === 1 && versions[0]!.version === version))) await options.beforeLast?.();
+      await this.#uninstall(id, version, options.keepData ?? false);
+    });
+  }
+
+  /** A plugin's log, its saved secrets and anything shaped like a credential redacted. */
+  log(id: string): PluginLogView {
+    return { entries: this.logs.read(id), quarantined: this.native.quarantined(id) };
+  }
+
+  /** What uninstalling a version, or every version, removes and leaves. */
+  async uninstallPreview(id: string, version?: string): Promise<Omit<PluginUninstallPreview, "projects">> {
+    await this.ready();
+    const removed = version
+      ? [this.index.get(id, version)].filter((entry) => entry !== undefined)
+      : this.index.versions(id);
+    const last = removed.length > 0 && removed.length === this.index.versions(id).length;
+    return {
+      last,
+      settings: last ? this.values.count(id) : 0,
+      dataBytes: last ? await folderBytes(this.dataFolder(id)) : 0,
+      projectFiles: [...new Set(removed.flatMap((entry) => entry.manifest.projectFiles ?? []))].sort(),
+    };
+  }
+
+  /** Installing and uninstalling share folders, so one can't delete what the other just placed. */
+  #onePackageChangeAtATime<T>(work: () => Promise<T>): Promise<T> {
+    const run = this.#packageChanges.then(work);
+    this.#packageChanges = run.catch(() => undefined);
+    return run;
+  }
+
+  async #uninstall(id: string, version: string | undefined, keepData: boolean): Promise<void> {
+    await this.ready();
+    const removed = version
+      ? [this.index.get(id, version)].filter((entry) => entry !== undefined)
+      : this.index.versions(id);
+    if (!removed.length) return;
+    await this.index.remove(id, version);
+    const last = !this.index.versions(id).length;
+    if (last) {
+      await this.grants.forget(id);
+      if (!keepData) await this.values.forget(id);
+    }
+    // Hosts let go of the removed versions before their files go.
+    await this.changed();
+    for (const entry of removed) {
+      const inside = path.relative(this.packagesDirectory, entry.root);
+      if (inside && !inside.startsWith("..") && !path.isAbsolute(inside))
+        await rm(entry.root, { recursive: true, force: true });
+    }
+    if (last && !keepData) {
+      await rm(this.dataFolder(id), { recursive: true, force: true });
+      this.logs.forget(id);
+    }
+  }
+
+  /** Drops what was kept when the last version was uninstalled, before a package from elsewhere takes the id. */
+  async forgetKeptData(id: string): Promise<void> {
+    await this.ready();
+    if (this.index.versions(id).length) return;
+    await this.values.forget(id);
+    await rm(this.dataFolder(id), { recursive: true, force: true });
+    this.logs.forget(id);
+  }
+
+  /** Records what the person allowed at install; a new plugin starts on. */
+  async consent(id: string, allowed: readonly string[]): Promise<void> {
+    await this.ready();
+    // What's allowed belongs to an installed plugin, so a package added later under its id asks again.
+    if (!this.index.get(id)) throw new Error(`${id} is not installed`);
+    await this.grants.consent(id, allowed);
+    await this.changed();
+  }
+
+  /**
+   * Turns a plugin on or off in every project it suits; projects that set it
+   * themselves keep that. Turning it on allows what it asks for.
+   */
+  async setEveryProject(id: string, on: boolean): Promise<void> {
+    await this.ready();
+    const entry = this.index.get(id);
+    if (!entry) throw new Error(`${id} is not installed`);
+    if (on) await this.grants.consent(id, capabilityGrants(entry.manifest));
+    await this.grants.setEveryProject(id, on);
+    await this.changed();
+  }
+
+  /** Starts a plugin again after it stopped from crashing too often. */
+  async restart(id: string): Promise<void> {
+    await this.ready();
+    if (this.safeMode) throw new Error("Plugins stay off in safe mode. Restart OhMyGame normally to turn one on.");
+    this.native.release(id);
+    await this.changed();
+  }
+
+  async approve(
+    folder: string,
+    id: string,
+    allowed: readonly string[],
+  ): Promise<void> {
+    await this.ready();
+    await this.grants.approve(await projectFolderKey(folder), id, allowed);
+    await this.changed(folder);
+  }
+
+  async revoke(folder: string, id: string): Promise<void> {
+    await this.ready();
+    await this.grants.revoke(await projectFolderKey(folder), id);
+    await this.changed(folder);
+  }
+
+  /** Turns a plugin on in a project, at a version or its newest, or off. */
+  async setProjectPlugin(
+    folder: string,
+    id: string,
+    on: boolean,
+    options: { version?: string; initialType?: string } = {},
+  ): Promise<void> {
+    await this.ready();
+    await setProjectPlugin({ folder, id, on, ...options, ...this.scope });
+    await this.changed(folder);
+  }
+
+  async close(): Promise<void> {
+    await Promise.all(
+      [...this.#watchers.keys()].map((folder) => this.#unwatch(folder)),
+    );
+    await this.native.dispose();
+  }
+
+  /**
+   * Stops watching a project and its host, as when it is deleted. A report
+   * the watcher was still waiting to send is dropped; one already on its way
+   * finishes first.
+   */
+  async closeProject(folder: string): Promise<void> {
+    await this.#unwatch(folder);
+    await this.native.closeProject(folder);
+  }
+
+  /**
+   * Watches the folder, not the file: atomic saves replace the file. A
+   * change to `ohmygame.json` by hand, by git or by an agent counts as a
+   * change to the project's plugins.
+   */
+  #watch(folder: string) {
+    if (this.#watchers.has(folder)) return;
+    try {
+      const watcher = watch(folder, { persistent: false }, (_event, name) => {
+        if (name !== null && String(name) !== PROJECT_FILE_NAME) return;
+        const watched = this.#watchers.get(folder);
+        if (watched?.watcher !== watcher) return;
+        clearTimeout(watched.timer);
+        watched.timer = setTimeout(() => {
+          watched.timer = undefined;
+          watched.report = this.changed(folder).catch(() => {});
+        }, 200);
+      });
+      // A watcher that fails still sends what it saw; the next call to
+      // `#watch` starts a new one.
+      watcher.on("error", () => {
+        watcher.close();
+        if (this.#watchers.get(folder)?.watcher === watcher)
+          this.#watchers.delete(folder);
+      });
+      this.#watchers.set(folder, { watcher });
+    } catch {
+      // A folder that can't be watched still works; edits show next session.
+    }
+  }
+
+  /**
+   * Stops watching the folder: drops the report it still owed and waits for
+   * one it already sent.
+   */
+  async #unwatch(folder: string): Promise<void> {
+    const watched = this.#watchers.get(folder);
+    if (!watched) return;
+    clearTimeout(watched.timer);
+    watched.watcher.close();
+    this.#watchers.delete(folder);
+    await watched.report;
+  }
+
+  #tool(
+    entry: PluginIndexEntry,
+    tool: NonNullable<
+      NonNullable<PluginIndexEntry["manifest"]["contributes"]>["tools"]
+    >[number],
+    name: string,
+    folder: string,
+    turn: (() => string | undefined) | undefined,
+  ): ToolDefinition {
+    const parameters = this.#schema(entry, tool.input);
+    const output = tool.output ? this.#schema(entry, tool.output) : undefined;
+    return {
+      name,
+      label: `${localizePluginString(entry, entry.manifest.displayName, "en")}: ${tool.name}`,
+      description: localizePluginString(entry, tool.description, "en"),
+      parameters,
+      ...(output ? { outputSchema: output } : {}),
+      namespace: { name: entry.id.replace("/", "__") },
+      execute: async (
+        toolCallId,
+        input,
+        signal,
+        onUpdate,
+      ): Promise<AgentToolResult<unknown>> => {
+        const value = await this.callTool(entry, tool.name, {
+          folder,
+          input,
+          signal,
+          onProgress: (message, url) =>
+            onUpdate?.({
+              content: [{ type: "text", text: url ? `${message}\n${url}` : message }],
+              details: { plugin: entry.id, tool: tool.name, progress: message, ...(url ? { url } : {}) },
+            }),
+          turn: turn?.() ?? toolCallId,
+        });
+        const text =
+          typeof value === "string"
+            ? value
+            : (JSON.stringify(value ?? null, null, 2) ?? "null");
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                text.length > TOOL_TEXT_MAX_CHARS
+                  ? `${text.slice(0, TOOL_TEXT_MAX_CHARS)}\n… (cut at ${TOOL_TEXT_MAX_CHARS} characters)`
+                  : text,
+            },
+          ],
+          details: { plugin: entry.id, tool: tool.name },
+          ...(output ? { structuredContent: value as never } : {}),
+        };
+      },
+    };
+  }
+
+  /**
+   * Runs a plugin tool with its input and result checked against the schemas
+   * its manifest names. Agents and commands both call tools through here.
+   */
+  async callTool(
+    entry: PluginIndexEntry,
+    name: string,
+    options: Omit<PluginCallOptions, "version">,
+  ): Promise<unknown> {
+    // A session made before a version change must not run the new code with this version's schemas.
+    return this.#checkedTool(entry, entry.id, name, options.input, (tool, input) => {
+      const declared = entry.manifest.contributes?.tools?.find((item) => item.name === tool);
+      if (declared?.panel) {
+        if (!this.#pageTools) return Promise.reject(new Error(`${entry.id}'s ${tool} runs in its panel, which only the app's window can show`));
+        return this.#pageTools(entry, { name: tool, panel: declared.panel, ...(declared.timeoutSeconds ? { timeoutSeconds: declared.timeoutSeconds } : {}) }, { ...options, input });
+      }
+      return this.#redacting(entry.id, this.native.callTool(`${entry.id}:${tool}`, { ...options, input, version: entry.version }));
+    });
+  }
+
+  #pageTools: PageToolRunner | undefined;
+
+  /** How a tool a panel answers reaches its page: through the project's open window. */
+  servePageTools(run: PageToolRunner): void {
+    this.#pageTools = run;
+  }
+
+  /**
+   * Runs a command that runs plugin code. A tool command's `input`, from a
+   * page or the manifest, is checked by the tool; a native command takes
+   * input only when it declares a schema for it.
+   */
+  async runCommand(
+    entry: PluginIndexEntry,
+    command: PluginCommand,
+    options: Pick<PluginCallOptions, "folder" | "input" | "onProgress" | "build">,
+  ): Promise<unknown> {
+    const id = `${entry.id}:${command.id}`;
+    return this.#checkedCommand(entry, entry.id, command, options.input, {
+      tool: (tool, input) => this.callTool(entry, tool, { ...options, input }),
+      native: (input) => this.#redacting(entry.id, this.native.runCommand(id, { ...options, version: entry.version, ...(input === undefined ? {} : { input }) })),
+    });
+  }
+
+  /**
+   * Runs one of a Plugin Builder draft's tools, commands or hooks, checked
+   * as `callTool` and `runCommand` check an installed plugin's, but under its
+   * draft id, in a host scope of its own (`NativePlugins.callDraft`).
+   */
+  async runDraft(entry: PluginIndexEntry, target: DraftRunTarget, options: {
+    id: string;
+    scope: string;
+    folder: string;
+    dataFolder: string;
+    input?: unknown;
+    signal?: AbortSignal;
+  }): Promise<unknown> {
+    const tool = (name: string, given: unknown) => this.#checkedTool(entry, options.id, name, given, (name, input) =>
+      entry.manifest.contributes?.tools?.find((item) => item.name === name)?.panel
+        ? Promise.reject(new PluginCommandInputError(`${name} is answered by the draft's panel, not its native code; try it from the panel's preview`))
+        : this.native.callDraft(entry, { ...options, input, tool: name }));
+    if ("tool" in target) return tool(target.tool, options.input);
+    if ("command" in target) {
+      const command = entry.manifest.contributes?.commands?.find((item) => item.id === target.command);
+      if (!command) throw new PluginCommandInputError(`${options.id} does not declare a command named ${target.command}`);
+      return this.#checkedCommand(entry, options.id, command, options.input, {
+        tool,
+        native: (input) => this.native.callDraft(entry, { ...options, input, command: (command.run as { native: string }).native }),
+      });
+    }
+    if (!(manifestHooks(entry.manifest) as readonly string[]).includes(target.hook))
+      throw new PluginCommandInputError(`${options.id} doesn't hear ${target.hook}`);
+    return this.native.callDraft(entry, { ...options, input: options.input ?? {}, hook: target.hook });
+  }
+
+  /** A tool's input and result checked against its schemas around `call`; `plugin` names it in errors. */
+  async #checkedTool(entry: PluginIndexEntry, plugin: string, name: string, given: unknown,
+    call: (tool: string, input: unknown) => Promise<unknown>): Promise<unknown> {
+    const tool = entry.manifest.contributes?.tools?.find((item) => item.name === name);
+    if (!tool) throw new Error(`${plugin} does not declare a tool named ${name}`);
+    const id = `${plugin}:${name}`;
+    const input = this.#schema(entry, tool.input);
+    if (!Check(input, given ?? {})) throw new PluginToolSchemaError(id, "input", input, given ?? {});
+    const value = await call(tool.name, given ?? {});
+    const output = tool.output ? this.#schema(entry, tool.output) : undefined;
+    if (output && !Check(output, value)) throw new PluginToolSchemaError(id, "output", output, value);
+    return value;
+  }
+
+  /** A command's input checked as its `run` says, then given to the tool or native code it runs. */
+  async #checkedCommand(entry: PluginIndexEntry, plugin: string, command: PluginCommand, given: unknown, run: {
+    tool: (tool: string, input: unknown) => Promise<unknown>;
+    native: (input: unknown) => Promise<unknown>;
+  }): Promise<unknown> {
+    const id = `${plugin}:${command.id}`;
+    if ("tool" in command.run) return run.tool(command.run.tool, given ?? command.run.input ?? {});
+    if (!("native" in command.run)) throw new PluginCommandInputError(`${id} runs in the app`);
+    if (!command.run.input) {
+      if (given !== undefined) throw new PluginCommandInputError(`${id} takes no input`);
+      return run.native(undefined);
+    }
+    const schema = this.#schema(entry, command.run.input);
+    const input = given ?? {};
+    if (!Check(schema, input)) throw new PluginToolSchemaError(id, "input", schema, input);
+    return run.native(input);
+  }
+
+  /** A plugin's error reaches a toast, a page or an agent as its log does, with its secrets taken out. */
+  async #redacting<T>(plugin: string, call: Promise<T>): Promise<T> {
+    try {
+      return await call;
+    } catch (cause) {
+      if (cause instanceof Error) cause.message = redactCredentials(cause.message, this.values.secrets(plugin));
+      throw cause;
+    }
+  }
+
+  /** A tool whose schema can't be read still shows, and says why it can't run. */
+  #broken(
+    entry: PluginIndexEntry,
+    tool: string,
+    name: string,
+    error: unknown,
+  ): ToolDefinition {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      name,
+      label: `${entry.id}: ${tool}`,
+      description: `Unavailable: ${message}`,
+      parameters: { type: "object", properties: {} } as unknown as TSchema,
+      execute: () => {
+        throw new Error(`${entry.id} can't run ${tool}: ${message}`);
+      },
+    };
+  }
+
+  /** A schema the index checked and kept from the package's bytes. */
+  #schema(entry: PluginIndexEntry, file: string): TSchema {
+    const schema = entry.toolSchemas?.[file];
+    if (!schema) throw new Error(`${file} was not indexed`);
+    return structuredClone(schema) as unknown as TSchema;
+  }
+}

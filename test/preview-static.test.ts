@@ -1,0 +1,544 @@
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { startStaticPreview } from "../src/daemon/preview-static.js";
+import { PluginIndex } from "../src/daemon/plugin-index.js";
+import { PluginPageStorage } from "../src/daemon/plugin-page-storage.js";
+import { startPluginUiServer } from "../src/daemon/plugin-ui-server.js";
+import { PAGE_TOKENS } from "../src/renderer/plugin-frame.js";
+import { pageFilePaths, pluginFrameNavigationAllowed, pluginUiRefusal, readPluginUiRequest } from "../src/shared/plugin-ui-protocol.js";
+
+const cleanups: (() => Promise<void>)[] = [];
+
+afterEach(async () => {
+  for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
+});
+
+async function directory(): Promise<string> {
+  const value = await mkdtemp(path.join(tmpdir(), "ohmygame-static-preview-"));
+  cleanups.push(() => rm(value, { recursive: true, force: true }));
+  return value;
+}
+
+async function preview(root: string): Promise<string> {
+  const server = await startStaticPreview(root, 0);
+  cleanups.push(() => server.close());
+  return server.url;
+}
+
+describe("static preview directory URLs", () => {
+  it.each(["GET", "HEAD"])(
+    "redirects %s to a trailing slash while preserving escaped paths and queries",
+    async (method) => {
+      const root = await directory();
+      const nested = path.join(root, "level one");
+      await mkdir(nested);
+      const html = '<script type="module" src="./game.js"></script>';
+      await writeFile(path.join(nested, "index.html"), html);
+      await writeFile(
+        path.join(nested, "game.js"),
+        "export const ready = true;",
+      );
+      const url = `${await preview(root)}/level%20one?level=2&label=a%2Fb`;
+
+      const redirect = await fetch(url, { method, redirect: "manual" });
+      expect(redirect.status).toBe(301);
+      expect(redirect.headers.get("location")).toBe(
+        "/level%20one/?level=2&label=a%2Fb",
+      );
+      expect(redirect.headers.get("cache-control")).toBe("no-store");
+      expect(await redirect.text()).toBe("");
+
+      const response = await fetch(url, { method });
+      expect(response.status).toBe(200);
+      const resolvedUrl = new URL(response.url);
+      expect(resolvedUrl.pathname).toBe("/level%20one/");
+      expect(resolvedUrl.search).toBe("?level=2&label=a%2Fb");
+      expect(await response.text()).toBe(method === "HEAD" ? "" : html);
+      const script = await fetch(new URL("./game.js", resolvedUrl));
+      expect(script.status).toBe(200);
+      expect(await script.text()).toBe("export const ready = true;");
+    },
+  );
+
+  it.each(["GET", "HEAD"])(
+    "checks %s paths and resolved indexes before redirecting",
+    async (method) => {
+      const root = await directory();
+      const outside = await directory();
+      await writeFile(path.join(outside, "index.html"), "outside");
+      await symlink(
+        outside,
+        path.join(root, "external"),
+        process.platform === "win32" ? "junction" : "dir",
+      );
+      const indexed = path.join(root, "index-escape");
+      await mkdir(indexed);
+      // Windows junctions exercise index containment without symlink privileges.
+      await symlink(
+        process.platform === "win32"
+          ? outside
+          : path.join(outside, "index.html"),
+        path.join(indexed, "index.html"),
+        process.platform === "win32" ? "junction" : "file",
+      );
+      for (const name of [".private", "node_modules"]) {
+        await mkdir(path.join(root, name));
+        await writeFile(path.join(root, name, "index.html"), "blocked");
+      }
+      const url = await preview(root);
+
+      for (const name of [
+        ".private",
+        "node_modules",
+        "external",
+        "index-escape",
+      ]) {
+        const response = await fetch(`${url}/${name}`, {
+          method,
+          redirect: "manual",
+        });
+        expect(response.status).toBe(403);
+        expect(response.headers.has("location")).toBe(false);
+        await response.text();
+      }
+    },
+  );
+
+  it.each(["GET", "HEAD"])(
+    "returns 404 for %s directories without an index before redirecting",
+    async (method) => {
+      const root = await directory();
+      await writeFile(path.join(root, "index.html"), "home");
+      await mkdir(path.join(root, "empty"));
+      const url = await preview(root);
+
+      const response = await fetch(`${url}/empty?level=2`, {
+        method,
+        headers: { accept: "text/html" },
+        redirect: "manual",
+      });
+      expect(response.status).toBe(404);
+      expect(response.headers.has("location")).toBe(false);
+      expect(await response.text()).toBe(
+        method === "HEAD" ? "" : "Preview file not found.",
+      );
+    },
+  );
+
+  it.each(["GET", "HEAD"])(
+    "serves %s files, canonical directories and application routes without redirects",
+    async (method) => {
+      const root = await directory();
+      await writeFile(path.join(root, "index.html"), "home");
+      await mkdir(path.join(root, "levels"));
+      await writeFile(path.join(root, "levels", "index.html"), "home");
+      const url = await preview(root);
+
+      for (const pathname of [
+        "/",
+        "/index.html",
+        "/levels/",
+        "/levels/index.html",
+        "/play?level=2",
+      ]) {
+        const response = await fetch(`${url}${pathname}`, {
+          method,
+          headers: { accept: "text/html" },
+          redirect: "manual",
+        });
+        expect(response.status).toBe(200);
+        expect(response.headers.has("location")).toBe(false);
+        expect(await response.text()).toBe(method === "HEAD" ? "" : "home");
+      }
+    },
+  );
+});
+
+describe("static preview file types", () => {
+  it.each([
+    ["main.JS", "text/javascript", "export const ready = true;"],
+    ["helper.mJs", "text/javascript", "export const value = 42;"],
+    ["game.WASM", "application/wasm", "wasm fixture"],
+    ["style.CsS", "text/css", "body { margin: 0; }"],
+    ["lower.js", "text/javascript", "export const lower = true;"],
+    ["data.UNKNOWN", "application/octet-stream", "unknown fixture"],
+  ])(
+    "serves %s with its media type on GET and HEAD",
+    async (filename, type, contents) => {
+      const root = await directory();
+      await writeFile(path.join(root, filename), contents);
+      const url = `${await preview(root)}/${filename}`;
+
+      for (const method of ["GET", "HEAD"]) {
+        const response = await fetch(url, { method });
+        expect(response.status).toBe(200);
+        expect(response.headers.get("content-type")).toBe(type);
+        expect(response.headers.get("content-length")).toBe(
+          String(Buffer.byteLength(contents)),
+        );
+        expect(await response.text()).toBe(method === "HEAD" ? "" : contents);
+      }
+    },
+  );
+});
+
+describe("static preview byte ranges", () => {
+  it.each([
+    ["0123456789", "bytes=2-5"],
+    ["0123456789", "bytes=10-"],
+    ["", "bytes=0-"],
+  ])("ignores Range on HEAD for %j with %s", async (contents, range) => {
+    const root = await directory();
+    await writeFile(path.join(root, "clip.mp4"), contents);
+    const url = `${await preview(root)}/clip.mp4`;
+
+    const response = await fetch(url, { method: "HEAD", headers: { range } });
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-length")).toBe(
+      String(Buffer.byteLength(contents)),
+    );
+    expect(response.headers.get("content-type")).toBe("video/mp4");
+    expect(response.headers.get("accept-ranges")).toBe("bytes");
+    expect(response.headers.has("content-range")).toBe(false);
+    expect(await response.text()).toBe("");
+  });
+
+  it("answers byte ranges, so media can seek", async () => {
+    const root = await directory();
+    await writeFile(path.join(root, "clip.mp4"), "0123456789");
+    const url = `${await preview(root)}/clip.mp4`;
+
+    const whole = await fetch(url);
+    expect(whole.status).toBe(200);
+    expect(whole.headers.get("accept-ranges")).toBe("bytes");
+    expect(whole.headers.get("content-length")).toBe("10");
+    expect(await whole.text()).toBe("0123456789");
+
+    const middle = await fetch(url, { headers: { range: "bytes=2-5" } });
+    expect(middle.status).toBe(206);
+    expect(middle.headers.get("content-range")).toBe("bytes 2-5/10");
+    expect(middle.headers.get("content-type")).toBe("video/mp4");
+    expect(await middle.text()).toBe("2345");
+
+    const open = await fetch(url, { headers: { range: "bytes=7-" } });
+    expect(await open.text()).toBe("789");
+    const suffix = await fetch(url, { headers: { range: "bytes=-3" } });
+    expect(suffix.headers.get("content-range")).toBe("bytes 7-9/10");
+    expect(await suffix.text()).toBe("789");
+    const clamped = await fetch(url, { headers: { range: "bytes=8-99" } });
+    expect(await clamped.text()).toBe("89");
+
+    const outside = await fetch(url, { headers: { range: "bytes=10-" } });
+    expect(outside.status).toBe(416);
+    expect(outside.headers.get("content-range")).toBe("bytes */10");
+    // Several ranges at once are not needed by media; the whole file answers them.
+    const several = await fetch(url, { headers: { range: "bytes=0-1,4-5" } });
+    expect(several.status).toBe(200);
+    expect(await several.text()).toBe("0123456789");
+  });
+});
+
+describe("plugin pages", () => {
+  async function pluginPackage(extra: Record<string, unknown> = {}) {
+    const root = path.join(await directory(), "panel");
+    await mkdir(path.join(root, ".ohmygame-plugin"), { recursive: true });
+    await mkdir(path.join(root, "ui"), { recursive: true });
+    await mkdir(path.join(root, "assets"), { recursive: true });
+    await mkdir(path.join(root, "native"), { recursive: true });
+    await writeFile(path.join(root, "ui/panel.html"), "<p>panel</p>");
+    await writeFile(path.join(root, "ui/panel.js"), "export {}");
+    await writeFile(path.join(root, "assets/icon.svg"), "<svg/>");
+    await writeFile(path.join(root, "native/index.mjs"), "export function activate() {}");
+    await writeFile(
+      path.join(root, ".ohmygame-plugin/plugin.json"),
+      JSON.stringify({
+        id: "acme/panel",
+        version: "1.0.0",
+        engines: { "ohmygame-api": "^2.0.0" },
+        displayName: "Panel",
+        description: "A panel.",
+        icon: "./assets/icon.svg",
+        entrypoints: { native: "./native/index.mjs" },
+        capabilities: { native: true },
+        contributes: {
+          panels: [{ id: "main", title: "Main", area: "right", entry: "./ui/panel.html" }],
+        },
+        ...extra,
+      }),
+    );
+    return root;
+  }
+
+  it("serves only declared pages and assets, with a strict policy", async () => {
+    const index = new PluginIndex(path.join(await directory(), "index.json"));
+    const root = await pluginPackage();
+    const added = await index.add(root);
+    expect(added.ok ? [] : added.issues).toEqual([]);
+    // The index refuses links; one added after install is still never served.
+    const outside = path.join(await directory(), "secret.txt");
+    await writeFile(outside, "secret");
+    await symlink(outside, path.join(root, "ui/linked.txt"));
+    // So is a linked folder partway along a path.
+    await symlink(path.join(root, "native"), path.join(root, "ui/alias"));
+    const sdk = await directory();
+    await writeFile(path.join(sdk, "index.js"), "export function connect() {}");
+    await writeFile(path.join(sdk, "plugin-ui.css"), ":root {}");
+    await mkdir(path.join(sdk, "ui/1"), { recursive: true });
+    await writeFile(path.join(sdk, "ui/1/index.js"), "import './layout.js';");
+    await writeFile(path.join(sdk, "ui/1/notes.md"), "notes");
+    const server = await startPluginUiServer({ index, sdkDirectory: sdk, frameAncestors: ["http://localhost:5173"] });
+    cleanups.push(() => server.close());
+
+    const page = server.panelUrl("acme/panel", "1.0.0", "main")!;
+    expect(page).toBe(`${server.url}/acme/panel/1.0.0/ui/panel.html`);
+    expect(server.panelUrl("acme/panel", "1.0.0", "other")).toBeUndefined();
+    const response = await fetch(page);
+    expect(await response.text()).toBe("<p>panel</p>");
+    const csp = response.headers.get("content-security-policy")!;
+    // The bridge, styles and the stable components, which need no opt-in.
+    expect(csp).toContain(`script-src ${server.url}/acme/panel/1.0.0/ ${server.url}/_ohmygame/plugin-ui.js ${server.url}/_ohmygame/ui/1/;`);
+    expect(csp).toContain(`style-src ${server.url}/acme/panel/1.0.0/ ${server.url}/_ohmygame/plugin-ui.css 'unsafe-inline'`);
+    // A page reads its own files, such as presets that come with it, and nothing else.
+    expect(csp).toContain(`connect-src ${server.url}/acme/panel/1.0.0/;`);
+    expect(csp).toContain("frame-ancestors http://localhost:5173");
+    expect(csp).not.toContain("unsafe-eval");
+    // Pages have an opaque origin, so their module scripts need CORS.
+    expect(response.headers.get("access-control-allow-origin")).toBe("*");
+    // A page's fetch with headers of its own asks first, and may read; nothing may write.
+    const ask = (method: string, origin = "null") => fetch(`${server.url}/acme/panel/1.0.0/assets/icon.svg`, { method: "OPTIONS", headers: { origin, "access-control-request-method": method, "access-control-request-headers": "cache-control" } });
+    const asked = await ask("GET");
+    expect(asked.status).toBe(204);
+    expect(Object.fromEntries([...asked.headers].filter(([name]) => name.startsWith("access-control-")))).toEqual({
+      "access-control-allow-origin": "null", "access-control-allow-methods": "GET, HEAD", "access-control-allow-headers": "cache-control", "access-control-max-age": "600",
+    });
+    expect((await ask("PUT")).status).toBe(405);
+    expect((await ask("GET", "https://example.com")).status).toBe(405);
+    expect((await fetch(`${server.url}/acme/panel/1.0.0/ui/panel.js`)).status).toBe(200);
+    expect((await fetch(`${server.url}/acme/panel/1.0.0/assets/icon.svg`)).status).toBe(200);
+    expect(await (await fetch(`${server.url}/_ohmygame/plugin-ui.js`)).text()).toContain("connect");
+    const components = await fetch(`${server.url}/_ohmygame/ui/1/index.js`);
+    expect(components.headers.get("content-type")).toContain("javascript");
+    expect(await components.text()).toContain("layout.js");
+    for (const refused of [
+      "/acme/panel/1.0.0/native/index.mjs",
+      "/acme/panel/1.0.0/.ohmygame-plugin/plugin.json",
+      "/acme/panel/1.0.0/ui/linked.txt",
+      "/acme/panel/1.0.0/ui/alias/index.mjs",
+      "/acme/panel/1.0.0/ui/%2e%2e/native/index.mjs",
+      "/acme/panel/2.0.0/ui/panel.html",
+      "/_ohmygame/index.js",
+      "/_ohmygame/ui/1/notes.md",
+      "/_ohmygame/ui/2/index.js",
+      "/_ohmygame/ui/1/%2e%2e/%2e%2e/index.js",
+      "/_ohmygame/ui/1/nested/index.js",
+    ])
+      expect((await fetch(`${server.url}${refused}`)).status, refused).toBe(404);
+  });
+
+  it("lets a page with its modules token import the modules its plugin declared in the project, and nothing else of it", async () => {
+    const index = new PluginIndex(path.join(await directory(), "index.json"));
+    const added = await index.add(await pluginPackage({ capabilities: { native: true, "project.files": "read" }, ui: { projectModules: ["./fx/"] } }));
+    expect(added.ok ? [] : added.issues).toEqual([]);
+    const workspace = await directory();
+    await mkdir(path.join(workspace, "fx/burst"), { recursive: true });
+    await writeFile(path.join(workspace, "fx/burst/index.js"), "export { spark } from './spark.mjs';");
+    await writeFile(path.join(workspace, "fx/burst/spark.mjs"), "export const spark = 1;");
+    await writeFile(path.join(workspace, "fx/notes.json"), "{}");
+    await writeFile(path.join(workspace, "game.js"), "secret");
+    await symlink(path.join(workspace, "game.js"), path.join(workspace, "fx/linked.js"));
+    let allowed: boolean | "fails" = true;
+    const resolve = vi.fn(async () => {
+      if (allowed === "fails") throw new Error("busy");
+      return allowed ? { root: workspace, folders: ["fx"] } : undefined;
+    });
+    const server = await startPluginUiServer({ index, sdkDirectory: await directory() });
+    cleanups.push(() => server.close());
+
+    const token = server.modulesToken("p1 acme/panel 1.0.0", "acme/panel", resolve);
+    expect(token).toMatch(/^[A-Za-z0-9_-]{24}$/);
+    // One for each key, which a panel listed again gets again.
+    expect(server.modulesToken("p1 acme/panel 1.0.0", "acme/panel", resolve)).toBe(token);
+    expect(server.modulesToken("p2 acme/panel 1.0.0", "acme/panel", resolve)).not.toBe(token);
+    const page = `${server.panelUrl("acme/panel", "1.0.0", "main")}?modules=${token}`;
+    const csp = (await fetch(page)).headers.get("content-security-policy")!;
+    expect(csp).toContain(`script-src ${server.url}/acme/panel/1.0.0/ ${server.url}/_modules/${token}/ ${server.url}/_ohmygame/plugin-ui.js`);
+    // It fetches only its own plugin's files: modules are imported, never read as data.
+    expect(csp).toContain(`connect-src ${server.url}/acme/panel/1.0.0/;`);
+    // A page with no token, someone else's, or one made up, imports nothing.
+    const other = await pluginPackage({ id: "acme/other" });
+    expect((await index.add(other)).ok).toBe(true);
+    for (const url of [
+      server.panelUrl("acme/panel", "1.0.0", "main")!,
+      `${server.panelUrl("acme/other", "1.0.0", "main")}?modules=${token}`,
+      `${server.panelUrl("acme/panel", "1.0.0", "main")}?modules=AAAAAAAAAAAAAAAAAAAAAAAA`,
+    ])
+      expect((await fetch(url)).headers.get("content-security-policy"), url).not.toContain("_modules");
+
+    const module = await fetch(`${server.url}/_modules/${token}/r1/fx/burst/index.js`);
+    expect(module.status).toBe(200);
+    expect(module.headers.get("content-type")).toContain("javascript");
+    expect(module.headers.get("cache-control")).toBe("no-store");
+    // The project's files are the person's, so only a sandboxed page may read them.
+    expect(module.headers.get("access-control-allow-origin")).toBe("null");
+    expect((await fetch(`${server.url}/_modules/${token}/r2/fx/burst/spark.mjs`)).status).toBe(200);
+    // One import brings many modules, so where they are is checked once a second at most, even at once.
+    resolve.mockClear();
+    await Promise.all([1, 2, 3].map(() => fetch(`${server.url}/_modules/${token}/r1/fx/burst/index.js`)));
+    expect(resolve.mock.calls.length).toBeLessThanOrEqual(1);
+    for (const refused of [
+      `/_modules/${token}/r1/game.js`,
+      `/_modules/${token}/r1/fx/notes.json`,
+      `/_modules/${token}/r1/fx/linked.js`,
+      `/_modules/${token}/r1/fx/%2e%2e/game.js`,
+      `/_modules/${token}/fx/burst/index.js`,
+      "/_modules/AAAAAAAAAAAAAAAAAAAAAAAA/r1/fx/burst/index.js",
+    ])
+      expect((await fetch(`${server.url}${refused}`)).status, refused).toBe(404);
+    // Once the project no longer lets the plugin read it, or that can't be checked, the token serves
+    // nothing; the page still loads, and imports again once it may, without loading again.
+    const later = Date.now();
+    try {
+      for (const [step, state] of [[1, false], [2, "fails"], [3, true]] as const) {
+        allowed = state;
+        vi.useFakeTimers({ now: later + step * 1_500, toFake: ["Date"] });
+        const page_ = await fetch(page);
+        expect(page_.status).toBe(200);
+        expect(page_.headers.get("content-security-policy")).toContain(`/_modules/${token}/`);
+        expect((await fetch(`${server.url}/_modules/${token}/r${step + 2}/fx/burst/index.js`)).status, String(state)).toBe(state === true ? 200 : 404);
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("still serves stable components to a plugin that opts in to preview ones", async () => {
+    const index = new PluginIndex(path.join(await directory(), "index.json"));
+    const added = await index.add(await pluginPackage({ ui: { preview: true } }));
+    expect(added.ok ? [] : added.issues).toEqual([]);
+    const sdk = await directory();
+    await mkdir(path.join(sdk, "ui/1"), { recursive: true });
+    await writeFile(path.join(sdk, "ui/1/index.js"), "import './layout.js';");
+    const server = await startPluginUiServer({ index, sdkDirectory: sdk });
+    cleanups.push(() => server.close());
+    const csp = (await fetch(server.panelUrl("acme/panel", "1.0.0", "main")!)).headers.get("content-security-policy")!;
+    // The policy's source for components covers the file the server sends.
+    const source = `${server.url}/_ohmygame/ui/1/`;
+    expect(csp).toContain(`script-src ${server.url}/acme/panel/1.0.0/ ${server.url}/_ohmygame/plugin-ui.js ${source};`);
+    expect((await fetch(`${source}index.js`)).status).toBe(200);
+  });
+
+  it("styles pages with the app's tokens and defaults", async () => {
+    /** The custom properties a rule declares, comments removed and spaces collapsed. */
+    const declared = (css: string, selector: string) => {
+      const start = css.indexOf(`${selector} {`);
+      expect(start, selector).toBeGreaterThanOrEqual(0);
+      const body = css.slice(start, css.indexOf("\n}", start)).replace(/\/\*[\s\S]*?\*\//g, "");
+      return new Map([...body.matchAll(/(--[a-z0-9-]+)\s*:\s*([^;]+);/g)].map(([, name, value]) => [name!, value!.replace(/\s+/g, " ").trim()]));
+    };
+    // Windows checkouts may have CRLF line endings.
+    const read = async (file: string) => (await readFile(file, "utf8")).replace(/\r\n/g, "\n");
+    const app = await read("src/renderer/ui/tokens.css");
+    const page = await read("packages/plugin-ui/plugin-ui.css");
+    const tokens = new Set<string>(PAGE_TOKENS);
+    // Until the app sends its theme, a page has the app's own defaults.
+    for (const [appSelector, pageSelector] of [
+      [':root,\n[data-appearance="dark"]', ":root"],
+      ['[data-appearance="light"]', ':root[data-appearance="light"]'],
+    ] as const) {
+      const expected = [...declared(app, appSelector)].filter(([name]) => tokens.has(name));
+      expect(Object.fromEntries(declared(page, pageSelector)), pageSelector).toEqual(Object.fromEntries(expected));
+    }
+    // Every token the styles read is one the app sends.
+    const used = new Set([...page.matchAll(/var\((--[a-z0-9-]+)/g)].map(([, name]) => name!));
+    expect([...used].filter((name) => !tokens.has(name) && name !== "--omg-accent")).toEqual([]);
+    // The panel's surface shows through the page.
+    expect(declared(page, ":root").size).toBeGreaterThan(0);
+    expect(page).toMatch(/:root \{[^}]*background: transparent;/);
+  });
+
+  it("checks what a page asks for", async () => {
+    expect(readPluginUiRequest({ id: 1, method: "storage.set", params: { key: "a", value: 1 } }).ok).toBe(true);
+    expect(readPluginUiRequest({ id: 2, method: "fs.read" })).toMatchObject({ ok: false, id: 2 });
+    expect(readPluginUiRequest({ id: 3, method: "storage.get", params: { key: "../x" } })).toMatchObject({ ok: false, id: 3 });
+    expect(readPluginUiRequest({ id: 4, method: "command.run", params: { command: "Run Now" } }).ok).toBe(false);
+    expect(readPluginUiRequest({ id: 6, method: "command.run", params: { command: "rename", input: { name: "map" } } })).toMatchObject({
+      ok: true,
+      request: { params: { input: { name: "map" } } },
+    });
+    expect(readPluginUiRequest({ method: "theme.get" })).toEqual({ ok: false, error: "no id" });
+    expect(readPluginUiRequest({ id: 7, method: "ui.toast", params: { message: "Saved", tone: "success" } }).ok).toBe(true);
+    expect(readPluginUiRequest({ id: 8, method: "ui.toast", params: { message: " " } }).ok).toBe(false);
+    expect(readPluginUiRequest({ id: 9, method: "ui.toast", params: { message: "x".repeat(501) } }).ok).toBe(false);
+    expect(readPluginUiRequest({ id: 10, method: "ui.toast", params: { message: "Saved", tone: "loud" } }).ok).toBe(false);
+    expect(readPluginUiRequest({ id: 11, method: "ui.confirm", params: { title: "Reset?", message: "Clears it.", confirmLabel: "Reset" } }).ok).toBe(true);
+    expect(readPluginUiRequest({ id: 12, method: "ui.confirm" }).ok).toBe(false);
+    expect(readPluginUiRequest({ id: 13, method: "ui.confirm", params: { title: "Reset?", confirmLabel: "x".repeat(41) } }).ok).toBe(false);
+    expect(pluginUiRefusal("ui.confirm", {})).toBeUndefined();
+    const browser = (url: unknown) => readPluginUiRequest({ id: 14, method: "browser.open", params: { url } }).ok;
+    expect(browser("http://localhost:5173/")).toBe(true);
+    expect(browser("https://docs.example.com/")).toBe(true);
+    for (const url of [undefined, "javascript:alert(1)", "file:///tmp/x", "https://user:secret@example.com", `https://example.com/${"x".repeat(4000)}`]) expect(browser(url)).toBe(false);
+    expect(pluginUiRefusal("browser.open", {})).toBeUndefined();
+    expect(readPluginUiRequest({ id: 5, method: "storage.set", params: { key: "a", value: "x".repeat(300_000) } }).ok).toBe(false);
+    expect(pluginUiRefusal("composer.fill", {})).toContain("composer capability");
+    expect(pluginUiRefusal("composer.fill", { composer: true })).toBeUndefined();
+    // Text, files or both go in the composer; the person sends them.
+    const fill = (params: unknown) => readPluginUiRequest({ id: 14, method: "composer.fill", params }).ok;
+    expect(fill({ text: "Fix the boss fight" })).toBe(true);
+    expect(fill({ attachments: [{ name: "feedback.md", data: "Too hard", type: "text/markdown" }] })).toBe(true);
+    expect(fill({ text: "See the shot", attachments: [{ name: "shot.png", data: new Blob(["png"], { type: "image/png" }) }] })).toBe(true);
+    expect(fill({})).toBe(false);
+    expect(fill({ text: "" })).toBe(false);
+    expect(fill({ attachments: [{ name: "../escape.md", data: "x" }] })).toBe(false);
+    expect(fill({ attachments: [{ name: "a.md", data: 5 }] })).toBe(false);
+    expect(fill({ attachments: [{ name: "a.md", data: "x", type: "not a type" }] })).toBe(false);
+    expect(fill({ attachments: Array.from({ length: 11 }, (_, index) => ({ name: `${index}.md`, data: "x" })) })).toBe(false);
+    // What a page reads about its project needs its own capability.
+    expect(pluginUiRefusal("history.list", {})).toContain("project.history capability");
+    expect(pluginUiRefusal("history.list", { "project.history": true })).toBeUndefined();
+    expect(pluginUiRefusal("usage.get", { "project.history": true })).toContain("project.usage capability");
+    expect(pluginUiRefusal("usage.get", { "project.usage": true })).toBeUndefined();
+    expect(readPluginUiRequest({ id: 15, method: "history.list", params: { limit: 100 } }).ok).toBe(true);
+    expect(readPluginUiRequest({ id: 16, method: "history.list", params: { limit: 101 } }).ok).toBe(false);
+    // Pages don't hear about hidden files, which they can't use.
+    expect(pageFilePaths(["src/main.ts", ".env", ".private/key.txt", "assets/.cache/x.png"])).toEqual(["src/main.ts"]);
+    expect(pluginUiRefusal("project.info", {})).toBeUndefined();
+    // net.fetch reaches HTTPS hosts on the default port, for a page listing some.
+    expect(pluginUiRefusal("net.fetch", {})).toContain("net capability");
+    expect(pluginUiRefusal("net.fetch", { net: ["api.example.com"] })).toBeUndefined();
+    const fetchAsk = (params: unknown) => readPluginUiRequest({ id: 17, method: "net.fetch", params }).ok;
+    expect(fetchAsk({ url: "https://api.example.com/v1", method: "POST", headers: { "content-type": "application/json" }, body: "{}" })).toBe(true);
+    expect(fetchAsk({ url: "http://api.example.com/v1" })).toBe(false);
+    expect(fetchAsk({ url: "https://user@api.example.com/" })).toBe(false);
+    expect(fetchAsk({ url: "https://api.example.com:444/" })).toBe(false);
+    expect(fetchAsk({ url: "https://api.example.com/", method: "TRACE" })).toBe(false);
+    expect(fetchAsk({ url: "https://api.example.com/", body: 5 })).toBe(false);
+    // A frame showing a plugin page stays within that plugin version's files.
+    const ui = "http://127.0.0.1:9000";
+    const from = `${ui}/acme/panel/1.0.0/ui/panel.html`;
+    expect(pluginFrameNavigationAllowed(from, `${ui}/acme/panel/1.0.0/ui/other.html`, ui)).toBe(true);
+    expect(pluginFrameNavigationAllowed(from, `${ui}/acme/other/1.0.0/ui/panel.html`, ui)).toBe(false);
+    expect(pluginFrameNavigationAllowed(from, `${ui}/acme/panel/1.0.1/ui/panel.html`, ui)).toBe(false);
+    expect(pluginFrameNavigationAllowed(from, "https://example.com/?data=x", ui)).toBe(false);
+    expect(pluginFrameNavigationAllowed(from, "about:blank", ui)).toBe(false);
+    // And a project's own panel within its folder.
+    expect(pluginFrameNavigationAllowed(`${ui}/_project/p1/stats/index.html`, `${ui}/_project/p1/stats/other.html`, ui)).toBe(true);
+    expect(pluginFrameNavigationAllowed(`${ui}/_project/p1/stats/index.html`, `${ui}/_project/p1/other/index.html`, ui)).toBe(false);
+    expect(pluginFrameNavigationAllowed("http://127.0.0.1:5173/game", "https://example.com", ui)).toBe(true);
+  });
+
+  it("keeps a page's storage per plugin and project, within its limit", async () => {
+    const storagePath = await directory();
+    const project = { id: "p", workspacePath: path.join(storagePath, "workspace"), storagePath };
+    const storage = new PluginPageStorage();
+    await storage.set(project, "acme/panel", "zoom", 2);
+    expect(await storage.get(project, "acme/panel", "zoom")).toBe(2);
+    expect(await storage.get(project, "acme/other", "zoom")).toBeNull();
+    await expect(storage.set(project, "acme/panel", "big", "x".repeat(1024 * 1024))).rejects.toThrow("at most");
+    expect(await storage.get(project, "acme/panel", "zoom")).toBe(2);
+    await storage.set(project, "acme/panel", "zoom", null);
+    expect(await storage.get(project, "acme/panel", "zoom")).toBeNull();
+  });
+});

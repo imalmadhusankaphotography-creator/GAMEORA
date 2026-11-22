@@ -1,0 +1,382 @@
+import { mapConcurrent } from "./map-concurrent.js";
+import { isAccountRuntimeId, type AccountRuntimeId, type AccountProfileIds } from "../shared/agent-runtimes.js";
+import path from "node:path";
+import { mkdir, readdir, rename, rm } from "node:fs/promises";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
+import type { AgentModelRef, AgentReasoningLevel, AgentResponseStats, ConversationSummary, PlanSessionState, ProjectState } from "../shared/contracts.js";
+import { parseReasoningLevel } from "../shared/reasoning.js";
+import { ConversationCache, type ConversationInfo } from "./conversation-cache.js";
+import type { ConversationImageStore } from "./conversation-images.js";
+
+const UNTITLED_CONVERSATION = "New conversation";
+const TITLE_MAX_LENGTH = 80;
+const PLAN_STATE_ENTRY = "ohmygame-plan";
+
+export interface StoredConversation {
+  summary: ConversationSummary;
+  sessionPath: string;
+}
+
+export const NATIVE_REASONING_ENTRY = "ohmygame-native-reasoning";
+
+export class ConversationManager {
+  readonly #pending = new Map<string, { stored: StoredConversation; manager: SessionManager; titled: boolean }>();
+  /** The file operations on each conversation, one after another, so a rename never writes to a file being moved. */
+  readonly #fileOperations = new Map<string, Promise<unknown>>();
+  readonly #cache: ConversationCache;
+
+  constructor(
+    images?: ConversationImageStore,
+    private readonly resolveProfileId: (runtime: AccountRuntimeId, profileId: string) => string = (_runtime, id) => id,
+  ) { this.#cache = new ConversationCache(images); }
+
+  forget(project: ProjectState): void {
+    for (const [id, pending] of this.#pending) if (pending.stored.summary.projectId === project.id) this.#pending.delete(id);
+    this.#cache.forgetDirectory(sessionDirectory(project));
+  }
+
+  async view(project: ProjectState, stored: StoredConversation): Promise<SessionManager> {
+    return await this.#cache.read(project, stored.sessionPath)
+      ?? this.#pending.get(key(project.id, stored.summary.id))?.manager
+      ?? SessionManager.inMemory(project.workspacePath);
+  }
+
+  async list(project: ProjectState): Promise<ConversationSummary[]> {
+    const persisted = (await this.#sessions(project)).map((session) => summary(project.id, session));
+    const persistedIds = new Set(persisted.map((conversation) => conversation.id));
+    for (const conversationId of persistedIds) this.#pending.delete(key(project.id, conversationId));
+    const pending = [...this.#pending.values()]
+      .map(({ stored }) => stored.summary)
+      .filter((conversation) => conversation.projectId === project.id && !persistedIds.has(conversation.id));
+    return [...persisted, ...pending].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  }
+
+  async create(project: ProjectState, model?: AgentModelRef, reasoningLevel?: AgentReasoningLevel): Promise<StoredConversation> {
+    const manager = SessionManager.create(project.workspacePath, sessionDirectory(project));
+    if (model) manager.appendModelChange(model.provider, model.id);
+    if (reasoningLevel) manager.appendThinkingLevelChange(reasoningLevel);
+    const sessionPath = manager.getSessionFile();
+    if (!sessionPath) throw new Error("Pi did not create a persistent session");
+    const stored = {
+      sessionPath,
+      summary: {
+        id: manager.getSessionId(),
+        projectId: project.id,
+        title: UNTITLED_CONVERSATION,
+        createdAt: manager.getHeader()?.timestamp ?? new Date().toISOString(),
+        updatedAt: manager.getHeader()?.timestamp ?? new Date().toISOString(),
+        messageCount: 0,
+      },
+    };
+    this.#pending.set(key(project.id, stored.summary.id), { stored, manager, titled: false });
+    return stored;
+  }
+
+  /** Copy only the current path through a finished assistant message. Never mutate the source manager. */
+  async branch(project: ProjectState, stored: StoredConversation, entryId: string): Promise<StoredConversation> {
+    const source = SessionManager.open(stored.sessionPath, sessionDirectory(project), project.workspacePath);
+    const entry = source.getBranch().find((candidate) => candidate.id === entryId);
+    if (entry?.type !== "message" || entry.message.role !== "assistant" || !["stop", "length"].includes(entry.message.stopReason) ||
+      !entry.message.content.some((block) => block.type === "text" && block.text.trim())) {
+      throw new Error("Choose a completed agent response on the current conversation branch");
+    }
+    const sessionPath = source.createBranchedSession(entry.id);
+    if (!sessionPath) throw new Error("Could not create a persistent conversation branch");
+    // The selected assistant message ends this path, so earlier native ready markers are already stale.
+    source.appendCustomEntry(PLAN_STATE_ENTRY, { mode: "normal" });
+    const suffix = " (branch)";
+    source.appendSessionInfo(normalizeTitle(`${stored.summary.title.slice(0, TITLE_MAX_LENGTH - suffix.length)}${suffix}`));
+    return (await this.get(project, source.getSessionId()))!;
+  }
+
+  async get(project: ProjectState, conversationId: string): Promise<StoredConversation | undefined> {
+    const directory = sessionDirectory(project);
+    const files = await this.#sessionFiles(directory);
+    // Pi puts the id in the filename. Verify the header and retain discovery for renamed/imported sessions.
+    const matches = files.filter((file) => file.endsWith(`_${conversationId}.jsonl`));
+    let session = matches.length === 1 ? await this.#cache.info(project, matches[0]!) : undefined;
+    if (session?.id !== conversationId) {
+      session = (await this.#sessions(project, directory, files)).find((item) => item.id === conversationId);
+    }
+    if (session) {
+      this.#pending.delete(key(project.id, conversationId));
+      return { summary: summary(project.id, session), sessionPath: session.path };
+    }
+    return this.#pending.get(key(project.id, conversationId))?.stored;
+  }
+
+  /**
+   * Archiving moves a conversation's session file aside, out of the list; it
+   * can come back, or be deleted from the archive for good.
+   */
+  archive(project: ProjectState, conversationId: string): Promise<boolean> {
+    return this.#serially(project, conversationId, () => this.#archive(project, conversationId));
+  }
+
+  async #archive(project: ProjectState, conversationId: string): Promise<boolean> {
+    const stored = await this.get(project, conversationId);
+    if (!stored) return false;
+    // A conversation without messages has no file yet; archiving drops it.
+    if (this.#pending.delete(key(project.id, conversationId))) return true;
+    await mkdir(archiveDirectory(project), { recursive: true });
+    await rename(stored.sessionPath, path.join(archiveDirectory(project), path.basename(stored.sessionPath)));
+    return true;
+  }
+
+  async archived(project: ProjectState): Promise<ConversationSummary[]> {
+    return (await this.#sessions(project, archiveDirectory(project)))
+      .map((session) => summary(project.id, session))
+      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  }
+
+  unarchive(project: ProjectState, conversationId: string): Promise<ConversationSummary | undefined> {
+    return this.#serially(project, conversationId, () => this.#unarchive(project, conversationId));
+  }
+
+  async #unarchive(project: ProjectState, conversationId: string): Promise<ConversationSummary | undefined> {
+    const session = (await this.#sessions(project, archiveDirectory(project))).find((candidate) => candidate.id === conversationId);
+    if (!session) return undefined;
+    await rename(session.path, path.join(sessionDirectory(project), path.basename(session.path)));
+    return (await this.get(project, conversationId))?.summary;
+  }
+
+  /** Deletes an archived conversation; one still in the list must be archived first. */
+  deleteArchived(project: ProjectState, conversationId: string): Promise<boolean> {
+    return this.#serially(project, conversationId, () => this.#deleteArchived(project, conversationId));
+  }
+
+  async #deleteArchived(project: ProjectState, conversationId: string): Promise<boolean> {
+    const session = (await this.#sessions(project, archiveDirectory(project))).find((candidate) => candidate.id === conversationId);
+    if (!session) return false;
+    await rm(session.path, { force: true });
+    return true;
+  }
+
+  /** Renames a conversation in the list; one archived meanwhile is not found. */
+  rename(project: ProjectState, conversationId: string, title: string): Promise<ConversationSummary | undefined> {
+    return this.#serially(project, conversationId, () => this.#rename(project, conversationId, title));
+  }
+
+  #serially<T>(project: ProjectState, conversationId: string, operation: () => Promise<T>): Promise<T> {
+    const id = key(project.id, conversationId);
+    const result = (this.#fileOperations.get(id) ?? Promise.resolve()).then(operation, operation);
+    const settled = result.catch(() => {});
+    this.#fileOperations.set(id, settled);
+    void settled.then(() => { if (this.#fileOperations.get(id) === settled) this.#fileOperations.delete(id); });
+    return result;
+  }
+
+  setInitialTitle(project: ProjectState, conversationId: string, prompt: string): ConversationSummary | undefined {
+    const pending = this.#pending.get(key(project.id, conversationId));
+    if (!pending || pending.titled) return undefined;
+    const title = normalizeTitle(prompt);
+    if (!title) return undefined;
+    pending.titled = true;
+    pending.manager.appendSessionInfo(title);
+    pending.stored = {
+      ...pending.stored,
+      summary: {
+        ...pending.stored.summary,
+        title,
+        updatedAt: new Date().toISOString(),
+      },
+    };
+    return pending.stored.summary;
+  }
+
+  async #rename(
+    project: ProjectState,
+    conversationId: string,
+    title: string,
+    stored?: StoredConversation,
+  ): Promise<ConversationSummary | undefined> {
+    stored ??= await this.get(project, conversationId);
+    if (!stored) return undefined;
+    const normalized = normalizeTitle(title);
+    if (!normalized) throw new Error("Conversation title must not be empty");
+    const pending = this.#pending.get(key(project.id, conversationId));
+    const manager = pending?.manager ?? SessionManager.open(stored.sessionPath, sessionDirectory(project), project.workspacePath);
+    manager.appendSessionInfo(normalized);
+    if (pending) {
+      pending.titled = true;
+      pending.stored = {
+        ...pending.stored,
+        summary: { ...pending.stored.summary, title: normalized, updatedAt: new Date().toISOString() },
+      };
+      return pending.stored.summary;
+    }
+    return (await this.get(project, conversationId))?.summary;
+  }
+
+  open(project: ProjectState, stored: StoredConversation): SessionManager {
+    const pending = this.#pending.get(key(project.id, stored.summary.id));
+    if (pending) return pending.manager;
+    return SessionManager.open(stored.sessionPath, sessionDirectory(project), project.workspacePath);
+  }
+
+  async model(project: ProjectState, stored: StoredConversation): Promise<AgentModelRef | undefined> {
+    const model = (await this.view(project, stored)).buildSessionContext().model;
+    return model?.provider && model.modelId ? { provider: model.provider, id: model.modelId } : undefined;
+  }
+
+  setModel(project: ProjectState, stored: StoredConversation, model: AgentModelRef): void {
+    this.open(project, stored).appendModelChange(model.provider, model.id);
+  }
+
+  /**
+   * The latest response's speed and cache use, and the context it filled,
+   * from the usage its provider reported. Context counts only until the
+   * conversation is compacted after it.
+   */
+  async lastResponse(project: ProjectState, stored: StoredConversation): Promise<(AgentResponseStats & { contextTokens?: number }) | undefined> {
+    const branch = (await this.view(project, stored)).getBranch();
+    const index = branch.findLastIndex((entry) => entry.type === "message" && entry.message.role === "assistant" &&
+      (Boolean(entry.message.usage?.output) || codexTurnFigures(entry.message) !== undefined));
+    const entry = branch[index];
+    if (entry?.type !== "message" || entry.message.role !== "assistant") return undefined;
+    const { usage, timestamp } = entry.message;
+    const prompt = usage.input + usage.cacheRead + usage.cacheWrite;
+    const seconds = (Date.parse(entry.timestamp) - timestamp) / 1000;
+    const compacted = branch.slice(index + 1).some((later) => later.type === "compaction");
+    // Codex reports usage only once a request completes, so a message's own
+    // span measures the wrong window; the turn measured its figures when it
+    // ended, and the message carries them. A Codex message the turn could not
+    // measure — aborted before its first report, or from before the figures
+    // existed — hides its speed rather than dividing by a flush tail; its
+    // per-request cache share is still real, so that stands. Every other
+    // runtime keeps the span it always used.
+    const measured = codexTurnFigures(entry.message);
+    return {
+      outputTokens: usage.output,
+      ...(measured?.responseTokensPerSecond !== undefined
+        ? { tokensPerSecond: measured.responseTokensPerSecond, speedScope: "turn" as const }
+        : measured === undefined && entry.message.provider !== "codex-cli" && seconds >= 0.5
+          ? { tokensPerSecond: Math.round(usage.output / seconds) }
+          : {}),
+      ...(measured?.cacheHitPercent !== undefined
+        ? { cacheHitPercent: measured.cacheHitPercent, cacheScope: "turn" as const }
+        : prompt > 0
+          ? { cacheHitPercent: Math.round((usage.cacheRead / prompt) * 100) }
+          : {}),
+      ...(compacted ? {} : { contextTokens: prompt + usage.output }),
+    };
+  }
+
+  async reasoningLevel(project: ProjectState, stored: StoredConversation): Promise<AgentReasoningLevel | undefined> {
+    const entry = (await this.view(project, stored)).getBranch().findLast((candidate) => candidate.type === "thinking_level_change");
+    return entry?.type === "thinking_level_change" ? parseReasoningLevel(entry.thinkingLevel) : undefined;
+  }
+
+  setReasoningLevel(project: ProjectState, stored: StoredConversation, level: AgentReasoningLevel): void {
+    this.open(project, stored).appendThinkingLevelChange(level);
+  }
+
+  async nativeReasoningLevel(project: ProjectState, stored: StoredConversation, model: AgentModelRef): Promise<string | undefined> {
+    const entry = (await this.view(project, stored)).getBranch().findLast((candidate) => candidate.type === "custom" && candidate.customType === NATIVE_REASONING_ENTRY);
+    if (entry?.type !== "custom") return undefined;
+    const data = entry.data as { version?: number; provider?: string; model?: string; level?: unknown } | undefined;
+    return data?.version === 1 && data.provider === model.provider && data.model === model.id && typeof data.level === "string" ? data.level : undefined;
+  }
+
+  setNativeReasoningLevel(project: ProjectState, stored: StoredConversation, model: AgentModelRef, level: string): void {
+    this.open(project, stored).appendCustomEntry(NATIVE_REASONING_ENTRY, { version: 1, provider: model.provider, model: model.id, level });
+  }
+
+  /**
+   * The account last chosen per runtime; a deleted account reads as System default.
+   * It belongs to the conversation and not its history, so editing a message, which
+   * leaves what came after it on another branch, keeps the choice.
+   * Native resume markers carry their account, so a context of another or a
+   * deleted account is never resumed and this read changes nothing.
+   */
+  async accountProfiles(project: ProjectState, stored: StoredConversation): Promise<AccountProfileIds> {
+    const profiles: AccountProfileIds = {};
+    for (const entry of (await this.view(project, stored)).getEntries()) {
+      if (entry.type !== "custom" || entry.customType !== "ohmygame-account-profile") continue;
+      const data = entry.data as { version?: unknown; runtime?: unknown; profileId?: unknown } | undefined;
+      if (data?.version === 1 && isAccountRuntimeId(data.runtime) && typeof data.profileId === "string")
+        profiles[data.runtime] = this.resolveProfileId(data.runtime, data.profileId);
+    }
+    return profiles;
+  }
+
+  async accountProfileId(project: ProjectState, stored: StoredConversation, runtime: AccountRuntimeId): Promise<string> {
+    return (await this.accountProfiles(project, stored))[runtime] ?? "system";
+  }
+
+  setAccountProfile(project: ProjectState, stored: StoredConversation, runtime: AccountRuntimeId, profileId: string): void {
+    this.open(project, stored).appendCustomEntry("ohmygame-account-profile", { version: 1, runtime, profileId });
+  }
+
+  async planState(project: ProjectState, stored: StoredConversation): Promise<PlanSessionState> {
+    const entry = (await this.view(project, stored)).getBranch().findLast((candidate) => candidate.type === "custom" && candidate.customType === PLAN_STATE_ENTRY);
+    if (entry?.type !== "custom" || !entry.data || typeof entry.data !== "object") return { mode: "normal" };
+    const state = entry.data as Partial<PlanSessionState>;
+    if (state.mode !== "normal" && state.mode !== "planning" && state.mode !== "awaiting_approval" && state.mode !== "executing") {
+      return { mode: "normal" };
+    }
+    if (state.mode === "planning" || state.mode === "executing") {
+      return state.plan ? { mode: "awaiting_approval", plan: state.plan } : { mode: "normal" };
+    }
+    return { mode: state.mode, ...(state.plan ? { plan: state.plan } : {}) };
+  }
+
+  async #sessionFiles(directory: string): Promise<string[]> {
+    const names = await readdir(directory).catch((cause: NodeJS.ErrnoException) => {
+      if (cause.code === "ENOENT") return [];
+      throw cause;
+    });
+    return names.filter((name) => name.endsWith(".jsonl")).map((name) => path.join(directory, name));
+  }
+
+  async #sessions(project: ProjectState, directory = sessionDirectory(project), knownFiles?: string[]): Promise<ConversationInfo[]> {
+    const files = knownFiles ?? await this.#sessionFiles(directory);
+    const sessions = await mapConcurrent(files, 4, (file) => this.#cache.info(project, file));
+    return sessions.filter((session) => session !== undefined);
+  }
+}
+
+function codexTurnFigures(message: { provider: string }) {
+  if (message.provider !== "codex-cli") return undefined;
+  const figures = message as { responseTokensPerSecond?: number; cacheHitPercent?: number };
+  return figures.responseTokensPerSecond !== undefined || figures.cacheHitPercent !== undefined
+    ? figures
+    : undefined;
+}
+
+function key(projectId: string, conversationId: string): string {
+  return `${projectId}:${conversationId}`;
+}
+
+export function defaultConversationTitle(firstMessage: string): string {
+  const normalized = normalizeTitle(firstMessage);
+  return normalized && normalized !== "(no messages)" ? normalized : UNTITLED_CONVERSATION;
+}
+
+function summary(projectId: string, session: ConversationInfo): ConversationSummary {
+  return {
+    id: session.id,
+    projectId,
+    title: session.name?.trim() || defaultConversationTitle(session.firstMessage),
+    createdAt: session.created.toISOString(),
+    updatedAt: session.modified.toISOString(),
+    messageCount: session.messageCount,
+  };
+}
+
+/** Where archived conversations' session files wait, inside the session folder. */
+function archiveDirectory(project: ProjectState): string {
+  return path.join(sessionDirectory(project), "archived");
+}
+
+/** The folder that holds the session files of a project's conversations. */
+export function sessionDirectory(project: ProjectState): string {
+  return path.join(project.storagePath ?? path.dirname(project.workspacePath), "session");
+}
+
+function normalizeTitle(value: string, maxLength = TITLE_MAX_LENGTH): string {
+  const title = value.replace(/\s+/g, " ").trim();
+  const characters = [...title];
+  if (characters.length <= maxLength) return title;
+  return `${characters.slice(0, maxLength - 3).join("").trimEnd()}...`;
+}

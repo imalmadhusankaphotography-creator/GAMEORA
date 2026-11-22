@@ -1,0 +1,115 @@
+import { describe, expect, it } from "vitest";
+import { appendSystemPromptForProject } from "../src/daemon/agent-prompts.js";
+
+function prompt(project: Parameters<typeof appendSystemPromptForProject>[0]): string {
+  return appendSystemPromptForProject(project).join("\n\n");
+}
+
+describe("OhMyGame system prompt", () => {
+  it("preserves shared interaction guidance for every project type", () => {
+    for (const type of ["general", "web-game", "godot-game", "interactive-story", "asset-canvas"] as const) {
+      const text = prompt({ type });
+
+      expect(text).toContain("brief commentary update before the first tool call");
+      expect(text).toContain("update_plan");
+      expect(text).toContain("Do not create or change files for casual conversation");
+      expect(text).toContain("do not revert changes you did not make");
+      expect(text).toContain("relevant boards/documents before canvas, design or asset work");
+      expect(text).toContain("For game implementation, also read the main document if one is selected");
+      expect(text).not.toContain("may be empty");
+    }
+  });
+
+  it("carries the Web Game platform contract in the system prompt", () => {
+    const text = prompt({ type: "web-game" });
+
+    expect(text).toContain("create and evolve browser games");
+    expect(text).toContain("smallest reliable change");
+    expect(text).toContain("OhMyGame owns the dev server");
+    expect(text).toContain("inside an iframe of any size");
+    expect(text).toContain("__OHMYGAME_PLAYTEST__");
+    expect(text).toContain("Colyseus + WebSocket");
+    expect(text).toContain("multiplayer_setup");
+    expect(text).toContain("Do not silently substitute PeerJS");
+    // The SDK's own direct connections are allowed; a hand-made WebRTC stack is not.
+    expect(text).toContain("built-in p2p option");
+    expect(text).toContain("server/rules.ts");
+    // Saves and multiplayer follow the identity line, briefly; their guides carry the rest.
+    expect(text.indexOf("You are OhMyGame")).toBeLessThan(text.indexOf("multiplayer_setup"));
+    expect(text).toContain("needs no cloud deployment");
+    expect(text).toContain("the workspace root");
+    expect(text).toContain('a "dev" script and a "build" script');
+    expect(text).toContain("process.env.HOST");
+    expect(text).toContain("Number(process.env.PORT)");
+    expect(text).toContain("dist/, build/, or out/");
+    expect(text).toContain("missing from the published build");
+    expect(text).not.toContain("playable_check");
+    expect(text).not.toContain("existing folder as the workspace");
+  });
+
+  it("uses Game Studio for general games and keeps the Web contract conditional", () => {
+    const text = prompt({ type: "general", webPreviewEnabled: true, startupDirectory: "client", startupScript: "start", packageManager: "pnpm", workspaceLocation: "external" });
+
+    expect(text).toContain("use game-studio when available");
+    expect(text).toContain("multiplayer_setup");
+    expect(text).toContain("Applications, tools, and content");
+    expect(text).toContain("Web preview is enabled by the user");
+    expect(text).toContain("the client/ folder of the workspace, run with pnpm");
+    expect(text).toContain('a "start" script');
+    expect(text).not.toContain("use web-game-studio");
+    expect(text).not.toContain("playable_add_node");
+  });
+
+  it("leaves a plugin type that runs outside OhMyGame to its plugin, without Web setup guidance", () => {
+    const text = appendSystemPromptForProject({ type: "general", pluginType: { id: "ohmygame/taptap-maker:maker", plugin: "ohmygame/taptap-maker", preview: "native" } }).join("\n");
+    expect(text).toContain("comes from the ohmygame/taptap-maker plugin");
+    expect(text).toContain("use its tools to preview and build");
+    expect(text).not.toContain("Web preview switch in Project settings");
+    expect(text).not.toContain("Web publishing is independent");
+    expect(text).not.toContain("game_sdk_setup");
+    expect(text).not.toContain("multiplayer_setup");
+  });
+  it("keeps disabled General previews under user control without requiring a Node stack", () => {
+    const text = prompt({ type: "general" });
+    expect(text).toContain("Web preview is disabled");
+    expect(text).toContain("game_sdk_setup");
+    expect(text).toContain("Do not start a persistent dev server or enable the capability yourself");
+    expect(text).toContain("Web publishing is independent of the preview switch");
+    expect(text).not.toContain("The game is a Node project");
+    expect(text).not.toContain("starts it after your turn");
+  });
+
+  it("explains how an explicitly referenced design revision should be used", () => {
+    const text = prompt({ type: "web-game" });
+
+    expect(text).toContain("explicitly referenced document snapshots");
+    expect(text).toContain("canvas/AGENTS.md");
+    expect(text).toContain("read/edit/write");
+    expect(text).toContain("canvas_check");
+    expect(text).toContain("Read actual image files");
+    expect(text).toContain("Editing a prompt or reference does not request generation");
+  });
+
+  it("describes the configured run settings and external workspaces", () => {
+    const text = prompt({ type: "web-game", startupDirectory: "client", startupScript: "start", packageManager: "pnpm", workspaceLocation: "external" });
+
+    expect(text).toContain("the client/ folder of the workspace, run with pnpm");
+    expect(text).toContain('a "start" script');
+    expect(text).toContain('Preview runs the "start" script');
+    expect(text).toContain("existing folder as the workspace");
+  });
+
+  it("tells the Interactive Story agent how to build, use media in, and check Playable Nodes", () => {
+    const text = prompt({ type: "interactive-story" });
+
+    expect(text).toContain("playable_add_node");
+    expect(text).toContain("playable_check");
+    expect(text).toContain('mode "publish"');
+    expect(text).toContain('"kind": "workspace"');
+    expect(text).toContain("viewport from graph.json");
+    expect(text).toContain("<editor-context>");
+    expect(text).toContain("drawing");
+    expect(text).not.toContain("create and evolve browser games");
+    expect(text).not.toContain("OhMyGame owns the dev server");
+  });
+});

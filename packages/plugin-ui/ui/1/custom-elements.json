@@ -1,0 +1,3916 @@
+{
+  "schemaVersion": "2.1.0",
+  "readme": "",
+  "modules": [
+    {
+      "kind": "javascript-module",
+      "path": "ui/1/controls.js",
+      "declarations": [
+        {
+          "kind": "class",
+          "name": "OmgButton",
+          "tagName": "omg-button",
+          "customElement": true,
+          "description": "`<omg-button variant=\"secondary|primary|ghost|danger\" disabled busy>`: the app's button. Primary is ink; there is one per view. A busy button shows a spinner and takes no clicks.",
+          "superclass": {
+            "name": "HTMLElement",
+            "package": "global:"
+          },
+          "attributes": [
+            {
+              "name": "busy",
+              "description": "Shows a spinner and takes no clicks.",
+              "type": {
+                "text": "boolean"
+              }
+            },
+            {
+              "name": "disabled",
+              "description": "Takes no clicks.",
+              "type": {
+                "text": "boolean"
+              }
+            },
+            {
+              "name": "variant",
+              "description": "Secondary by default.",
+              "type": {
+                "text": "\"secondary\" | \"primary\" | \"ghost\" | \"danger\""
+              }
+            }
+          ],
+          "members": [
+            {
+              "kind": "field",
+              "name": "busy",
+              "description": "The `busy` attribute.",
+              "type": {
+                "text": "boolean"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "disabled",
+              "description": "The `disabled` attribute.",
+              "type": {
+                "text": "boolean"
+              }
+            }
+          ],
+          "events": [],
+          "slots": [
+            {
+              "name": "",
+              "description": "The label."
+            }
+          ],
+          "cssParts": [
+            {
+              "name": "button",
+              "description": "The button."
+            },
+            {
+              "name": "spinner",
+              "description": "The spinner shown while busy."
+            }
+          ],
+          "cssProperties": []
+        },
+        {
+          "kind": "class",
+          "name": "OmgDisclosure",
+          "tagName": "omg-disclosure",
+          "customElement": true,
+          "description": "`<omg-disclosure heading open disabled>`: a plain title row with a leading arrow that shows or hides content. Closing keeps the content mounted and returns focus to the button when focus was inside. Enter and Space use the button's native activation.",
+          "superclass": {
+            "name": "HTMLElement",
+            "package": "global:"
+          },
+          "attributes": [
+            {
+              "name": "disabled",
+              "description": "Disables the button, without changing the content's state.",
+              "type": {
+                "text": "boolean"
+              }
+            },
+            {
+              "name": "heading",
+              "description": "The button's label.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "open",
+              "description": "Shows the content; closed by default.",
+              "type": {
+                "text": "boolean"
+              }
+            }
+          ],
+          "members": [
+            {
+              "kind": "field",
+              "name": "disabled",
+              "description": "The `disabled` attribute.",
+              "type": {
+                "text": "boolean"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "open",
+              "description": "The `open` attribute; setting it does not emit an event.",
+              "type": {
+                "text": "boolean"
+              }
+            }
+          ],
+          "events": [
+            {
+              "name": "omg-toggle",
+              "description": "The person opened or closed the content; bubbles across shadow roots.",
+              "type": {
+                "text": "CustomEvent<{ open: boolean }>"
+              }
+            }
+          ],
+          "slots": [
+            {
+              "name": "",
+              "description": "The content, retained while closed."
+            }
+          ],
+          "cssParts": [
+            {
+              "name": "body",
+              "description": "The content, hidden while closed."
+            },
+            {
+              "name": "button",
+              "description": "The toggle button."
+            },
+            {
+              "name": "heading",
+              "description": "The button's label."
+            },
+            {
+              "name": "icon",
+              "description": "The expansion arrow."
+            }
+          ],
+          "cssProperties": []
+        },
+        {
+          "kind": "class",
+          "name": "OmgCommandButton",
+          "tagName": "omg-command-button",
+          "customElement": true,
+          "description": "`<omg-command-button command input variant concurrent quiet>`: runs one of the plugin's commands, by its manifest id, when clicked. `input` is JSON, or set the `input` property. While it runs, the button is busy and shows the command's progress beside it, and other command buttons wait unless they are `concurrent`. A failure shows beside it unless it is `quiet`, and is its `error` attribute until the next run, so a page that draws the button again can pass it on. Events: `omg-command-start` (cancelable, before it runs), `omg-command-result` with `detail.result`, and `omg-command-error` with `detail.error`, cancelable to show the failure yourself.",
+          "superclass": {
+            "name": "OmgButton",
+            "module": "ui/1/controls.js"
+          },
+          "attributes": [
+            {
+              "name": "busy",
+              "description": "Shows a spinner and takes no clicks.",
+              "type": {
+                "text": "boolean"
+              },
+              "inheritedFrom": {
+                "name": "OmgButton",
+                "module": "ui/1/controls.js"
+              }
+            },
+            {
+              "name": "command",
+              "description": "The command's id in the manifest.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "concurrent",
+              "description": "Runs while other command buttons run, and doesn't make them wait.",
+              "type": {
+                "text": "boolean"
+              }
+            },
+            {
+              "name": "disabled",
+              "description": "Takes no clicks.",
+              "type": {
+                "text": "boolean"
+              },
+              "inheritedFrom": {
+                "name": "OmgButton",
+                "module": "ui/1/controls.js"
+              }
+            },
+            {
+              "name": "error",
+              "description": "The last run's failure, until the next run.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "input",
+              "description": "The command's input, as JSON.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "quiet",
+              "description": "Doesn't show a failure beside it.",
+              "type": {
+                "text": "boolean"
+              }
+            },
+            {
+              "name": "variant",
+              "description": "Secondary by default.",
+              "type": {
+                "text": "\"secondary\" | \"primary\" | \"ghost\" | \"danger\""
+              },
+              "inheritedFrom": {
+                "name": "OmgButton",
+                "module": "ui/1/controls.js"
+              }
+            }
+          ],
+          "members": [
+            {
+              "kind": "field",
+              "name": "busy",
+              "description": "The `busy` attribute.",
+              "type": {
+                "text": "boolean"
+              },
+              "inheritedFrom": {
+                "name": "OmgButton",
+                "module": "ui/1/controls.js"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "disabled",
+              "description": "The `disabled` attribute.",
+              "type": {
+                "text": "boolean"
+              },
+              "inheritedFrom": {
+                "name": "OmgButton",
+                "module": "ui/1/controls.js"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "input",
+              "description": "The command's input; it takes the place of the attribute.",
+              "type": {
+                "text": "unknown"
+              }
+            },
+            {
+              "kind": "method",
+              "name": "run",
+              "description": "Runs the command, as a click does; resolves to its result, or undefined when it didn't run or failed.",
+              "return": {
+                "type": {
+                  "text": "Promise<unknown>"
+                }
+              }
+            }
+          ],
+          "events": [
+            {
+              "name": "omg-command-error",
+              "description": "The command failed; cancel it to show the failure yourself.",
+              "type": {
+                "text": "CustomEvent<{ command: string; error: string }>"
+              }
+            },
+            {
+              "name": "omg-command-result",
+              "description": "The command's result.",
+              "type": {
+                "text": "CustomEvent<{ command: string; result: unknown }>"
+              }
+            },
+            {
+              "name": "omg-command-start",
+              "description": "Before it runs; cancel it to not run.",
+              "type": {
+                "text": "CustomEvent<{ command: string; input: unknown }>"
+              }
+            }
+          ],
+          "slots": [
+            {
+              "name": "",
+              "description": "The label."
+            }
+          ],
+          "cssParts": [
+            {
+              "name": "button",
+              "description": "The button."
+            },
+            {
+              "name": "error",
+              "description": "The failure."
+            },
+            {
+              "name": "progress",
+              "description": "The command's progress while it runs."
+            },
+            {
+              "name": "spinner",
+              "description": "The spinner shown while busy."
+            }
+          ],
+          "cssProperties": []
+        }
+      ],
+      "exports": [
+        {
+          "kind": "custom-element-definition",
+          "name": "omg-button",
+          "declaration": {
+            "name": "OmgButton",
+            "module": "ui/1/controls.js"
+          }
+        },
+        {
+          "kind": "custom-element-definition",
+          "name": "omg-disclosure",
+          "declaration": {
+            "name": "OmgDisclosure",
+            "module": "ui/1/controls.js"
+          }
+        },
+        {
+          "kind": "custom-element-definition",
+          "name": "omg-command-button",
+          "declaration": {
+            "name": "OmgCommandButton",
+            "module": "ui/1/controls.js"
+          }
+        }
+      ]
+    },
+    {
+      "kind": "javascript-module",
+      "path": "ui/1/data.js",
+      "declarations": [
+        {
+          "kind": "class",
+          "name": "OmgTable",
+          "tagName": "omg-table",
+          "customElement": true,
+          "description": "`<omg-table label>`: a semantic table with stable keyed rows and cells. Text is always inserted as text; a Node cell is slotted without cloning so its state, listeners and plugin styles survive updates. Callers own sorting, loading and actions. Wide tables scroll inside their labelled region.",
+          "superclass": {
+            "name": "HTMLElement",
+            "package": "global:"
+          },
+          "attributes": [
+            {
+              "name": "empty-label",
+              "description": "Message with no rows; defaults to No data.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "label",
+              "description": "Table and scroll-region accessible name.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "loading",
+              "description": "Marks data busy; existing rows remain visible.",
+              "type": {
+                "text": "boolean"
+              }
+            }
+          ],
+          "members": [
+            {
+              "kind": "field",
+              "name": "columns",
+              "description": "Unique column keys, headings, optional width and alignment.",
+              "type": {
+                "text": "Array<{ key: string; heading: string; align?: \"left\" | \"right\"; width?: string }>"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "rows",
+              "description": "Unique row keys and cells by column key; Node cells belong to this table while mounted.",
+              "type": {
+                "text": "Array<{ key: string; cells: Record<string, string | Node> }>"
+              }
+            }
+          ],
+          "events": [],
+          "slots": [],
+          "cssParts": [
+            {
+              "name": "empty",
+              "description": "Empty message."
+            },
+            {
+              "name": "region",
+              "description": "Focusable horizontal scroll region."
+            },
+            {
+              "name": "table",
+              "description": "Native table."
+            }
+          ],
+          "cssProperties": []
+        },
+        {
+          "kind": "class",
+          "name": "OmgPagination",
+          "tagName": "omg-pagination",
+          "customElement": true,
+          "description": "`<omg-pagination page pages>`: controlled pagination. It requests a page; the caller updates `page` after success. Pending requests preserve focus.",
+          "superclass": {
+            "name": "HTMLElement",
+            "package": "global:"
+          },
+          "attributes": [
+            {
+              "name": "disabled",
+              "description": "Ignores requests while retaining focus.",
+              "type": {
+                "text": "boolean"
+              }
+            },
+            {
+              "name": "label",
+              "description": "Navigation accessible name; defaults to Pagination.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "next-label",
+              "description": "Next button text; defaults to Next.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "page",
+              "description": "Current page, one-based; defaults to 1.",
+              "type": {
+                "text": "number"
+              }
+            },
+            {
+              "name": "pages",
+              "description": "Number of pages; at least 1.",
+              "type": {
+                "text": "number"
+              }
+            },
+            {
+              "name": "previous-label",
+              "description": "Previous button text; defaults to Previous.",
+              "type": {
+                "text": "string"
+              }
+            }
+          ],
+          "members": [],
+          "events": [
+            {
+              "name": "omg-page-change",
+              "description": "Requested page; no state changes until the caller updates page.",
+              "type": {
+                "text": "CustomEvent<{ page: number }>"
+              }
+            }
+          ],
+          "slots": [],
+          "cssParts": [
+            {
+              "name": "next",
+              "description": "Next button."
+            },
+            {
+              "name": "previous",
+              "description": "Previous button."
+            },
+            {
+              "name": "status",
+              "description": "Current page and total."
+            }
+          ],
+          "cssProperties": []
+        }
+      ],
+      "exports": [
+        {
+          "kind": "custom-element-definition",
+          "name": "omg-table",
+          "declaration": {
+            "name": "OmgTable",
+            "module": "ui/1/data.js"
+          }
+        },
+        {
+          "kind": "custom-element-definition",
+          "name": "omg-pagination",
+          "declaration": {
+            "name": "OmgPagination",
+            "module": "ui/1/data.js"
+          }
+        }
+      ]
+    },
+    {
+      "kind": "javascript-module",
+      "path": "ui/1/feedback.js",
+      "declarations": [
+        {
+          "kind": "class",
+          "name": "OmgStatus",
+          "tagName": "omg-status",
+          "customElement": true,
+          "description": "`<omg-status tone=\"neutral|good|warning|bad|busy\">`: a short state, such as \"Running\", after a coloured dot, or a spinner while busy. It is a live region, so a change is read out.",
+          "superclass": {
+            "name": "HTMLElement",
+            "package": "global:"
+          },
+          "attributes": [
+            {
+              "name": "tone",
+              "description": "Neutral by default.",
+              "type": {
+                "text": "\"neutral\" | \"good\" | \"warning\" | \"bad\" | \"busy\""
+              }
+            }
+          ],
+          "members": [],
+          "events": [],
+          "slots": [
+            {
+              "name": "",
+              "description": "The state, in a few words."
+            }
+          ],
+          "cssParts": [
+            {
+              "name": "indicator",
+              "description": "The dot."
+            },
+            {
+              "name": "label",
+              "description": "The state."
+            },
+            {
+              "name": "spinner",
+              "description": "The spinner shown while busy."
+            }
+          ],
+          "cssProperties": [
+            {
+              "name": "--omg-accent",
+              "description": "The plugin's brand colour, for the busy spinner."
+            }
+          ]
+        },
+        {
+          "kind": "class",
+          "name": "OmgBanner",
+          "tagName": "omg-banner",
+          "customElement": true,
+          "description": "`<omg-banner tone=\"info|good|warning|bad\" heading>`: a message across the page, such as a failure and what to do about it. Slots: the message, and `actions`. A `bad` banner is an alert; the others are a status.",
+          "superclass": {
+            "name": "HTMLElement",
+            "package": "global:"
+          },
+          "attributes": [
+            {
+              "name": "heading",
+              "description": "A title above the message.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "tone",
+              "description": "Plain by default.",
+              "type": {
+                "text": "\"info\" | \"good\" | \"warning\" | \"bad\""
+              }
+            }
+          ],
+          "members": [],
+          "events": [],
+          "slots": [
+            {
+              "name": "",
+              "description": "The message."
+            },
+            {
+              "name": "actions",
+              "description": "Buttons after the message."
+            }
+          ],
+          "cssParts": [
+            {
+              "name": "actions",
+              "description": "The buttons' row; hidden when empty."
+            },
+            {
+              "name": "heading",
+              "description": "The title."
+            },
+            {
+              "name": "message",
+              "description": "The message."
+            }
+          ],
+          "cssProperties": []
+        },
+        {
+          "kind": "class",
+          "name": "OmgLog",
+          "tagName": "omg-log",
+          "customElement": true,
+          "description": "`<omg-log empty=\"No lines yet.\" follow>`: lines of output in the app's monospace type, scrolling past `--omg-log-height` (280px). Its text is its content, or set `text`. With `follow`, it keeps the latest line in view unless the person scrolled up.",
+          "superclass": {
+            "name": "HTMLElement",
+            "package": "global:"
+          },
+          "attributes": [
+            {
+              "name": "empty",
+              "description": "What it says with no lines.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "follow",
+              "description": "Keeps the latest line in view.",
+              "type": {
+                "text": "boolean"
+              }
+            }
+          ],
+          "members": [
+            {
+              "kind": "field",
+              "name": "text",
+              "description": "Its lines.",
+              "type": {
+                "text": "string"
+              }
+            }
+          ],
+          "events": [],
+          "slots": [
+            {
+              "name": "",
+              "description": "Its lines, as text."
+            }
+          ],
+          "cssParts": [
+            {
+              "name": "empty",
+              "description": "The text shown with no lines."
+            },
+            {
+              "name": "log",
+              "description": "The lines; hidden with none."
+            }
+          ],
+          "cssProperties": [
+            {
+              "name": "--omg-log-height",
+              "default": "280px",
+              "description": "How tall it grows before it scrolls."
+            }
+          ]
+        },
+        {
+          "kind": "class",
+          "name": "OmgSteps",
+          "tagName": "omg-steps",
+          "customElement": true,
+          "description": "`<omg-steps>`: the steps of a flow, numbered in order. Each is an `<omg-step heading state=\"pending|current|done|error\" open>`; a current or failed step shows its content, and `open` shows it in any state. Slots of a step: `summary`, always shown under its heading, and its content.",
+          "superclass": {
+            "name": "HTMLElement",
+            "package": "global:"
+          },
+          "attributes": [],
+          "members": [],
+          "events": [],
+          "slots": [
+            {
+              "name": "",
+              "description": "Its `omg-step` elements."
+            }
+          ],
+          "cssParts": [],
+          "cssProperties": []
+        },
+        {
+          "kind": "class",
+          "name": "OmgStep",
+          "tagName": "omg-step",
+          "customElement": true,
+          "description": "`<omg-step heading state open>`: one step of an `omg-steps` flow.",
+          "superclass": {
+            "name": "HTMLElement",
+            "package": "global:"
+          },
+          "attributes": [
+            {
+              "name": "heading",
+              "description": "What the step does.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "number",
+              "description": "Its place in the flow, which `omg-steps` sets.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "open",
+              "description": "Shows its content in any state.",
+              "type": {
+                "text": "boolean"
+              }
+            },
+            {
+              "name": "state",
+              "description": "Pending by default.",
+              "type": {
+                "text": "\"pending\" | \"current\" | \"done\" | \"error\""
+              }
+            }
+          ],
+          "members": [],
+          "events": [],
+          "slots": [
+            {
+              "name": "",
+              "description": "What the step shows while it is current or failed."
+            },
+            {
+              "name": "summary",
+              "description": "Always shown under the heading, such as what a finished step did."
+            }
+          ],
+          "cssParts": [
+            {
+              "name": "body",
+              "description": "The content."
+            },
+            {
+              "name": "heading",
+              "description": "The heading."
+            },
+            {
+              "name": "marker",
+              "description": "The number, check or failure mark."
+            },
+            {
+              "name": "summary",
+              "description": "The summary; hidden when empty."
+            }
+          ],
+          "cssProperties": []
+        },
+        {
+          "kind": "class",
+          "name": "OmgBadge",
+          "tagName": "omg-badge",
+          "customElement": true,
+          "description": "`<omg-badge tone>`: a short label for what something is or how it stands.",
+          "superclass": {
+            "name": "HTMLElement",
+            "package": "global:"
+          },
+          "attributes": [
+            {
+              "name": "tone",
+              "description": "Its colour; neutral by default.",
+              "type": {
+                "text": "\"neutral\" | \"info\" | \"good\" | \"warning\" | \"bad\""
+              }
+            }
+          ],
+          "members": [],
+          "events": [],
+          "slots": [
+            {
+              "name": "",
+              "description": "The label."
+            }
+          ],
+          "cssParts": [],
+          "cssProperties": []
+        },
+        {
+          "kind": "class",
+          "name": "OmgProgress",
+          "tagName": "omg-progress",
+          "customElement": true,
+          "description": "`<omg-progress value max label>`: how far something has got, or a moving bar while nobody knows yet.",
+          "superclass": {
+            "name": "HTMLElement",
+            "package": "global:"
+          },
+          "attributes": [
+            {
+              "name": "label",
+              "description": "What is in progress, above the bar and for screen readers.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "max",
+              "description": "What finished means; 100 by default.",
+              "type": {
+                "text": "number"
+              }
+            },
+            {
+              "name": "value",
+              "description": "How far it has got; without one, the bar just moves.",
+              "type": {
+                "text": "number"
+              }
+            }
+          ],
+          "members": [],
+          "events": [],
+          "slots": [],
+          "cssParts": [
+            {
+              "name": "bar",
+              "description": "The part that is done."
+            },
+            {
+              "name": "label",
+              "description": "The label; hidden when empty."
+            },
+            {
+              "name": "track",
+              "description": "The whole bar."
+            }
+          ],
+          "cssProperties": []
+        }
+      ],
+      "exports": [
+        {
+          "kind": "custom-element-definition",
+          "name": "omg-status",
+          "declaration": {
+            "name": "OmgStatus",
+            "module": "ui/1/feedback.js"
+          }
+        },
+        {
+          "kind": "custom-element-definition",
+          "name": "omg-banner",
+          "declaration": {
+            "name": "OmgBanner",
+            "module": "ui/1/feedback.js"
+          }
+        },
+        {
+          "kind": "custom-element-definition",
+          "name": "omg-log",
+          "declaration": {
+            "name": "OmgLog",
+            "module": "ui/1/feedback.js"
+          }
+        },
+        {
+          "kind": "custom-element-definition",
+          "name": "omg-steps",
+          "declaration": {
+            "name": "OmgSteps",
+            "module": "ui/1/feedback.js"
+          }
+        },
+        {
+          "kind": "custom-element-definition",
+          "name": "omg-step",
+          "declaration": {
+            "name": "OmgStep",
+            "module": "ui/1/feedback.js"
+          }
+        },
+        {
+          "kind": "custom-element-definition",
+          "name": "omg-badge",
+          "declaration": {
+            "name": "OmgBadge",
+            "module": "ui/1/feedback.js"
+          }
+        },
+        {
+          "kind": "custom-element-definition",
+          "name": "omg-progress",
+          "declaration": {
+            "name": "OmgProgress",
+            "module": "ui/1/feedback.js"
+          }
+        }
+      ]
+    },
+    {
+      "kind": "javascript-module",
+      "path": "ui/1/forms.js",
+      "declarations": [
+        {
+          "kind": "class",
+          "name": "OmgFilePicker",
+          "tagName": "omg-file-picker",
+          "customElement": true,
+          "description": "`<omg-file-picker label accept multiple>`: choose local files or drop them. Selection stays local; callers own validation, persistence and uploads. Accept checks filenames/MIME hints, never file contents. Invalid drops retain the prior selection. Cancelling the native chooser also retains it.",
+          "superclass": {
+            "name": "HTMLElement",
+            "package": "global:"
+          },
+          "attributes": [
+            {
+              "name": "accept",
+              "description": "Comma-separated extensions or MIME types, including image/*.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "aria-label",
+              "description": "Its name, without a label.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "choose-label",
+              "description": "Picker action; defaults to Choose files.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "clear-label",
+              "description": "Clear action; defaults to Clear.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "disabled",
+              "description": "Can't be changed.",
+              "type": {
+                "text": "boolean"
+              }
+            },
+            {
+              "name": "drop-label",
+              "description": "Drop hint; defaults to or drop files here.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "error",
+              "description": "What's wrong with its value.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "hint",
+              "description": "A line under it; an error takes its place.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "label",
+              "description": "Shown with it.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "multiple",
+              "description": "Allows more than one file.",
+              "type": {
+                "text": "boolean"
+              }
+            },
+            {
+              "name": "rejected-label",
+              "description": "Rejection feedback; defaults to Check the file type and number of files.",
+              "type": {
+                "text": "string"
+              }
+            }
+          ],
+          "members": [
+            {
+              "kind": "method",
+              "name": "clear",
+              "description": "Clears selection silently; user clearing emits change.",
+              "return": {
+                "type": {
+                  "text": "void"
+                }
+              }
+            },
+            {
+              "kind": "field",
+              "name": "files",
+              "description": "A copy of the currently selected local files.",
+              "type": {
+                "text": "File[]"
+              },
+              "readonly": true
+            }
+          ],
+          "events": [
+            {
+              "name": "change",
+              "description": "The person changed it.",
+              "type": {
+                "text": "Event"
+              }
+            },
+            {
+              "name": "input",
+              "description": "The person is changing it.",
+              "type": {
+                "text": "Event"
+              }
+            },
+            {
+              "name": "omg-reject",
+              "description": "Rejected selection; previous files remain available.",
+              "type": {
+                "text": "CustomEvent<{ files: File[], reason: \"accept\" | \"multiple\" }>"
+              }
+            }
+          ],
+          "slots": [],
+          "cssParts": [
+            {
+              "name": "clear",
+              "description": "Clear button."
+            },
+            {
+              "name": "dropzone",
+              "description": "Clickable drop surface."
+            },
+            {
+              "name": "error",
+              "description": "The error; hidden when empty."
+            },
+            {
+              "name": "field",
+              "description": "The label around it."
+            },
+            {
+              "name": "files",
+              "description": "Selected filenames."
+            },
+            {
+              "name": "hint",
+              "description": "The hint; hidden when empty or when there is an error."
+            },
+            {
+              "name": "input",
+              "description": "Native file input."
+            },
+            {
+              "name": "label",
+              "description": "The label's text."
+            }
+          ],
+          "cssProperties": []
+        },
+        {
+          "kind": "class",
+          "name": "OmgSlider",
+          "tagName": "omg-slider",
+          "customElement": true,
+          "description": "`<omg-slider label min max step value>`: a native range with a numeric readout. The browser bounds and steps the value. Input fires while adjusting; change fires when committed. Programmatic changes are silent.",
+          "superclass": {
+            "name": "HTMLElement",
+            "package": "global:"
+          },
+          "attributes": [
+            {
+              "name": "aria-label",
+              "description": "Its name, without a label.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "disabled",
+              "description": "Can't be changed.",
+              "type": {
+                "text": "boolean"
+              }
+            },
+            {
+              "name": "error",
+              "description": "What's wrong with its value.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "hint",
+              "description": "A line under it; an error takes its place.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "label",
+              "description": "Shown with it.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "max",
+              "description": "Range end; defaults to 100.",
+              "type": {
+                "text": "number"
+              }
+            },
+            {
+              "name": "min",
+              "description": "Range start; defaults to 0.",
+              "type": {
+                "text": "number"
+              }
+            },
+            {
+              "name": "step",
+              "description": "Increment; defaults to 1.",
+              "type": {
+                "text": "number | \"any\""
+              }
+            },
+            {
+              "name": "value",
+              "description": "Current value; defaults to the native range midpoint.",
+              "type": {
+                "text": "number"
+              }
+            }
+          ],
+          "members": [
+            {
+              "kind": "field",
+              "name": "value",
+              "description": "Current bounded numeric value.",
+              "type": {
+                "text": "number"
+              }
+            }
+          ],
+          "events": [
+            {
+              "name": "change",
+              "description": "The person changed it.",
+              "type": {
+                "text": "Event"
+              }
+            },
+            {
+              "name": "input",
+              "description": "The person is changing it.",
+              "type": {
+                "text": "Event"
+              }
+            }
+          ],
+          "slots": [],
+          "cssParts": [
+            {
+              "name": "error",
+              "description": "The error; hidden when empty."
+            },
+            {
+              "name": "field",
+              "description": "The label around it."
+            },
+            {
+              "name": "hint",
+              "description": "The hint; hidden when empty or when there is an error."
+            },
+            {
+              "name": "input",
+              "description": "Native range control."
+            },
+            {
+              "name": "label",
+              "description": "The label's text."
+            },
+            {
+              "name": "output",
+              "description": "Current numeric value."
+            }
+          ],
+          "cssProperties": []
+        },
+        {
+          "kind": "class",
+          "name": "OmgRadioGroup",
+          "tagName": "omg-radio-group",
+          "customElement": true,
+          "description": "`<omg-radio-group label value>` with `<option>` children: visible choices, optionally explained by each option's `data-description`. Native arrows and Space select; separate groups keep independent selections.",
+          "superclass": {
+            "name": "HTMLElement",
+            "package": "global:"
+          },
+          "attributes": [
+            {
+              "name": "aria-label",
+              "description": "Its name, without a label.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "disabled",
+              "description": "Can't be changed.",
+              "type": {
+                "text": "boolean"
+              }
+            },
+            {
+              "name": "error",
+              "description": "What's wrong with its value.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "hint",
+              "description": "A line under it; an error takes its place.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "label",
+              "description": "Shown with it.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "value",
+              "description": "The chosen option's value.",
+              "type": {
+                "text": "string"
+              }
+            }
+          ],
+          "members": [
+            {
+              "kind": "field",
+              "name": "value",
+              "description": "The chosen option's value.",
+              "type": {
+                "text": "string"
+              }
+            }
+          ],
+          "events": [
+            {
+              "name": "change",
+              "description": "The person changed it.",
+              "type": {
+                "text": "Event"
+              }
+            },
+            {
+              "name": "input",
+              "description": "The person is changing it.",
+              "type": {
+                "text": "Event"
+              }
+            }
+          ],
+          "slots": [],
+          "cssParts": [
+            {
+              "name": "error",
+              "description": "The error; hidden when empty."
+            },
+            {
+              "name": "field",
+              "description": "The label around it."
+            },
+            {
+              "name": "hint",
+              "description": "The hint; hidden when empty or when there is an error."
+            },
+            {
+              "name": "label",
+              "description": "The label's text."
+            },
+            {
+              "name": "option",
+              "description": "One labelled choice."
+            },
+            {
+              "name": "options",
+              "description": "The radio group."
+            }
+          ],
+          "cssProperties": []
+        },
+        {
+          "kind": "class",
+          "name": "OmgCombobox",
+          "tagName": "omg-combobox",
+          "customElement": true,
+          "description": "`<omg-combobox label value>` with `<option>` children: a searchable choice. Query text never changes the committed value until an enabled option is picked. Closing discards the query. Options can be replaced asynchronously; set `manual-filter` when the caller filters them remotely.",
+          "superclass": {
+            "name": "HTMLElement",
+            "package": "global:"
+          },
+          "attributes": [
+            {
+              "name": "aria-label",
+              "description": "Its name, without a label.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "disabled",
+              "description": "Can't be changed.",
+              "type": {
+                "text": "boolean"
+              }
+            },
+            {
+              "name": "empty-label",
+              "description": "Empty list message; defaults to No results.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "error",
+              "description": "What's wrong with its value.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "hint",
+              "description": "A line under it; an error takes its place.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "label",
+              "description": "Shown with it.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "loading",
+              "description": "Shows loading-label; disables picking stale options.",
+              "type": {
+                "text": "boolean"
+              }
+            },
+            {
+              "name": "loading-label",
+              "description": "Loading message; defaults to Loading….",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "manual-filter",
+              "description": "The caller filters options using omg-query.",
+              "type": {
+                "text": "boolean"
+              }
+            },
+            {
+              "name": "placeholder",
+              "description": "Text shown with no selection.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "value",
+              "description": "The chosen option's value.",
+              "type": {
+                "text": "string"
+              }
+            }
+          ],
+          "members": [
+            {
+              "kind": "field",
+              "name": "query",
+              "description": "Current uncommitted search text.",
+              "type": {
+                "text": "string"
+              },
+              "readonly": true
+            },
+            {
+              "kind": "field",
+              "name": "value",
+              "description": "The chosen option's value.",
+              "type": {
+                "text": "string"
+              }
+            }
+          ],
+          "events": [
+            {
+              "name": "change",
+              "description": "The person changed it.",
+              "type": {
+                "text": "Event"
+              }
+            },
+            {
+              "name": "input",
+              "description": "The person is changing it.",
+              "type": {
+                "text": "Event"
+              }
+            },
+            {
+              "name": "omg-query",
+              "description": "Search text changed, or a manual-filter list opened; caller owns fetching and stale-result protection.",
+              "type": {
+                "text": "CustomEvent<{ query: string }>"
+              }
+            }
+          ],
+          "slots": [],
+          "cssParts": [
+            {
+              "name": "error",
+              "description": "The error; hidden when empty."
+            },
+            {
+              "name": "field",
+              "description": "The label around it."
+            },
+            {
+              "name": "hint",
+              "description": "The hint; hidden when empty or when there is an error."
+            },
+            {
+              "name": "input",
+              "description": "Combobox input, with active-descendant keyboard navigation."
+            },
+            {
+              "name": "label",
+              "description": "The label's text."
+            },
+            {
+              "name": "options",
+              "description": "Listbox."
+            },
+            {
+              "name": "panel",
+              "description": "Floating list surface."
+            },
+            {
+              "name": "status",
+              "description": "Loading or empty message."
+            }
+          ],
+          "cssProperties": []
+        },
+        {
+          "kind": "class",
+          "name": "OmgInput",
+          "tagName": "omg-input",
+          "customElement": true,
+          "description": "`<omg-input label value type placeholder hint error>`: one line of text.",
+          "superclass": {
+            "name": "HTMLElement",
+            "package": "global:"
+          },
+          "attributes": [
+            {
+              "name": "aria-label",
+              "description": "Its name, without a label.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "disabled",
+              "description": "Can't be changed.",
+              "type": {
+                "text": "boolean"
+              }
+            },
+            {
+              "name": "error",
+              "description": "What's wrong with its value.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "hint",
+              "description": "A line under it; an error takes its place.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "label",
+              "description": "Shown with it.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "max",
+              "description": "Maximum for type=number.",
+              "type": {
+                "text": "number"
+              }
+            },
+            {
+              "name": "min",
+              "description": "Minimum for type=number; native validation does not clamp typed text.",
+              "type": {
+                "text": "number"
+              }
+            },
+            {
+              "name": "placeholder",
+              "description": "Shown while it is empty.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "readonly",
+              "description": "Can be read and copied, not changed.",
+              "type": {
+                "text": "boolean"
+              }
+            },
+            {
+              "name": "step",
+              "description": "Numeric increment; native default is 1.",
+              "type": {
+                "text": "number | \"any\""
+              }
+            },
+            {
+              "name": "type",
+              "description": "What it holds; text by default.",
+              "type": {
+                "text": "\"text\" | \"search\" | \"password\" | \"number\" | \"email\" | \"url\""
+              }
+            },
+            {
+              "name": "value",
+              "description": "Its text; setting it replaces what was typed.",
+              "type": {
+                "text": "string"
+              }
+            }
+          ],
+          "members": [
+            {
+              "kind": "method",
+              "name": "checkValidity",
+              "description": "Whether the native input satisfies its constraints.",
+              "return": {
+                "type": {
+                  "text": "boolean"
+                }
+              }
+            },
+            {
+              "kind": "field",
+              "name": "value",
+              "description": "Its text.",
+              "type": {
+                "text": "string"
+              }
+            }
+          ],
+          "events": [
+            {
+              "name": "change",
+              "description": "The person changed it.",
+              "type": {
+                "text": "Event"
+              }
+            },
+            {
+              "name": "input",
+              "description": "The person is changing it.",
+              "type": {
+                "text": "Event"
+              }
+            }
+          ],
+          "slots": [],
+          "cssParts": [
+            {
+              "name": "error",
+              "description": "The error; hidden when empty."
+            },
+            {
+              "name": "field",
+              "description": "The label around it."
+            },
+            {
+              "name": "hint",
+              "description": "The hint; hidden when empty or when there is an error."
+            },
+            {
+              "name": "input",
+              "description": "The native input."
+            },
+            {
+              "name": "label",
+              "description": "The label's text."
+            }
+          ],
+          "cssProperties": []
+        },
+        {
+          "kind": "class",
+          "name": "OmgTextarea",
+          "tagName": "omg-textarea",
+          "customElement": true,
+          "description": "`<omg-textarea label value rows placeholder hint error>`: several lines of text.",
+          "superclass": {
+            "name": "HTMLElement",
+            "package": "global:"
+          },
+          "attributes": [
+            {
+              "name": "aria-label",
+              "description": "Its name, without a label.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "disabled",
+              "description": "Can't be changed.",
+              "type": {
+                "text": "boolean"
+              }
+            },
+            {
+              "name": "error",
+              "description": "What's wrong with its value.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "hint",
+              "description": "A line under it; an error takes its place.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "label",
+              "description": "Shown with it.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "placeholder",
+              "description": "Shown while it is empty.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "readonly",
+              "description": "Can be read and copied, not changed.",
+              "type": {
+                "text": "boolean"
+              }
+            },
+            {
+              "name": "rows",
+              "description": "How many lines it shows; 3 by default.",
+              "type": {
+                "text": "number"
+              }
+            },
+            {
+              "name": "value",
+              "description": "Its text; setting it replaces what was typed.",
+              "type": {
+                "text": "string"
+              }
+            }
+          ],
+          "members": [
+            {
+              "kind": "field",
+              "name": "value",
+              "description": "Its text.",
+              "type": {
+                "text": "string"
+              }
+            }
+          ],
+          "events": [
+            {
+              "name": "change",
+              "description": "The person changed it.",
+              "type": {
+                "text": "Event"
+              }
+            },
+            {
+              "name": "input",
+              "description": "The person is changing it.",
+              "type": {
+                "text": "Event"
+              }
+            }
+          ],
+          "slots": [],
+          "cssParts": [
+            {
+              "name": "error",
+              "description": "The error; hidden when empty."
+            },
+            {
+              "name": "field",
+              "description": "The label around it."
+            },
+            {
+              "name": "hint",
+              "description": "The hint; hidden when empty or when there is an error."
+            },
+            {
+              "name": "label",
+              "description": "The label's text."
+            },
+            {
+              "name": "textarea",
+              "description": "The native textarea."
+            }
+          ],
+          "cssProperties": []
+        },
+        {
+          "kind": "class",
+          "name": "OmgSwitch",
+          "tagName": "omg-switch",
+          "customElement": true,
+          "description": "`<omg-switch label checked hint>`: turns a setting on or off at once, with its label at the row's start and the switch at its end.",
+          "superclass": {
+            "name": "HTMLElement",
+            "package": "global:"
+          },
+          "attributes": [
+            {
+              "name": "aria-label",
+              "description": "Its name, without a label.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "checked",
+              "description": "It is on.",
+              "type": {
+                "text": "boolean"
+              }
+            },
+            {
+              "name": "disabled",
+              "description": "Can't be changed.",
+              "type": {
+                "text": "boolean"
+              }
+            },
+            {
+              "name": "error",
+              "description": "What's wrong with its value.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "hint",
+              "description": "A line under it; an error takes its place.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "label",
+              "description": "Shown with it.",
+              "type": {
+                "text": "string"
+              }
+            }
+          ],
+          "members": [
+            {
+              "kind": "field",
+              "name": "checked",
+              "description": "It is on.",
+              "type": {
+                "text": "boolean"
+              }
+            }
+          ],
+          "events": [
+            {
+              "name": "change",
+              "description": "The person changed it.",
+              "type": {
+                "text": "Event"
+              }
+            },
+            {
+              "name": "input",
+              "description": "The person is changing it.",
+              "type": {
+                "text": "Event"
+              }
+            }
+          ],
+          "slots": [],
+          "cssParts": [
+            {
+              "name": "error",
+              "description": "The error; hidden when empty."
+            },
+            {
+              "name": "field",
+              "description": "The label around it."
+            },
+            {
+              "name": "hint",
+              "description": "The hint; hidden when empty or when there is an error."
+            },
+            {
+              "name": "label",
+              "description": "The label's text."
+            },
+            {
+              "name": "switch",
+              "description": "The native checkbox."
+            }
+          ],
+          "cssProperties": [
+            {
+              "name": "--omg-accent",
+              "description": "The plugin's brand colour, for the switch when on."
+            },
+            {
+              "name": "--omg-on-accent",
+              "description": "The colour of the thumb when on."
+            }
+          ]
+        },
+        {
+          "kind": "class",
+          "name": "OmgCheckbox",
+          "tagName": "omg-checkbox",
+          "customElement": true,
+          "description": "`<omg-checkbox label checked hint>`: a choice that takes effect with the rest of a form, with the box before its label.",
+          "superclass": {
+            "name": "HTMLElement",
+            "package": "global:"
+          },
+          "attributes": [
+            {
+              "name": "aria-label",
+              "description": "Its name, without a label.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "checked",
+              "description": "It is on.",
+              "type": {
+                "text": "boolean"
+              }
+            },
+            {
+              "name": "disabled",
+              "description": "Can't be changed.",
+              "type": {
+                "text": "boolean"
+              }
+            },
+            {
+              "name": "error",
+              "description": "What's wrong with its value.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "hint",
+              "description": "A line under it; an error takes its place.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "label",
+              "description": "Shown with it.",
+              "type": {
+                "text": "string"
+              }
+            }
+          ],
+          "members": [
+            {
+              "kind": "field",
+              "name": "checked",
+              "description": "It is on.",
+              "type": {
+                "text": "boolean"
+              }
+            }
+          ],
+          "events": [
+            {
+              "name": "change",
+              "description": "The person changed it.",
+              "type": {
+                "text": "Event"
+              }
+            },
+            {
+              "name": "input",
+              "description": "The person is changing it.",
+              "type": {
+                "text": "Event"
+              }
+            }
+          ],
+          "slots": [],
+          "cssParts": [
+            {
+              "name": "checkbox",
+              "description": "The native checkbox."
+            },
+            {
+              "name": "error",
+              "description": "The error; hidden when empty."
+            },
+            {
+              "name": "field",
+              "description": "The label around it."
+            },
+            {
+              "name": "hint",
+              "description": "The hint; hidden when empty or when there is an error."
+            },
+            {
+              "name": "label",
+              "description": "The label's text."
+            }
+          ],
+          "cssProperties": [
+            {
+              "name": "--omg-accent",
+              "description": "The plugin's brand colour, for the box when checked."
+            },
+            {
+              "name": "--omg-on-accent",
+              "description": "The colour of the check."
+            }
+          ]
+        },
+        {
+          "kind": "class",
+          "name": "OmgSelect",
+          "tagName": "omg-select",
+          "customElement": true,
+          "description": "`<omg-select label value hint error disabled>` with `<option>` children: the app's dropdown. Its list stays inside the panel and scrolls.",
+          "superclass": {
+            "name": "HTMLElement",
+            "package": "global:"
+          },
+          "attributes": [
+            {
+              "name": "aria-label",
+              "description": "Its name, without a label.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "disabled",
+              "description": "Can't be changed.",
+              "type": {
+                "text": "boolean"
+              }
+            },
+            {
+              "name": "error",
+              "description": "What's wrong with its value.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "hint",
+              "description": "A line under it; an error takes its place.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "label",
+              "description": "Shown with it.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "value",
+              "description": "The chosen option's value.",
+              "type": {
+                "text": "string"
+              }
+            }
+          ],
+          "members": [
+            {
+              "kind": "field",
+              "name": "value",
+              "description": "The chosen option's value.",
+              "type": {
+                "text": "string"
+              }
+            }
+          ],
+          "events": [
+            {
+              "name": "change",
+              "description": "The person changed it.",
+              "type": {
+                "text": "Event"
+              }
+            },
+            {
+              "name": "input",
+              "description": "The person is changing it.",
+              "type": {
+                "text": "Event"
+              }
+            }
+          ],
+          "slots": [],
+          "cssParts": [
+            {
+              "name": "error",
+              "description": "The error; hidden when empty."
+            },
+            {
+              "name": "field",
+              "description": "The label around it."
+            },
+            {
+              "name": "hint",
+              "description": "The hint; hidden when empty or when there is an error."
+            },
+            {
+              "name": "label",
+              "description": "The label's text."
+            },
+            {
+              "name": "select",
+              "description": "The native select."
+            }
+          ],
+          "cssProperties": []
+        },
+        {
+          "kind": "class",
+          "name": "OmgSegmented",
+          "tagName": "omg-segmented",
+          "customElement": true,
+          "description": "`<omg-segmented label value hint error disabled>` with `<option>` children: a few choices side by side, all in view. Arrow keys move between them.",
+          "superclass": {
+            "name": "HTMLElement",
+            "package": "global:"
+          },
+          "attributes": [
+            {
+              "name": "aria-label",
+              "description": "Its name, without a label.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "disabled",
+              "description": "Can't be changed.",
+              "type": {
+                "text": "boolean"
+              }
+            },
+            {
+              "name": "error",
+              "description": "What's wrong with its value.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "hint",
+              "description": "A line under it; an error takes its place.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "label",
+              "description": "Shown with it.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "value",
+              "description": "The chosen option's value.",
+              "type": {
+                "text": "string"
+              }
+            }
+          ],
+          "members": [
+            {
+              "kind": "field",
+              "name": "value",
+              "description": "The chosen option's value.",
+              "type": {
+                "text": "string"
+              }
+            }
+          ],
+          "events": [
+            {
+              "name": "change",
+              "description": "The person changed it.",
+              "type": {
+                "text": "Event"
+              }
+            },
+            {
+              "name": "input",
+              "description": "The person is changing it.",
+              "type": {
+                "text": "Event"
+              }
+            }
+          ],
+          "slots": [],
+          "cssParts": [
+            {
+              "name": "error",
+              "description": "The error; hidden when empty."
+            },
+            {
+              "name": "field",
+              "description": "The label around it."
+            },
+            {
+              "name": "hint",
+              "description": "The hint; hidden when empty or when there is an error."
+            },
+            {
+              "name": "label",
+              "description": "The label's text."
+            },
+            {
+              "name": "segment",
+              "description": "One choice."
+            },
+            {
+              "name": "segments",
+              "description": "The row of choices."
+            }
+          ],
+          "cssProperties": []
+        }
+      ],
+      "exports": [
+        {
+          "kind": "custom-element-definition",
+          "name": "omg-file-picker",
+          "declaration": {
+            "name": "OmgFilePicker",
+            "module": "ui/1/forms.js"
+          }
+        },
+        {
+          "kind": "custom-element-definition",
+          "name": "omg-slider",
+          "declaration": {
+            "name": "OmgSlider",
+            "module": "ui/1/forms.js"
+          }
+        },
+        {
+          "kind": "custom-element-definition",
+          "name": "omg-radio-group",
+          "declaration": {
+            "name": "OmgRadioGroup",
+            "module": "ui/1/forms.js"
+          }
+        },
+        {
+          "kind": "custom-element-definition",
+          "name": "omg-combobox",
+          "declaration": {
+            "name": "OmgCombobox",
+            "module": "ui/1/forms.js"
+          }
+        },
+        {
+          "kind": "custom-element-definition",
+          "name": "omg-input",
+          "declaration": {
+            "name": "OmgInput",
+            "module": "ui/1/forms.js"
+          }
+        },
+        {
+          "kind": "custom-element-definition",
+          "name": "omg-textarea",
+          "declaration": {
+            "name": "OmgTextarea",
+            "module": "ui/1/forms.js"
+          }
+        },
+        {
+          "kind": "custom-element-definition",
+          "name": "omg-switch",
+          "declaration": {
+            "name": "OmgSwitch",
+            "module": "ui/1/forms.js"
+          }
+        },
+        {
+          "kind": "custom-element-definition",
+          "name": "omg-checkbox",
+          "declaration": {
+            "name": "OmgCheckbox",
+            "module": "ui/1/forms.js"
+          }
+        },
+        {
+          "kind": "custom-element-definition",
+          "name": "omg-select",
+          "declaration": {
+            "name": "OmgSelect",
+            "module": "ui/1/forms.js"
+          }
+        },
+        {
+          "kind": "custom-element-definition",
+          "name": "omg-segmented",
+          "declaration": {
+            "name": "OmgSegmented",
+            "module": "ui/1/forms.js"
+          }
+        }
+      ]
+    },
+    {
+      "kind": "javascript-module",
+      "path": "ui/1/layout.js",
+      "declarations": [
+        {
+          "kind": "class",
+          "name": "OmgPage",
+          "tagName": "omg-page",
+          "customElement": true,
+          "description": "`<omg-page heading description wide>`: the page's column, centred and at most 720px wide, or the panel's whole width when `wide`. Slots: `brand` (a logo before the heading), `actions`, and the page's sections.",
+          "superclass": {
+            "name": "HTMLElement",
+            "package": "global:"
+          },
+          "attributes": [
+            {
+              "name": "description",
+              "description": "A line under the title.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "heading",
+              "description": "The page's title.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "wide",
+              "description": "Fills the panel's width, for a page with a sidebar or a grid.",
+              "type": {
+                "text": "boolean"
+              }
+            }
+          ],
+          "members": [],
+          "events": [],
+          "slots": [
+            {
+              "name": "",
+              "description": "The page's sections."
+            },
+            {
+              "name": "actions",
+              "description": "Buttons beside the heading."
+            },
+            {
+              "name": "brand",
+              "description": "A logo before the heading."
+            }
+          ],
+          "cssParts": [
+            {
+              "name": "body",
+              "description": "The column of sections."
+            },
+            {
+              "name": "description",
+              "description": "The line under the title."
+            },
+            {
+              "name": "header",
+              "description": "The row of the brand, titles and actions; hidden when empty."
+            },
+            {
+              "name": "heading",
+              "description": "The title."
+            }
+          ],
+          "cssProperties": []
+        },
+        {
+          "kind": "class",
+          "name": "OmgSection",
+          "tagName": "omg-section",
+          "customElement": true,
+          "description": "`<omg-section heading description>`: a titled group of content. Slots: `actions` beside the heading, and the section's content.",
+          "superclass": {
+            "name": "HTMLElement",
+            "package": "global:"
+          },
+          "attributes": [
+            {
+              "name": "description",
+              "description": "A line under the title.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "heading",
+              "description": "The section's title, which names it.",
+              "type": {
+                "text": "string"
+              }
+            }
+          ],
+          "members": [],
+          "events": [],
+          "slots": [
+            {
+              "name": "",
+              "description": "The section's content."
+            },
+            {
+              "name": "actions",
+              "description": "Buttons beside the heading."
+            }
+          ],
+          "cssParts": [
+            {
+              "name": "body",
+              "description": "The column of content."
+            },
+            {
+              "name": "description",
+              "description": "The line under the title."
+            },
+            {
+              "name": "header",
+              "description": "The titles and actions; hidden when empty."
+            },
+            {
+              "name": "heading",
+              "description": "The title."
+            },
+            {
+              "name": "section",
+              "description": "The section."
+            }
+          ],
+          "cssProperties": []
+        },
+        {
+          "kind": "class",
+          "name": "OmgStack",
+          "tagName": "omg-stack",
+          "customElement": true,
+          "description": "`<omg-stack direction=\"row|column\" gap=\"1|2|3|4|6\" align justify wrap>`: lays its children out in a row or a column, spaced by the app's steps.",
+          "superclass": {
+            "name": "HTMLElement",
+            "package": "global:"
+          },
+          "attributes": [
+            {
+              "name": "align",
+              "description": "How children line up across it.",
+              "type": {
+                "text": "\"start\" | \"center\" | \"end\" | \"stretch\" | \"baseline\""
+              }
+            },
+            {
+              "name": "direction",
+              "description": "Column by default.",
+              "type": {
+                "text": "\"column\" | \"row\""
+              }
+            },
+            {
+              "name": "gap",
+              "description": "A space token; 4 for columns, 2 for rows by default.",
+              "type": {
+                "text": "\"0\" | \"1\" | \"2\" | \"3\" | \"4\" | \"6\""
+              }
+            },
+            {
+              "name": "justify",
+              "description": "How children are spread along it.",
+              "type": {
+                "text": "\"start\" | \"center\" | \"end\" | \"between\""
+              }
+            },
+            {
+              "name": "wrap",
+              "description": "Lets a row wrap.",
+              "type": {
+                "text": "boolean"
+              }
+            }
+          ],
+          "members": [],
+          "events": [],
+          "slots": [
+            {
+              "name": "",
+              "description": "The children."
+            }
+          ],
+          "cssParts": [],
+          "cssProperties": []
+        },
+        {
+          "kind": "class",
+          "name": "OmgEmpty",
+          "tagName": "omg-empty",
+          "customElement": true,
+          "description": "`<omg-empty heading description>`: what a page shows when it has nothing yet. Slots: `icon`, and actions as its content.",
+          "superclass": {
+            "name": "HTMLElement",
+            "package": "global:"
+          },
+          "attributes": [
+            {
+              "name": "description",
+              "description": "What to do about it.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "heading",
+              "description": "What is missing.",
+              "type": {
+                "text": "string"
+              }
+            }
+          ],
+          "members": [],
+          "events": [],
+          "slots": [
+            {
+              "name": "",
+              "description": "Actions."
+            },
+            {
+              "name": "icon",
+              "description": "An icon above the heading."
+            }
+          ],
+          "cssParts": [
+            {
+              "name": "actions",
+              "description": "The actions' row; hidden when empty."
+            },
+            {
+              "name": "description",
+              "description": "The description."
+            },
+            {
+              "name": "heading",
+              "description": "The heading."
+            },
+            {
+              "name": "icon",
+              "description": "The icon's place; hidden when empty."
+            }
+          ],
+          "cssProperties": []
+        },
+        {
+          "kind": "class",
+          "name": "OmgGrid",
+          "tagName": "omg-grid",
+          "customElement": true,
+          "description": "`<omg-grid min columns gap>`: lays its children out in equal columns, as many as fit at `min` pixels wide each, or exactly `columns`.",
+          "superclass": {
+            "name": "HTMLElement",
+            "package": "global:"
+          },
+          "attributes": [
+            {
+              "name": "columns",
+              "description": "A fixed number of columns, in place of as many as fit.",
+              "type": {
+                "text": "number"
+              }
+            },
+            {
+              "name": "gap",
+              "description": "A space token; 3 by default.",
+              "type": {
+                "text": "\"0\" | \"1\" | \"2\" | \"3\" | \"4\" | \"6\""
+              }
+            },
+            {
+              "name": "min",
+              "description": "The narrowest a column gets, in pixels; 240 by default.",
+              "type": {
+                "text": "number"
+              }
+            }
+          ],
+          "members": [],
+          "events": [],
+          "slots": [
+            {
+              "name": "",
+              "description": "The children."
+            }
+          ],
+          "cssParts": [
+            {
+              "name": "grid",
+              "description": "The grid."
+            }
+          ],
+          "cssProperties": []
+        },
+        {
+          "kind": "class",
+          "name": "OmgSplit",
+          "tagName": "omg-split",
+          "customElement": true,
+          "description": "`<omg-split side side-width>`: a sidebar beside the main content, which go one above the other when there isn't room for both.",
+          "superclass": {
+            "name": "HTMLElement",
+            "package": "global:"
+          },
+          "attributes": [
+            {
+              "name": "side",
+              "description": "Which side the sidebar is on; the start by default.",
+              "type": {
+                "text": "\"start\" | \"end\""
+              }
+            },
+            {
+              "name": "side-width",
+              "description": "The sidebar's width in pixels; 240 by default.",
+              "type": {
+                "text": "number"
+              }
+            }
+          ],
+          "members": [],
+          "events": [],
+          "slots": [
+            {
+              "name": "",
+              "description": "The main content."
+            },
+            {
+              "name": "sidebar",
+              "description": "The sidebar."
+            }
+          ],
+          "cssParts": [
+            {
+              "name": "main",
+              "description": "The main content's place."
+            },
+            {
+              "name": "sidebar",
+              "description": "The sidebar's place."
+            },
+            {
+              "name": "split",
+              "description": "The two places together."
+            }
+          ],
+          "cssProperties": []
+        },
+        {
+          "kind": "class",
+          "name": "OmgCard",
+          "tagName": "omg-card",
+          "customElement": true,
+          "description": "`<omg-card heading description>`: a raised surface that groups its content.",
+          "superclass": {
+            "name": "HTMLElement",
+            "package": "global:"
+          },
+          "attributes": [
+            {
+              "name": "description",
+              "description": "A line under the title.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "heading",
+              "description": "The card's title.",
+              "type": {
+                "text": "string"
+              }
+            }
+          ],
+          "members": [],
+          "events": [],
+          "slots": [
+            {
+              "name": "",
+              "description": "The content."
+            },
+            {
+              "name": "actions",
+              "description": "Buttons beside the heading."
+            }
+          ],
+          "cssParts": [
+            {
+              "name": "body",
+              "description": "The content."
+            },
+            {
+              "name": "description",
+              "description": "The line under the title."
+            },
+            {
+              "name": "header",
+              "description": "The row of the titles and actions; hidden when empty."
+            },
+            {
+              "name": "heading",
+              "description": "The title."
+            }
+          ],
+          "cssProperties": []
+        },
+        {
+          "kind": "class",
+          "name": "OmgList",
+          "tagName": "omg-list",
+          "customElement": true,
+          "description": "`<omg-list>`: rows of `omg-list-item`, with a hairline between them.",
+          "superclass": {
+            "name": "HTMLElement",
+            "package": "global:"
+          },
+          "attributes": [],
+          "members": [],
+          "events": [],
+          "slots": [
+            {
+              "name": "",
+              "description": "The `omg-list-item` children."
+            }
+          ],
+          "cssParts": [],
+          "cssProperties": []
+        },
+        {
+          "kind": "class",
+          "name": "OmgListItem",
+          "tagName": "omg-list-item",
+          "customElement": true,
+          "description": "`<omg-list-item heading description>`: a row: an icon, a title and a line under it, then a value and buttons at its end.",
+          "superclass": {
+            "name": "HTMLElement",
+            "package": "global:"
+          },
+          "attributes": [
+            {
+              "name": "description",
+              "description": "A line under the title.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "heading",
+              "description": "The row's title.",
+              "type": {
+                "text": "string"
+              }
+            }
+          ],
+          "members": [],
+          "events": [],
+          "slots": [
+            {
+              "name": "",
+              "description": "The row's value, at its end."
+            },
+            {
+              "name": "actions",
+              "description": "Buttons at its end, after the value."
+            },
+            {
+              "name": "leading",
+              "description": "An icon or picture before the title; an `omg-image` is drawn as a 40px thumbnail."
+            }
+          ],
+          "cssParts": [
+            {
+              "name": "actions",
+              "description": "The buttons' place; hidden when empty."
+            },
+            {
+              "name": "description",
+              "description": "The line under the title."
+            },
+            {
+              "name": "heading",
+              "description": "The title."
+            },
+            {
+              "name": "leading",
+              "description": "The leading place; hidden when empty."
+            },
+            {
+              "name": "value",
+              "description": "The value's place; hidden when empty."
+            }
+          ],
+          "cssProperties": []
+        },
+        {
+          "kind": "class",
+          "name": "OmgDivider",
+          "tagName": "omg-divider",
+          "customElement": true,
+          "description": "`<omg-divider label>`: a hairline between groups, with an optional label on it.",
+          "superclass": {
+            "name": "HTMLElement",
+            "package": "global:"
+          },
+          "attributes": [
+            {
+              "name": "label",
+              "description": "Text on the line.",
+              "type": {
+                "text": "string"
+              }
+            }
+          ],
+          "members": [],
+          "events": [],
+          "slots": [],
+          "cssParts": [
+            {
+              "name": "label",
+              "description": "The label; hidden when empty."
+            }
+          ],
+          "cssProperties": []
+        },
+        {
+          "kind": "class",
+          "name": "OmgPath",
+          "tagName": "omg-path",
+          "customElement": true,
+          "description": "`<omg-path path>`: a read-only path with a subdued directory and a prominent filename. Narrow rows truncate the start, keeping the filename in view. The full path remains selectable and available through the native title.",
+          "superclass": {
+            "name": "HTMLElement",
+            "package": "global:"
+          },
+          "attributes": [
+            {
+              "name": "path",
+              "description": "File or directory path, displayed as text; never opened or resolved.",
+              "type": {
+                "text": "string"
+              }
+            }
+          ],
+          "members": [],
+          "events": [],
+          "slots": [],
+          "cssParts": [
+            {
+              "name": "directory",
+              "description": "The directory prefix."
+            },
+            {
+              "name": "name",
+              "description": "The filename or last directory name."
+            },
+            {
+              "name": "path",
+              "description": "The full path, clipped at the start when needed."
+            }
+          ],
+          "cssProperties": []
+        }
+      ],
+      "exports": [
+        {
+          "kind": "custom-element-definition",
+          "name": "omg-page",
+          "declaration": {
+            "name": "OmgPage",
+            "module": "ui/1/layout.js"
+          }
+        },
+        {
+          "kind": "custom-element-definition",
+          "name": "omg-section",
+          "declaration": {
+            "name": "OmgSection",
+            "module": "ui/1/layout.js"
+          }
+        },
+        {
+          "kind": "custom-element-definition",
+          "name": "omg-stack",
+          "declaration": {
+            "name": "OmgStack",
+            "module": "ui/1/layout.js"
+          }
+        },
+        {
+          "kind": "custom-element-definition",
+          "name": "omg-empty",
+          "declaration": {
+            "name": "OmgEmpty",
+            "module": "ui/1/layout.js"
+          }
+        },
+        {
+          "kind": "custom-element-definition",
+          "name": "omg-grid",
+          "declaration": {
+            "name": "OmgGrid",
+            "module": "ui/1/layout.js"
+          }
+        },
+        {
+          "kind": "custom-element-definition",
+          "name": "omg-split",
+          "declaration": {
+            "name": "OmgSplit",
+            "module": "ui/1/layout.js"
+          }
+        },
+        {
+          "kind": "custom-element-definition",
+          "name": "omg-card",
+          "declaration": {
+            "name": "OmgCard",
+            "module": "ui/1/layout.js"
+          }
+        },
+        {
+          "kind": "custom-element-definition",
+          "name": "omg-list",
+          "declaration": {
+            "name": "OmgList",
+            "module": "ui/1/layout.js"
+          }
+        },
+        {
+          "kind": "custom-element-definition",
+          "name": "omg-list-item",
+          "declaration": {
+            "name": "OmgListItem",
+            "module": "ui/1/layout.js"
+          }
+        },
+        {
+          "kind": "custom-element-definition",
+          "name": "omg-divider",
+          "declaration": {
+            "name": "OmgDivider",
+            "module": "ui/1/layout.js"
+          }
+        },
+        {
+          "kind": "custom-element-definition",
+          "name": "omg-path",
+          "declaration": {
+            "name": "OmgPath",
+            "module": "ui/1/layout.js"
+          }
+        }
+      ]
+    },
+    {
+      "kind": "javascript-module",
+      "path": "ui/1/media.js",
+      "declarations": [
+        {
+          "kind": "class",
+          "name": "OmgImage",
+          "tagName": "omg-image",
+          "customElement": true,
+          "description": "`<omg-image src file alt ratio fit pixelated checker>`: a picture, on a raised surface until it loads and with a mark when it can't. With `ratio` it fills a frame of that shape; without, it is drawn at its own size, at most as wide as its place.",
+          "superclass": {
+            "name": "HTMLElement",
+            "package": "global:"
+          },
+          "attributes": [
+            {
+              "name": "alt",
+              "description": "What it shows, for people who can't see it; leave it empty for a decoration.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "checker",
+              "description": "Draws a checkerboard behind it, to show where it is transparent.",
+              "type": {
+                "text": "boolean"
+              }
+            },
+            {
+              "name": "file",
+              "description": "A picture in the project, by its path there, in place of `src`; the plugin needs the `project.files` capability. Set it again to show the file as it is now.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "fit",
+              "description": "How the picture fills a frame of another shape: whole, or cropped to fill it. Whole by default.",
+              "type": {
+                "text": "\"contain\" | \"cover\""
+              }
+            },
+            {
+              "name": "pixelated",
+              "description": "Scales pixel art without smoothing it.",
+              "type": {
+                "text": "boolean"
+              }
+            },
+            {
+              "name": "ratio",
+              "description": "The frame's shape, such as `16/9` or `1`; the picture's own by default.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "src",
+              "description": "The picture's address: a file in the plugin's package, or a `data:` or `blob:` URL.",
+              "type": {
+                "text": "string"
+              }
+            }
+          ],
+          "members": [
+            {
+              "kind": "field",
+              "name": "complete",
+              "description": "It has loaded, or failed to.",
+              "type": {
+                "text": "boolean"
+              },
+              "readonly": true
+            },
+            {
+              "kind": "field",
+              "name": "naturalHeight",
+              "description": "The picture's own height in pixels; 0 until it loads.",
+              "type": {
+                "text": "number"
+              },
+              "readonly": true
+            },
+            {
+              "kind": "field",
+              "name": "naturalWidth",
+              "description": "The picture's own width in pixels; 0 until it loads.",
+              "type": {
+                "text": "number"
+              },
+              "readonly": true
+            }
+          ],
+          "events": [
+            {
+              "name": "error",
+              "description": "The picture couldn't load.",
+              "type": {
+                "text": "Event"
+              }
+            },
+            {
+              "name": "load",
+              "description": "The picture loaded.",
+              "type": {
+                "text": "Event"
+              }
+            }
+          ],
+          "slots": [],
+          "cssParts": [
+            {
+              "name": "broken",
+              "description": "The mark shown when it couldn't load."
+            },
+            {
+              "name": "frame",
+              "description": "The surface the picture is drawn on."
+            },
+            {
+              "name": "image",
+              "description": "The picture."
+            }
+          ],
+          "cssProperties": [
+            {
+              "name": "--omg-image-radius",
+              "description": "The frame's corners; the app's large radius by default."
+            }
+          ]
+        },
+        {
+          "kind": "class",
+          "name": "OmgTile",
+          "tagName": "omg-tile",
+          "customElement": true,
+          "description": "`<omg-tile heading description badge src file ratio selected disabled>`: a picture with its name and a line under it, such as an asset in a grid. It is a button: a click on it is the person picking it, and `selected` marks the one picked.",
+          "superclass": {
+            "name": "HTMLElement",
+            "package": "global:"
+          },
+          "attributes": [
+            {
+              "name": "alt",
+              "description": "What the picture shows, when the name doesn't say; empty by default.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "badge",
+              "description": "A few words over the picture's corner, such as a duration.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "checker",
+              "description": "As for `omg-image`.",
+              "type": {
+                "text": "boolean"
+              }
+            },
+            {
+              "name": "description",
+              "description": "A line under the name, such as its size or kind.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "disabled",
+              "description": "It can't be picked.",
+              "type": {
+                "text": "boolean"
+              }
+            },
+            {
+              "name": "file",
+              "description": "A picture in the project, as for `omg-image`.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "fit",
+              "description": "As for `omg-image`; cropped to fill by default.",
+              "type": {
+                "text": "\"contain\" | \"cover\""
+              }
+            },
+            {
+              "name": "heading",
+              "description": "Its name, on one line.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "pixelated",
+              "description": "As for `omg-image`.",
+              "type": {
+                "text": "boolean"
+              }
+            },
+            {
+              "name": "ratio",
+              "description": "The picture's shape, as for `omg-image`; `4/3` by default.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "selected",
+              "description": "It is the one picked.",
+              "type": {
+                "text": "boolean"
+              }
+            },
+            {
+              "name": "src",
+              "description": "The picture, as for `omg-image`.",
+              "type": {
+                "text": "string"
+              }
+            }
+          ],
+          "members": [
+            {
+              "kind": "field",
+              "name": "disabled",
+              "description": "The `disabled` attribute.",
+              "type": {
+                "text": "boolean"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "selected",
+              "description": "The `selected` attribute.",
+              "type": {
+                "text": "boolean"
+              }
+            }
+          ],
+          "events": [],
+          "slots": [
+            {
+              "name": "media",
+              "description": "Drawn in place of the picture, such as a video or a canvas."
+            }
+          ],
+          "cssParts": [
+            {
+              "name": "badge",
+              "description": "The badge; hidden when empty."
+            },
+            {
+              "name": "description",
+              "description": "The line under the name; hidden when empty."
+            },
+            {
+              "name": "heading",
+              "description": "The name."
+            },
+            {
+              "name": "image",
+              "description": "The `omg-image`, when there's no `media`."
+            },
+            {
+              "name": "preview",
+              "description": "The picture's frame."
+            },
+            {
+              "name": "tile",
+              "description": "The button."
+            }
+          ],
+          "cssProperties": []
+        },
+        {
+          "kind": "class",
+          "name": "OmgImagePreview",
+          "tagName": "omg-image-preview",
+          "customElement": true,
+          "description": "`<omg-image-preview src file alt>`: an image button that opens the whole picture in a modal. Reuses omg-image loading and omg-dialog focus/closing. It never changes a selection or uploads a file.",
+          "superclass": {
+            "name": "HTMLElement",
+            "package": "global:"
+          },
+          "attributes": [
+            {
+              "name": "alt",
+              "description": "Image description and default preview title.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "checker",
+              "description": "Show transparency in both views.",
+              "type": {
+                "text": "boolean"
+              }
+            },
+            {
+              "name": "close-label",
+              "description": "Close button name; defaults to Close.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "file",
+              "description": "A project image; requires project.files and takes precedence over src.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "fit",
+              "description": "Thumbnail fit; contain by default. The modal always shows the whole image.",
+              "type": {
+                "text": "\"contain\" | \"cover\""
+              }
+            },
+            {
+              "name": "label",
+              "description": "Trigger's accessible name; defaults to alt or Preview image.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "open",
+              "description": "Show the preview modal.",
+              "type": {
+                "text": "boolean"
+              }
+            },
+            {
+              "name": "pixelated",
+              "description": "Preserve pixel-art edges in both views.",
+              "type": {
+                "text": "boolean"
+              }
+            },
+            {
+              "name": "ratio",
+              "description": "Thumbnail aspect ratio; image's own by default.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "src",
+              "description": "Same sources as omg-image.",
+              "type": {
+                "text": "string"
+              }
+            }
+          ],
+          "members": [
+            {
+              "kind": "field",
+              "name": "open",
+              "description": "Preview visibility.",
+              "type": {
+                "text": "boolean"
+              }
+            }
+          ],
+          "events": [
+            {
+              "name": "omg-close",
+              "description": "Cancelable close request, forwarded from omg-dialog.",
+              "type": {
+                "text": "CustomEvent<{ reason: \"escape\" | \"backdrop\" | \"button\" }>"
+              }
+            }
+          ],
+          "slots": [],
+          "cssParts": [
+            {
+              "name": "dialog",
+              "description": "The omg-dialog holding the full image."
+            },
+            {
+              "name": "image",
+              "description": "The full omg-image, loaded only while open."
+            },
+            {
+              "name": "thumbnail",
+              "description": "The omg-image in the page."
+            },
+            {
+              "name": "trigger",
+              "description": "Image button."
+            }
+          ],
+          "cssProperties": []
+        }
+      ],
+      "exports": [
+        {
+          "kind": "custom-element-definition",
+          "name": "omg-image",
+          "declaration": {
+            "name": "OmgImage",
+            "module": "ui/1/media.js"
+          }
+        },
+        {
+          "kind": "custom-element-definition",
+          "name": "omg-tile",
+          "declaration": {
+            "name": "OmgTile",
+            "module": "ui/1/media.js"
+          }
+        },
+        {
+          "kind": "custom-element-definition",
+          "name": "omg-image-preview",
+          "declaration": {
+            "name": "OmgImagePreview",
+            "module": "ui/1/media.js"
+          }
+        }
+      ]
+    },
+    {
+      "kind": "javascript-module",
+      "path": "ui/1/navigation.js",
+      "declarations": [
+        {
+          "kind": "class",
+          "name": "OmgTabs",
+          "tagName": "omg-tabs",
+          "customElement": true,
+          "description": "`<omg-tabs value aria-label>`: shows one of its `omg-tab` children, with a row of their headings above. Arrow keys, Home and End move between tabs. A page listens for `omg-tab-change`, since `change` would also come up from the controls inside a tab.",
+          "superclass": {
+            "name": "HTMLElement",
+            "package": "global:"
+          },
+          "attributes": [
+            {
+              "name": "aria-label",
+              "description": "What the tabs choose between, for screen readers.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "value",
+              "description": "The `name` of the open tab; the first that isn't disabled without one.",
+              "type": {
+                "text": "string"
+              }
+            }
+          ],
+          "members": [
+            {
+              "kind": "field",
+              "name": "value",
+              "description": "The open tab's name.",
+              "type": {
+                "text": "string"
+              }
+            }
+          ],
+          "events": [
+            {
+              "name": "omg-tab-change",
+              "description": "The person opened a tab.",
+              "type": {
+                "text": "CustomEvent<{ value: string }>"
+              }
+            }
+          ],
+          "slots": [
+            {
+              "name": "",
+              "description": "The `omg-tab` children."
+            }
+          ],
+          "cssParts": [
+            {
+              "name": "list",
+              "description": "The row of headings."
+            },
+            {
+              "name": "tab",
+              "description": "A heading's button."
+            }
+          ],
+          "cssProperties": []
+        },
+        {
+          "kind": "class",
+          "name": "OmgTab",
+          "tagName": "omg-tab",
+          "customElement": true,
+          "description": "`<omg-tab name heading disabled>`: one view of an `omg-tabs`.",
+          "superclass": {
+            "name": "HTMLElement",
+            "package": "global:"
+          },
+          "attributes": [
+            {
+              "name": "disabled",
+              "description": "It can't be opened.",
+              "type": {
+                "text": "boolean"
+              }
+            },
+            {
+              "name": "heading",
+              "description": "The text of its heading, and its name for screen readers.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "name",
+              "description": "What `value` on the `omg-tabs` calls it; unique among its tabs.",
+              "type": {
+                "text": "string"
+              }
+            }
+          ],
+          "members": [],
+          "events": [],
+          "slots": [
+            {
+              "name": "",
+              "description": "The view."
+            }
+          ],
+          "cssParts": [],
+          "cssProperties": []
+        }
+      ],
+      "exports": [
+        {
+          "kind": "custom-element-definition",
+          "name": "omg-tabs",
+          "declaration": {
+            "name": "OmgTabs",
+            "module": "ui/1/navigation.js"
+          }
+        },
+        {
+          "kind": "custom-element-definition",
+          "name": "omg-tab",
+          "declaration": {
+            "name": "OmgTab",
+            "module": "ui/1/navigation.js"
+          }
+        }
+      ]
+    },
+    {
+      "kind": "javascript-module",
+      "path": "ui/1/overlays.js",
+      "declarations": [
+        {
+          "kind": "class",
+          "name": "OmgPopover",
+          "tagName": "omg-popover",
+          "customElement": true,
+          "description": "`<omg-popover label>`: a non-modal panel with a labelled trigger.",
+          "superclass": {
+            "name": "HTMLElement",
+            "package": "global:"
+          },
+          "attributes": [
+            {
+              "name": "disabled",
+              "description": "Disables the trigger and closes the panel.",
+              "type": {
+                "text": "boolean"
+              }
+            },
+            {
+              "name": "label",
+              "description": "Trigger and panel accessible name.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "open",
+              "description": "Shows the panel.",
+              "type": {
+                "text": "boolean"
+              }
+            },
+            {
+              "name": "placement",
+              "description": "Preferred placement, bottom-start by default.",
+              "type": {
+                "text": "\"bottom-start\" | \"bottom-end\" | \"top-start\" | \"top\" | \"bottom\""
+              }
+            }
+          ],
+          "members": [
+            {
+              "kind": "field",
+              "name": "open",
+              "description": "Showing state; programmatic changes are silent.",
+              "type": {
+                "text": "boolean"
+              }
+            }
+          ],
+          "events": [
+            {
+              "name": "omg-toggle",
+              "description": "User opened or dismissed the panel.",
+              "type": {
+                "text": "CustomEvent<{ open: boolean }>"
+              }
+            }
+          ],
+          "slots": [
+            {
+              "name": "",
+              "description": "Panel content, retained while closed."
+            },
+            {
+              "name": "trigger",
+              "description": "Optional text or decorative icon inside the trigger; no interactive children."
+            }
+          ],
+          "cssParts": [
+            {
+              "name": "button",
+              "description": "Trigger button."
+            },
+            {
+              "name": "label",
+              "description": "Default trigger label."
+            },
+            {
+              "name": "panel",
+              "description": "Floating panel."
+            }
+          ],
+          "cssProperties": []
+        },
+        {
+          "kind": "class",
+          "name": "OmgMenu",
+          "tagName": "omg-menu",
+          "customElement": true,
+          "description": "`<omg-menu label>`: an action menu. Arrow keys, Home/End and typeahead move through enabled actions. Enter/Space selects, Esc returns to the trigger.",
+          "superclass": {
+            "name": "HTMLElement",
+            "package": "global:"
+          },
+          "attributes": [
+            {
+              "name": "disabled",
+              "description": "Disables the trigger and closes the panel.",
+              "type": {
+                "text": "boolean"
+              }
+            },
+            {
+              "name": "label",
+              "description": "Trigger and panel accessible name.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "open",
+              "description": "Shows the panel.",
+              "type": {
+                "text": "boolean"
+              }
+            },
+            {
+              "name": "placement",
+              "description": "Preferred placement, bottom-start by default.",
+              "type": {
+                "text": "\"bottom-start\" | \"bottom-end\" | \"top-start\" | \"top\" | \"bottom\""
+              }
+            }
+          ],
+          "members": [
+            {
+              "kind": "field",
+              "name": "items",
+              "description": "Actions; values must be unique. Setting items preserves the focused action by value when possible.",
+              "type": {
+                "text": "Array<{ value: string; label: string; description?: string; disabled?: boolean; danger?: boolean; checked?: boolean }>"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "open",
+              "description": "Showing state; programmatic changes are silent.",
+              "type": {
+                "text": "boolean"
+              }
+            }
+          ],
+          "events": [
+            {
+              "name": "omg-select",
+              "description": "Selected action, after closing the menu.",
+              "type": {
+                "text": "CustomEvent<{ value: string }>"
+              }
+            },
+            {
+              "name": "omg-toggle",
+              "description": "User opened or dismissed the panel.",
+              "type": {
+                "text": "CustomEvent<{ open: boolean }>"
+              }
+            }
+          ],
+          "slots": [
+            {
+              "name": "trigger",
+              "description": "Optional text or decorative icon inside the trigger; no interactive children."
+            }
+          ],
+          "cssParts": [
+            {
+              "name": "button",
+              "description": "Trigger button."
+            },
+            {
+              "name": "label",
+              "description": "Default trigger label."
+            },
+            {
+              "name": "panel",
+              "description": "Floating panel."
+            }
+          ],
+          "cssProperties": []
+        },
+        {
+          "kind": "class",
+          "name": "OmgTooltip",
+          "tagName": "omg-tooltip",
+          "customElement": true,
+          "description": "`<omg-tooltip content>` around a focusable control: a brief non-interactive hint immediately on hover or focus. Activation and Esc dismiss it. The text is also attached as aria-description to the actual focused control, across custom-element shadow roots, preserving any existing description.",
+          "superclass": {
+            "name": "HTMLElement",
+            "package": "global:"
+          },
+          "attributes": [
+            {
+              "name": "content",
+              "description": "Plain text hint; never essential instructions.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "placement",
+              "description": "Preferred placement; top by default.",
+              "type": {
+                "text": "\"top\" | \"bottom\" | \"top-start\" | \"bottom-start\" | \"bottom-end\""
+              }
+            }
+          ],
+          "members": [],
+          "events": [],
+          "slots": [
+            {
+              "name": "",
+              "description": "One focusable control."
+            }
+          ],
+          "cssParts": [
+            {
+              "name": "tooltip",
+              "description": "Floating hint."
+            }
+          ],
+          "cssProperties": []
+        },
+        {
+          "kind": "class",
+          "name": "OmgDialog",
+          "tagName": "omg-dialog",
+          "customElement": true,
+          "description": "`<omg-dialog heading open>`: custom modal content inside the plugin iframe. Native dialog owns focus trapping and Escape; content remains mounted. Programmatic open changes are silent. Simple host confirmations still use ui.confirm.",
+          "superclass": {
+            "name": "HTMLElement",
+            "package": "global:"
+          },
+          "attributes": [
+            {
+              "name": "close-label",
+              "description": "Close button name; defaults to Close.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "description",
+              "description": "Optional description below the title.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "heading",
+              "description": "Dialog title and accessible name.",
+              "type": {
+                "text": "string"
+              }
+            },
+            {
+              "name": "open",
+              "description": "Shows the modal.",
+              "type": {
+                "text": "boolean"
+              }
+            }
+          ],
+          "members": [
+            {
+              "kind": "field",
+              "name": "open",
+              "description": "Modal visibility.",
+              "type": {
+                "text": "boolean"
+              }
+            }
+          ],
+          "events": [
+            {
+              "name": "omg-close",
+              "description": "Cancelable user close request; preventDefault keeps the dialog open.",
+              "type": {
+                "text": "CustomEvent<{ reason: \"escape\" | \"backdrop\" | \"button\" }>"
+              }
+            }
+          ],
+          "slots": [
+            {
+              "name": "",
+              "description": "Modal content, retained while closed."
+            },
+            {
+              "name": "footer",
+              "description": "Action buttons, aligned at the end."
+            }
+          ],
+          "cssParts": [
+            {
+              "name": "body",
+              "description": "Scrollable content area."
+            },
+            {
+              "name": "close",
+              "description": "Close button."
+            },
+            {
+              "name": "description",
+              "description": "Optional description."
+            },
+            {
+              "name": "footer",
+              "description": "Action area, hidden when empty."
+            },
+            {
+              "name": "heading",
+              "description": "Title."
+            },
+            {
+              "name": "panel",
+              "description": "Native modal; set max-width for custom sizing."
+            }
+          ],
+          "cssProperties": []
+        }
+      ],
+      "exports": [
+        {
+          "kind": "custom-element-definition",
+          "name": "omg-popover",
+          "declaration": {
+            "name": "OmgPopover",
+            "module": "ui/1/overlays.js"
+          }
+        },
+        {
+          "kind": "custom-element-definition",
+          "name": "omg-menu",
+          "declaration": {
+            "name": "OmgMenu",
+            "module": "ui/1/overlays.js"
+          }
+        },
+        {
+          "kind": "custom-element-definition",
+          "name": "omg-tooltip",
+          "declaration": {
+            "name": "OmgTooltip",
+            "module": "ui/1/overlays.js"
+          }
+        },
+        {
+          "kind": "custom-element-definition",
+          "name": "omg-dialog",
+          "declaration": {
+            "name": "OmgDialog",
+            "module": "ui/1/overlays.js"
+          }
+        }
+      ]
+    }
+  ]
+}

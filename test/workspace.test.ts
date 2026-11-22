@@ -1,0 +1,212 @@
+import { mkdir, mkdtemp, readFile, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { describe, expect, it } from "vitest";
+import { getWorkspaceMedia, listWorkspaceFiles, readWorkspaceFile } from "../src/daemon/workspace.js";
+import { deleteAssetMetadata, renameAssetMetadata, writeAssetMetadata } from "../src/daemon/asset-metadata.js";
+
+describe("workspace inspection", () => {
+  it("lists immediate children without descending into nonempty or excluded folders", async () => {
+    const workspace = await mkdtemp(path.join(tmpdir(), "ohmygame-workspace-"));
+    await mkdir(path.join(workspace, "src", "deep"), { recursive: true });
+    await mkdir(path.join(workspace, "src", "empty"));
+    await mkdir(path.join(workspace, "node_modules"));
+    await writeFile(path.join(workspace, "root.ts"), "root");
+    await writeFile(path.join(workspace, "src", "deep", "hidden.ts"), "deep");
+    await writeFile(path.join(workspace, "src", "hero.png"), "image");
+    await expect(listWorkspaceFiles(workspace, "")).resolves.toEqual([
+      { path: "root.ts", size: 4 }, { path: "src", size: 0, directory: true },
+    ]);
+    await expect(listWorkspaceFiles(workspace, "src")).resolves.toEqual([
+      { path: "src/deep", size: 0, directory: true },
+      { path: "src/empty", size: 0, directory: true },
+      { path: "src/hero.png", size: 5, mediaType: "image" },
+    ]);
+    for (const directory of ["..", "src/../../outside", "/tmp", "C:/Windows", "C:Windows", "node_modules", ".ohmygame", "src//deep"]) {
+      await expect(listWorkspaceFiles(workspace, directory)).rejects.toThrow();
+    }
+    await expect(listWorkspaceFiles(workspace, "root.ts")).rejects.toThrow("not a directory");
+    await expect(listWorkspaceFiles(workspace, "missing")).rejects.toMatchObject({ code: "ENOENT" });
+    expect((await listWorkspaceFiles(workspace)).some((file) => file.path === "src/deep/hidden.ts")).toBe(true);
+  });
+
+  it("shows the project's panels and nothing else of OhMyGame's folder", async () => {
+    const workspace = await mkdtemp(path.join(tmpdir(), "ohmygame-workspace-"));
+    await mkdir(path.join(workspace, ".ohmygame", "local"), { recursive: true });
+    await writeFile(path.join(workspace, ".ohmygame", "settings.json"), "{}");
+    await writeFile(path.join(workspace, ".ohmygame", "cover.webp"), "cover");
+    await expect(listWorkspaceFiles(workspace, "")).resolves.toEqual([]);
+    await mkdir(path.join(workspace, ".ohmygame", "panels", "board", "node_modules"), { recursive: true });
+    await writeFile(path.join(workspace, ".ohmygame", "panels", "board", "panel.json"), "{}");
+    await expect(listWorkspaceFiles(workspace, "")).resolves.toEqual([{ path: ".ohmygame", size: 0, directory: true }]);
+    await expect(listWorkspaceFiles(workspace, ".ohmygame")).resolves.toEqual([{ path: ".ohmygame/panels", size: 0, directory: true }]);
+    await expect(listWorkspaceFiles(workspace, ".ohmygame/panels/board")).resolves.toEqual([{ path: ".ohmygame/panels/board/panel.json", size: 2 }]);
+    for (const directory of [".ohmygame/local", ".ohmygame/panels/board/node_modules"]) {
+      await expect(listWorkspaceFiles(workspace, directory)).rejects.toThrow("excluded");
+    }
+    await expect(listWorkspaceFiles(workspace)).resolves.toEqual([{ path: ".ohmygame/panels/board/panel.json", size: 2 }]);
+  });
+
+  it("lists source files and ignores generated directories", async () => {
+    const workspace = await mkdtemp(path.join(tmpdir(), "ohmygame-workspace-"));
+    await mkdir(path.join(workspace, "src"));
+    await mkdir(path.join(workspace, "node_modules"));
+    await mkdir(path.join(workspace, "dist"));
+    await writeFile(path.join(workspace, "src", "main.ts"), "export const game = true;\n");
+    await writeFile(path.join(workspace, "src", "cover.PNG"), "image");
+    await writeFile(path.join(workspace, "src", "logo.svg"), "<svg/>");
+    await writeFile(path.join(workspace, "src", "model.glb"), "model");
+    await writeFile(path.join(workspace, "node_modules", "dependency.js"), "ignored");
+    await writeFile(path.join(workspace, "dist", "bundle.js"), "ignored");
+
+    await expect(listWorkspaceFiles(workspace)).resolves.toEqual([
+      { path: "src/cover.PNG", size: 5, mediaType: "image", modifiedAt: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/) },
+      { path: "src/logo.svg", size: 6, mediaType: "image", modifiedAt: expect.any(String) },
+      { path: "src/main.ts", size: 26 },
+      { path: "src/model.glb", size: 5, mediaType: "model", modifiedAt: expect.any(String) },
+    ]);
+  });
+
+  it("does not list or enter directory links in shallow listings", async () => {
+    const workspace = await mkdtemp(path.join(tmpdir(), "ohmygame-workspace-"));
+    const outside = await mkdtemp(path.join(tmpdir(), "ohmygame-outside-"));
+    await mkdir(path.join(outside, "nested"));
+    await writeFile(path.join(outside, "nested", "secret.ts"), "secret");
+    await symlink(outside, path.join(workspace, "linked"), process.platform === "win32" ? "junction" : "dir");
+    await expect(listWorkspaceFiles(workspace, "")).resolves.toEqual([]);
+    await expect(listWorkspaceFiles(workspace, "linked")).rejects.toThrow("Symbolic links cannot be opened");
+    await expect(listWorkspaceFiles(workspace, "linked/nested")).rejects.toThrow("Symbolic links cannot be opened");
+  });
+
+  it("adds stored local Asset metadata", async () => {
+    const workspace = await mkdtemp(path.join(tmpdir(), "ohmygame-workspace-"));
+    await mkdir(path.join(workspace, "assets", "generated"), { recursive: true });
+    await mkdir(path.join(workspace, ".ohmygame"));
+    await writeFile(path.join(workspace, "assets", "generated", "image.webp"), "image");
+    await writeFile(path.join(workspace, ".ohmygame", "assets.json"), JSON.stringify({
+      version: 1,
+      prompts: { "assets/generated/image.webp": "A forest shrine" },
+      previews: { "assets/generated/image.webp": ".ohmygame/asset-previews/image.jpg" },
+      libraryAssets: {},
+    }));
+
+    await expect(listWorkspaceFiles(workspace)).resolves.toEqual([
+      {
+        path: "assets/generated/image.webp", size: 5, mediaType: "image", prompt: "A forest shrine", previewPath: ".ohmygame/asset-previews/image.jpg", modifiedAt: expect.any(String),
+      },
+    ]);
+  });
+
+  it("leaves Asset metadata it can't read unchanged instead of replacing it", async () => {
+    const workspace = await mkdtemp(path.join(tmpdir(), "ohmygame-workspace-"));
+    await mkdir(path.join(workspace, "assets"));
+    await mkdir(path.join(workspace, ".data"));
+    await writeFile(path.join(workspace, "assets", "image.webp"), "image");
+    const file = path.join(workspace, ".data", "assets.json");
+    for (const unreadable of [
+      JSON.stringify({ version: 2, prompts: { "assets/image.webp": "A forest shrine" } }),
+      "{ \"version\": 1, <<<<<<< HEAD",
+    ]) {
+      await writeFile(file, unreadable);
+      // Each change still goes through, recording nothing, so nothing around it is left half done.
+      await writeAssetMetadata(workspace, "assets/other.webp", { prompt: "A lake" });
+      await renameAssetMetadata(workspace, "assets/image.webp", "assets/moved.webp");
+      await expect(deleteAssetMetadata(workspace, "assets/image.webp")).resolves.toEqual([]);
+      expect(await readFile(file, "utf8")).toBe(unreadable);
+      // Reading still works; it only knows nothing of the file's records.
+      await expect(listWorkspaceFiles(workspace, "assets")).resolves.toEqual([{ path: "assets/image.webp", size: 5, mediaType: "image" }]);
+    }
+  });
+
+  it("reads bounded text and reports binary files", async () => {
+    const workspace = await mkdtemp(path.join(tmpdir(), "ohmygame-workspace-"));
+    await writeFile(path.join(workspace, "large.txt"), "x".repeat(300 * 1024));
+    await writeFile(path.join(workspace, "image.bin"), Buffer.from([0xff, 0xfe, 0x00]));
+
+    const text = await readWorkspaceFile(workspace, "large.txt");
+    expect(text).toMatchObject({ binary: false, truncated: true, size: 300 * 1024 });
+    expect(text.content).toHaveLength(256 * 1024);
+    await expect(readWorkspaceFile(workspace, "image.bin")).resolves.toMatchObject({ binary: true, size: 3 });
+  });
+
+  it("keeps bounded text readable when the limit splits a multi-byte character", async () => {
+    const workspace = await mkdtemp(path.join(tmpdir(), "ohmygame-workspace-"));
+    // The 256 KB limit falls inside a character in these text files.
+    await writeFile(path.join(workspace, "accent.md"), `x${"é".repeat(150_000)}`);
+    await writeFile(path.join(workspace, "story.md"), "中".repeat(100_000));
+    await writeFile(path.join(workspace, "emoji.md"), `xx${"😀".repeat(80_000)}`);
+    await writeFile(path.join(workspace, "noise.bin"), Buffer.alloc(300 * 1024, 0xff));
+    await writeFile(path.join(workspace, "cut.txt"), Buffer.from([0x78, 0xe4, 0xb8]));
+
+    await expect(readWorkspaceFile(workspace, "accent.md")).resolves.toMatchObject({
+      binary: false, truncated: true, content: `x${"é".repeat(Math.floor((256 * 1024 - 1) / 2))}`,
+    });
+    const text = await readWorkspaceFile(workspace, "story.md");
+    expect(text).toMatchObject({ binary: false, truncated: true, size: 300_000 });
+    expect(text.content).toBe("中".repeat(Math.floor((256 * 1024) / 3)));
+    const emoji = await readWorkspaceFile(workspace, "emoji.md");
+    expect(emoji).toMatchObject({ binary: false, truncated: true, size: 320_002 });
+    expect(emoji.content).toBe(`xx${"😀".repeat(Math.floor((256 * 1024 - 2) / 4))}`);
+    await expect(readWorkspaceFile(workspace, "noise.bin")).resolves.toEqual({ path: "noise.bin", binary: true, truncated: true, size: 300 * 1024 });
+    await expect(readWorkspaceFile(workspace, "cut.txt")).resolves.toEqual({ path: "cut.txt", binary: true, size: 3 });
+  });
+
+  it.each([
+    ["invalid lead", [0xff]],
+    ["overlong two-byte lead", [0xc0]],
+    ["overlong three-byte prefix", [0xe0, 0x80]],
+    ["surrogate prefix", [0xed, 0xa0]],
+    ["out-of-range four-byte prefix", [0xf4, 0x90]],
+    ["invalid four-byte lead", [0xf5]],
+  ] as const)("keeps a truncated file binary with %s at the limit", async (_name, tail) => {
+    const workspace = await mkdtemp(path.join(tmpdir(), "ohmygame-workspace-"));
+    const bytes = Buffer.concat([Buffer.alloc(256 * 1024 - tail.length, 0x61), Buffer.from(tail), Buffer.from("after")]);
+    await writeFile(path.join(workspace, "invalid.bin"), bytes);
+
+    const result = await readWorkspaceFile(workspace, "invalid.bin");
+    expect(result.binary).toBe(true);
+    expect(result).toMatchObject({ path: "invalid.bin", truncated: true, size: bytes.length });
+    expect(Object.hasOwn(result, "content")).toBe(false);
+  });
+
+  it("preserves a UTF-8 BOM in complete and truncated text", async () => {
+    const workspace = await mkdtemp(path.join(tmpdir(), "ohmygame-workspace-"));
+    await writeFile(path.join(workspace, "small.txt"), "\uFEFFhello");
+    await writeFile(path.join(workspace, "large.txt"), `\uFEFF${"x".repeat(300 * 1024)}`);
+
+    await expect(readWorkspaceFile(workspace, "small.txt")).resolves.toMatchObject({ binary: false, content: "\uFEFFhello" });
+    await expect(readWorkspaceFile(workspace, "large.txt")).resolves.toMatchObject({
+      binary: false, truncated: true, content: `\uFEFF${"x".repeat(256 * 1024 - 3)}`,
+    });
+  });
+
+  it("rejects traversal and symbolic links", async () => {
+    const workspace = await mkdtemp(path.join(tmpdir(), "ohmygame-workspace-"));
+    const outside = path.join(await mkdtemp(path.join(tmpdir(), "ohmygame-outside-")), "secret.txt");
+    await writeFile(outside, "secret");
+    await symlink(outside, path.join(workspace, "link.txt"));
+
+    await expect(readWorkspaceFile(workspace, "../secret.txt")).rejects.toThrow("Invalid workspace path");
+    await expect(readWorkspaceFile(workspace, path.resolve(outside))).rejects.toThrow("Invalid workspace path");
+    await expect(readWorkspaceFile(workspace, "C:\\secret.txt")).rejects.toThrow("Invalid workspace path");
+    await expect(readWorkspaceFile(workspace, "C:secret.txt")).rejects.toThrow("Invalid workspace path");
+    await expect(readWorkspaceFile(workspace, "link.txt")).rejects.toThrow("Symbolic links cannot be opened");
+  });
+
+  it("resolves supported media and rejects other raw files", async () => {
+    const workspace = await mkdtemp(path.join(tmpdir(), "ohmygame-workspace-"));
+    await writeFile(path.join(workspace, "sound.mp3"), "audio");
+    await writeFile(path.join(workspace, "logo.svg"), "<svg/>");
+    await writeFile(path.join(workspace, "model.glb"), "model");
+    await writeFile(path.join(workspace, "notes.txt"), "text");
+
+    await expect(getWorkspaceMedia(workspace, "sound.mp3")).resolves.toMatchObject({
+      absolutePath: expect.stringMatching(/sound\.mp3$/),
+      contentType: "audio/mpeg",
+      size: 5,
+    });
+    await expect(getWorkspaceMedia(workspace, "notes.txt")).rejects.toThrow("not a supported media asset");
+    await expect(getWorkspaceMedia(workspace, "logo.svg")).resolves.toMatchObject({ contentType: "image/svg+xml", mediaType: "image" });
+    await expect(getWorkspaceMedia(workspace, "model.glb")).resolves.toMatchObject({ contentType: "model/gltf-binary" });
+  });
+});

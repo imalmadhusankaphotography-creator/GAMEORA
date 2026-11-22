@@ -1,0 +1,239 @@
+import { contextBridge, ipcRenderer } from "electron";
+import type { DesktopUpdateState } from "../shared/desktop-update.js";
+import type { ProjectFileOpenMode } from "../shared/contracts.js";
+import type { PlaytestWatchState } from "../shared/playtest.js";
+import type { DesktopClipboardFile } from "../shared/file-transfer.js";
+import type { GameRecordingState } from "../shared/game-recording.js";
+import type { WebGamePlayerRequest, WebGamePlayerState, WebGamePreviewLayout } from "../shared/web-game-player.js";
+import type { PreviewColorFilter } from "../shared/preview-filter.js";
+import type { BrowserCommand, BrowserMenuLabels, BrowserState, ProjectBrowser } from "../shared/browser.js";
+import type { DaemonRuntime, DesktopRuntimeState } from "../shared/desktop-runtime.js";
+import type { NodeThumbnailResult, PlayableThumbnailSnapshot } from "../shared/playable-player-protocol.js";
+import type { AgentNotificationPermission, AgentNotificationPreferences, AgentNotificationTarget } from "../shared/agent-notifications.js";
+
+function desktopRuntime(): { daemonUrl: string; token: string } {
+  const runtime = ipcRenderer.sendSync("ohmygame:desktop-runtime") as Partial<DaemonRuntime> | null;
+  if (typeof runtime?.url !== "string" || !runtime.url || typeof runtime.token !== "string" || !runtime.token) {
+    throw new Error("Missing desktop runtime");
+  }
+  return { daemonUrl: runtime.url, token: runtime.token };
+}
+
+if (process.isMainFrame) {
+  contextBridge.exposeInMainWorld("ohMyGameDesktop", Object.freeze({
+    platform: process.platform,
+    runtime: Object.freeze(desktopRuntime()),
+    runtimeService: Object.freeze({
+      state: () => ipcRenderer.invoke("ohmygame:runtime-state") as Promise<DesktopRuntimeState>,
+      restart: (options?: { safeMode?: boolean }) => ipcRenderer.invoke("ohmygame:restart-runtime", { safeMode: options?.safeMode === true }) as Promise<DesktopRuntimeState>,
+      onState: (listener: (state: DesktopRuntimeState) => void) => {
+        const handler = (_event: Electron.IpcRendererEvent, state: DesktopRuntimeState) => listener(state);
+        ipcRenderer.on("ohmygame:runtime-state", handler);
+        return () => ipcRenderer.removeListener("ohmygame:runtime-state", handler);
+      },
+    }),
+    setAppearance: (appearance: "system" | "light" | "dark") =>
+      ipcRenderer.invoke("ohmygame:set-appearance", appearance) as Promise<void>,
+    readUsageData: () => ipcRenderer.invoke("ohmygame:read-usage-data") as Promise<boolean>,
+    onUsageDataChanged: (listener: (enabled: boolean) => void) => {
+      ipcRenderer.on("ohmygame:usage-data-changed", (_event, enabled: boolean) => listener(enabled));
+    },
+    updateUsageData: (enabled: boolean, initialize: boolean) =>
+      ipcRenderer.invoke("ohmygame:update-usage-data", enabled, initialize) as Promise<boolean>,
+    restartApp: () => ipcRenderer.invoke("ohmygame:restart-app") as Promise<void>,
+    ...(process.platform === "darwin" || process.platform === "win32" ? { backgroundRunning: Object.freeze({
+      get: () => ipcRenderer.invoke("ohmygame:background-running") as Promise<boolean>,
+      set: (enabled: boolean) => ipcRenderer.invoke("ohmygame:background-running", enabled) as Promise<boolean>,
+    }) } : {}),
+    setKeepAwake: (enabled: boolean) => ipcRenderer.invoke("ohmygame:set-keep-awake", enabled) as Promise<void>,
+    gpuFallback: Object.freeze({
+      get: () => ipcRenderer.invoke("ohmygame:gpu-fallback") as Promise<{ disabled: boolean }>,
+      set: (disabled: boolean) => ipcRenderer.invoke("ohmygame:gpu-fallback", disabled) as Promise<{ disabled: boolean }>,
+    }),
+    focusWindow: () => ipcRenderer.invoke("ohmygame:focus-window") as Promise<void>,
+    onPrepareClose: (listener: () => Promise<void>) => {
+      const callback = (_event: Electron.IpcRendererEvent, id: number) => {
+        void Promise.resolve().then(listener).then(
+          () => ipcRenderer.send("ohmygame:ready-to-close", id),
+          (cause) => ipcRenderer.send("ohmygame:ready-to-close", id, cause instanceof Error ? cause.message : String(cause)),
+        );
+      };
+      ipcRenderer.on("ohmygame:prepare-close", callback);
+      return () => ipcRenderer.removeListener("ohmygame:prepare-close", callback);
+    },
+    onCancelClose: (listener: (error: string) => void) => {
+      const callback = (_event: Electron.IpcRendererEvent, _id: number, error: string) => listener(error);
+      ipcRenderer.on("ohmygame:cancel-close", callback);
+      return () => ipcRenderer.removeListener("ohmygame:cancel-close", callback);
+    },
+    windowMenu: Object.freeze({
+      setLabels: (labels: Record<string, string>) =>
+        ipcRenderer.invoke("ohmygame:set-application-menu-labels", labels) as Promise<void>,
+    }),
+    ...(process.platform === "win32" ? {
+      windowControls: Object.freeze({
+        minimize: () => ipcRenderer.invoke("ohmygame:window-control", "minimize") as Promise<void>,
+        toggleMaximize: () => ipcRenderer.invoke("ohmygame:window-control", "toggle-maximize") as Promise<void>,
+        close: () => ipcRenderer.invoke("ohmygame:window-control", "close") as Promise<void>,
+        state: () => ipcRenderer.invoke("ohmygame:window-state") as Promise<{ maximized: boolean }>,
+        onState: (listener: (state: { maximized: boolean }) => void) => {
+          const handler = (_event: Electron.IpcRendererEvent, state: { maximized: boolean }) => listener(state);
+          ipcRenderer.on("ohmygame:window-state", handler);
+          return () => ipcRenderer.removeListener("ohmygame:window-state", handler);
+        },
+      }),
+    } : {}),
+    openExternal: (url: string) => ipcRenderer.invoke("ohmygame:open-auth-url", url) as Promise<void>,
+    allowLibraryEmbed: (url: string) => ipcRenderer.invoke("ohmygame:library-embed", url) as Promise<void>,
+    openProjectFile: (projectId: string, filePath: string, mode: ProjectFileOpenMode = "default") =>
+      ipcRenderer.invoke("ohmygame:open-project-file", projectId, filePath, mode) as Promise<void>,
+    browsePluginDirectory: (pluginId: string) => ipcRenderer.invoke("ohmygame:browse-plugin-directory", pluginId) as Promise<void>,
+    browseAccountDirectory: (runtime: string, profileId: string) => ipcRenderer.invoke("ohmygame:browse-account-directory", runtime, profileId) as Promise<void>,
+    revealPluginSkill: (pluginId: string, skillId: string) => ipcRenderer.invoke("ohmygame:reveal-plugin-skill", pluginId, skillId) as Promise<void>,
+    selectPluginDirectory: () => ipcRenderer.invoke("ohmygame:select-plugin-directory") as Promise<string | undefined>,
+    selectProjectDirectory: () => ipcRenderer.invoke("ohmygame:select-project-directory") as Promise<string | undefined>,
+    removeProject: (projectId: string) => ipcRenderer.invoke("ohmygame:remove-project", projectId) as Promise<void>,
+    openLogsDirectory: () => ipcRenderer.invoke("ohmygame:open-logs-directory") as Promise<void>,
+    exportDiagnostics: () => ipcRenderer.invoke("ohmygame:export-diagnostics") as Promise<Uint8Array<ArrayBuffer>>,
+    clipboard: Object.freeze({
+      files: () => ipcRenderer.invoke("ohmygame:clipboard-files") as Promise<DesktopClipboardFile[]>,
+      paste: () => ipcRenderer.invoke("ohmygame:paste-native") as Promise<void>,
+    }),
+    capturePage: (bounds: { x: number; y: number; width: number; height: number }) =>
+      ipcRenderer.invoke("ohmygame:capture-page", bounds) as Promise<Uint8Array>,
+    captureNodeThumbnail: (projectId: string, nodeId: string, viewport: { width: number; height: number }, batchId: string) =>
+      ipcRenderer.invoke("ohmygame:capture-node-thumbnail", projectId, nodeId, viewport, batchId) as Promise<NodeThumbnailResult>,
+    prepareNodeThumbnails: (projectId: string, batchId: string, snapshot: PlayableThumbnailSnapshot) =>
+      ipcRenderer.invoke("ohmygame:prepare-node-thumbnails", projectId, batchId, snapshot) as Promise<void>,
+    nodeThumbnailSnapshot: () => ipcRenderer.invoke("ohmygame:node-thumbnail-snapshot") as Promise<PlayableThumbnailSnapshot | undefined>,
+    cancelNodeThumbnails: (batchId: string) =>
+      ipcRenderer.invoke("ohmygame:cancel-node-thumbnails", batchId) as Promise<void>,
+    finishNodeThumbnail: (captured: boolean, error?: string) => ipcRenderer.invoke("ohmygame:finish-node-thumbnail", captured, error) as Promise<void>,
+    openPlaytest: (projectId: string, viewport: { width: number; height: number }) =>
+      ipcRenderer.invoke("ohmygame:open-playtest", projectId, viewport) as Promise<void>,
+    webGamePlayer: Object.freeze({
+      preview: Object.freeze({
+        attach: (projectId: string, attachment: string, url: string, layout: WebGamePreviewLayout) =>
+          ipcRenderer.invoke("ohmygame:attach-web-game-preview", projectId, attachment, url, layout) as Promise<void>,
+        layout: (projectId: string, attachment: string, layout: WebGamePreviewLayout) =>
+          ipcRenderer.invoke("ohmygame:layout-web-game-preview", projectId, attachment, layout) as Promise<void>,
+        detach: (projectId: string, attachment: string) =>
+          ipcRenderer.invoke("ohmygame:detach-web-game-preview", projectId, attachment) as Promise<void>,
+        capture: (projectId: string) => ipcRenderer.invoke("ohmygame:capture-web-game-preview", projectId) as Promise<Uint8Array>,
+      }),
+      recording: Object.freeze({
+        start: (projectId: string) => ipcRenderer.invoke("ohmygame:start-game-recording", projectId) as Promise<void>,
+        stop: (projectId: string) => ipcRenderer.invoke("ohmygame:stop-game-recording", projectId) as Promise<void>,
+        state: (projectId: string) => ipcRenderer.invoke("ohmygame:game-recording-state", projectId) as Promise<GameRecordingState>,
+        onState: (listener: (state: GameRecordingState) => void) => {
+          const callback = (_event: Electron.IpcRendererEvent, state: GameRecordingState) => listener(state);
+          ipcRenderer.on("ohmygame:game-recording-state", callback);
+          return () => ipcRenderer.removeListener("ohmygame:game-recording-state", callback);
+        },
+        onSaved: (listener: () => void) => {
+          const callback = () => listener();
+          ipcRenderer.on("ohmygame:game-recording-saved", callback);
+          return () => ipcRenderer.removeListener("ohmygame:game-recording-saved", callback);
+        },
+      }),
+      open: (projectId: string, request: WebGamePlayerRequest) => ipcRenderer.invoke("ohmygame:open-web-game-player", projectId, request) as Promise<void>,
+      state: (projectId: string) => ipcRenderer.invoke("ohmygame:web-game-player-state", projectId) as Promise<WebGamePlayerState>,
+      close: (projectId: string) => ipcRenderer.invoke("ohmygame:close-web-game-player", projectId) as Promise<void>,
+      refresh: (projectId: string, reload = false) => ipcRenderer.invoke("ohmygame:refresh-web-game-player", projectId, reload) as Promise<void>,
+      setFilter: (projectId: string, filter: PreviewColorFilter | null) => ipcRenderer.invoke("ohmygame:filter-web-game-player", projectId, filter) as Promise<void>,
+      onState: (listener: (state: WebGamePlayerState) => void) => {
+        const callback = (_event: Electron.IpcRendererEvent, state: WebGamePlayerState) => listener(state);
+        ipcRenderer.on("ohmygame:web-game-player-state", callback);
+        return () => ipcRenderer.removeListener("ohmygame:web-game-player-state", callback);
+      },
+    }),
+    browser: Object.freeze({
+      attach: (projectId: string, attachment: string, layout: WebGamePreviewLayout, saved: ProjectBrowser, labels: BrowserMenuLabels) =>
+        ipcRenderer.invoke("ohmygame:attach-browser", projectId, attachment, layout, saved, labels) as Promise<BrowserState>,
+      layout: (projectId: string, attachment: string, layout: WebGamePreviewLayout) =>
+        ipcRenderer.invoke("ohmygame:layout-browser", projectId, attachment, layout) as Promise<void>,
+      ready: (projectId: string, attachment: string) => ipcRenderer.invoke("ohmygame:browser-ready", projectId, attachment) as Promise<void>,
+      detach: (projectId: string, attachment: string) => ipcRenderer.invoke("ohmygame:detach-browser", projectId, attachment) as Promise<void>,
+      capture: (projectId: string) => ipcRenderer.invoke("ohmygame:capture-browser", projectId) as Promise<Uint8Array>,
+      clearData: () => ipcRenderer.invoke("ohmygame:clear-browser-data") as Promise<void>,
+      open: (projectId: string, url?: string) => ipcRenderer.invoke("ohmygame:browser-open", projectId, url) as Promise<BrowserState>,
+      navigate: (projectId: string, tabId: string, url: string) => ipcRenderer.invoke("ohmygame:browser-tab", projectId, tabId, "navigate", url) as Promise<void>,
+      select: (projectId: string, tabId: string) => ipcRenderer.invoke("ohmygame:browser-tab", projectId, tabId, "select") as Promise<void>,
+      close: (projectId: string, tabId: string) => ipcRenderer.invoke("ohmygame:browser-tab", projectId, tabId, "close") as Promise<void>,
+      back: (projectId: string, tabId: string) => ipcRenderer.invoke("ohmygame:browser-tab", projectId, tabId, "back") as Promise<void>,
+      forward: (projectId: string, tabId: string) => ipcRenderer.invoke("ohmygame:browser-tab", projectId, tabId, "forward") as Promise<void>,
+      reload: (projectId: string, tabId: string, stop?: boolean) => ipcRenderer.invoke("ohmygame:browser-tab", projectId, tabId, "reload", stop === true) as Promise<void>,
+      onState: (listener: (state: BrowserState) => void) => {
+        const callback = (_event: Electron.IpcRendererEvent, state: BrowserState) => listener(state);
+        ipcRenderer.on("ohmygame:browser-state", callback);
+        return () => ipcRenderer.removeListener("ohmygame:browser-state", callback);
+      },
+      onCommand: (listener: (projectId: string, command: BrowserCommand) => void) => {
+        const callback = (_event: Electron.IpcRendererEvent, projectId: string, command: BrowserCommand) => listener(projectId, command);
+        ipcRenderer.on("ohmygame:browser-command", callback);
+        return () => ipcRenderer.removeListener("ohmygame:browser-command", callback);
+      },
+    }),
+    openPlayableNode: (projectId: string, nodeId: string) =>
+      ipcRenderer.invoke("ohmygame:open-playable-node", projectId, nodeId) as Promise<void>,
+    onOpenPlayableNode: (listener: (projectId: string, nodeId: string) => void) => {
+      const callback = (_event: Electron.IpcRendererEvent, projectId: string, nodeId: string) => listener(projectId, nodeId);
+      ipcRenderer.on("ohmygame:open-playable-node", callback);
+      return () => ipcRenderer.removeListener("ohmygame:open-playable-node", callback);
+    },
+    showPlaytestEditor: (projectId: string) =>
+      ipcRenderer.invoke("ohmygame:show-playtest-editor", projectId) as Promise<void>,
+    onShowPlaytestEditor: (listener: (projectId: string) => void) => {
+      const callback = (_event: Electron.IpcRendererEvent, projectId: string) => listener(projectId);
+      ipcRenderer.on("ohmygame:show-playtest-editor", callback);
+      return () => ipcRenderer.removeListener("ohmygame:show-playtest-editor", callback);
+    },
+    agentPlaytests: Object.freeze({
+      state: () => ipcRenderer.invoke("ohmygame:agent-playtest-state") as Promise<PlaytestWatchState>,
+      setVisible: (visible: boolean) => ipcRenderer.invoke("ohmygame:set-agent-playtest-visible", visible) as Promise<PlaytestWatchState>,
+      onState: (listener: (state: PlaytestWatchState) => void) => {
+        const callback = (_event: Electron.IpcRendererEvent, state: PlaytestWatchState) => listener(state);
+        ipcRenderer.on("ohmygame:agent-playtest-state", callback);
+        return () => ipcRenderer.removeListener("ohmygame:agent-playtest-state", callback);
+      },
+    }),
+    notifications: Object.freeze({
+      setPreferences: (preferences: AgentNotificationPreferences) =>
+        ipcRenderer.invoke("ohmygame:notification-preferences", preferences) as Promise<void>,
+      setView: (view: AgentNotificationTarget | null) => ipcRenderer.invoke("ohmygame:notification-view", view) as Promise<void>,
+      takeTarget: () => ipcRenderer.invoke("ohmygame:take-notification-target") as Promise<AgentNotificationTarget | undefined>,
+      permission: () => ipcRenderer.invoke("ohmygame:notification-permission") as Promise<AgentNotificationPermission>,
+      requestPermission: () => ipcRenderer.invoke("ohmygame:request-notification-permission") as Promise<AgentNotificationPermission>,
+      promptSent: () => ipcRenderer.invoke("ohmygame:notification-prompt-sent") as Promise<AgentNotificationPermission>,
+      openSettings: () => ipcRenderer.invoke("ohmygame:open-notification-settings") as Promise<void>,
+      onTarget: (listener: () => void) => {
+        const callback = () => listener();
+        ipcRenderer.on("ohmygame:notification-target", callback);
+        return () => ipcRenderer.removeListener("ohmygame:notification-target", callback);
+      },
+    }),
+    updates: Object.freeze({
+      state: () => ipcRenderer.invoke("ohmygame:update-state") as Promise<DesktopUpdateState | null>,
+      check: () => ipcRenderer.invoke("ohmygame:check-for-update") as Promise<void>,
+      download: () => ipcRenderer.invoke("ohmygame:download-update") as Promise<void>,
+      install: () => ipcRenderer.invoke("ohmygame:install-update") as Promise<void>,
+      setAutomatic: (enabled: boolean) => ipcRenderer.invoke("ohmygame:set-automatic-updates", enabled) as Promise<void>,
+      onState: (listener: (state: DesktopUpdateState) => void) => {
+        const callback = (_event: Electron.IpcRendererEvent, state: DesktopUpdateState) => listener(state);
+        ipcRenderer.on("ohmygame:update-state", callback);
+        return () => ipcRenderer.removeListener("ohmygame:update-state", callback);
+      },
+    }),
+    auth: Object.freeze({
+      callbackUrl: () => ipcRenderer.invoke("ohmygame:auth-callback-url") as Promise<string>,
+      cancel: () => ipcRenderer.invoke("ohmygame:cancel-auth") as Promise<void>,
+      openUrl: (url: string) => ipcRenderer.invoke("ohmygame:open-auth-url", url) as Promise<void>,
+      takeCallback: () => ipcRenderer.invoke("ohmygame:take-auth-callback") as Promise<string | undefined>,
+      onCallback: (listener: () => void) => {
+        const callback = () => listener();
+        ipcRenderer.on("ohmygame:auth-callback", callback);
+        return () => ipcRenderer.removeListener("ohmygame:auth-callback", callback);
+      },
+    }),
+  }));
+}

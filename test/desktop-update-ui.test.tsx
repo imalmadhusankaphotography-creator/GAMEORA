@@ -1,0 +1,183 @@
+// @vitest-environment happy-dom
+import path from "node:path";
+import { act } from "react";
+import { createRoot } from "react-dom/client";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import type { DesktopUpdateState } from "../src/shared/desktop-update.js";
+
+vi.doMock(path.resolve("src/renderer/auth.tsx"), () => ({
+  useAuth: () => ({ state: { status: "signed-out" }, openSignIn: vi.fn() }),
+}));
+const { SettingsPage } = await import("../src/renderer/settings-page.js");
+const { useDesktopUpdate } = await import("../src/renderer/use-desktop-update.js");
+
+const failedUpdate: DesktopUpdateState = {
+  currentVersion: "1.0.0",
+  status: {
+    type: "error",
+    phase: "download",
+    code: "network",
+    title: "The update download was interrupted",
+    message: "Check the network or proxy settings, then try again.",
+    detail: "Error: read ECONNRESET",
+    retry: "download",
+    version: "1.1.0",
+    dataSafe: true,
+  },
+};
+const updates = {
+  state: vi.fn(),
+  check: vi.fn(),
+  download: vi.fn(),
+  install: vi.fn(),
+  onState: vi.fn(),
+};
+let container: HTMLDivElement;
+let root: ReturnType<typeof createRoot>;
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  updates.state.mockResolvedValue(failedUpdate);
+  updates.onState.mockReturnValue(() => {});
+  Object.defineProperty(window, "ohMyGameDesktop", {
+    configurable: true,
+    value: { updates },
+  });
+  container = document.createElement("div");
+  document.body.appendChild(container);
+  root = createRoot(container);
+});
+
+afterEach(async () => {
+  await act(async () => root.unmount());
+  container.remove();
+  Reflect.deleteProperty(window, "ohMyGameDesktop");
+  vi.unstubAllGlobals();
+});
+
+it("shows recovery actions and routes retry to the failed update phase", async () => {
+  const onSectionChange = vi.fn();
+  await act(async () => root.render(
+    <SettingsPage
+      section="about"
+      onNavigate={() => {}}
+      onSectionChange={onSectionChange}
+    />,
+  ));
+  await vi.waitFor(() => expect(container.querySelector('[role="alert"]')?.textContent)
+    .toContain("Your projects and conversations were not deleted."));
+  expect(container.querySelector(".settings-nav")?.textContent).not.toContain("Plugins");
+
+  const button = (label: string) => [...container.querySelectorAll("button")]
+    .find((item) => item.textContent === label) as HTMLButtonElement;
+  button("Try again").click();
+  expect(updates.download).toHaveBeenCalledOnce();
+  expect(updates.check).not.toHaveBeenCalled();
+  expect(button("Copy details")).toBeDefined();
+
+  button("Network settings").click();
+  expect(onSectionChange).toHaveBeenCalledWith("network");
+
+  // The sidebar's pill turns to a warning and leads to About, which explains it.
+  const pill = container.querySelector<HTMLButtonElement>('.sidebar-account-row .sidebar-update[aria-label="Update failed"]');
+  expect(pill?.classList.contains("is-warning")).toBe(true);
+  expect(pill?.textContent).toBe("Issue");
+  pill!.click();
+  expect(window.location.hash).toBe("#/settings/about");
+});
+
+it("shows bundled notes in browser settings without an update bridge", async () => {
+  Reflect.deleteProperty(window, "ohMyGameDesktop");
+  await act(async () => root.render(
+    <SettingsPage section="about" onNavigate={() => {}} onSectionChange={() => {}} />,
+  ));
+  expect(container.querySelector(".settings-changelog-content")?.textContent?.trim()).toBeTruthy();
+  expect(container.querySelector('.ui-collapsible-trigger[aria-expanded="true"] .ui-collapsible-title')?.textContent).toBe(`v${__APP_VERSION__}`);
+  expect(container.textContent).not.toContain("Not checked yet");
+  const links = container.querySelectorAll<HTMLAnchorElement>('[aria-label="Project links"] a');
+  expect([...links].map((link) => link.href)).toEqual([
+    "https://github.com/WhiteTowerAI/ohmygame",
+    "https://ohmygame.ai/",
+    "https://github.com/WhiteTowerAI/ohmygame/issues",
+  ]);
+  expect([...links].every((link) => link.target === "_blank" && link.rel.includes("noreferrer"))).toBe(true);
+});
+
+it("keeps an update event that arrives before the first state query answers", async () => {
+  let answer!: (state: unknown) => void;
+  updates.state.mockReturnValue(new Promise((resolve) => { answer = resolve; }));
+  function Status() {
+    return <span data-status>{useDesktopUpdate()?.status.type ?? "none"}</span>;
+  }
+  await act(async () => root.render(<Status />));
+  await act(async () => updates.onState.mock.calls[0][0]({
+    currentVersion: "0.0.0-beta.4.6",
+    status: { type: "ready", version: "0.0.0-beta.4.7" },
+  }));
+  await act(async () => answer({ currentVersion: "0.0.0-beta.4.6", status: { type: "idle" } }));
+  expect(container.querySelector("[data-status]")?.textContent).toBe("ready");
+});
+
+it("shows new notes received over the desktop update subscription while downloading", async () => {
+  updates.state.mockResolvedValue({ currentVersion: "0.0.0-beta.4.6", status: { type: "idle" } });
+  await act(async () => root.render(
+    <SettingsPage section="about" onNavigate={() => {}} onSectionChange={() => {}} />,
+  ));
+  await act(async () => updates.onState.mock.calls[0][0]({
+    currentVersion: "0.0.0-beta.4.6",
+    status: { type: "downloading", version: "0.0.0-beta.4.7", percent: 50 },
+    availableRelease: { version: "0.0.0-beta.4.7", notes: "### Fixed\n\n- Recover interrupted previews." },
+  }));
+  expect(container.textContent).toContain("Downloading update (50%)");
+  expect(container.textContent).toContain("Recover interrupted previews.");
+  expect(container.querySelector('.ui-collapsible-trigger[aria-expanded="true"] .ui-collapsible-title')?.textContent).toBe("v0.0.0-beta.4.7");
+});
+
+it("shows one update action and keeps download and restart controls tied to their phase", async () => {
+  const available: DesktopUpdateState = {
+    currentVersion: "0.0.0-beta.4.6",
+    status: { type: "available", version: "0.0.0-beta.4.7" },
+  };
+  updates.state.mockResolvedValue(available);
+  await act(async () => root.render(
+    <SettingsPage section="about" onNavigate={() => {}} onSectionChange={() => {}} />,
+  ));
+  const action = () => container.querySelector<HTMLButtonElement>(".settings-about-actions button");
+  // The sidebar's pill sits at the account's end; its name shows on hover, its full label to assistive tech.
+  const sidebarItem = () => container.querySelector<HTMLElement>(".sidebar-account-row > :not(.sidebar-account)");
+  expect(action()?.textContent).toBe("Download update");
+  expect(sidebarItem()?.getAttribute("aria-label")).toBe("Update to 0.0.0-beta.4.7");
+  expect(sidebarItem()?.textContent).toBe("Update");
+  sidebarItem()!.click();
+  expect(updates.download).toHaveBeenCalledOnce();
+  updates.download.mockClear();
+  expect(container.querySelectorAll(".settings-about-actions button")).toHaveLength(1);
+  action()!.click();
+  expect(updates.download).toHaveBeenCalledOnce();
+
+  const notify = updates.onState.mock.calls[0][0];
+  await act(async () => notify({ ...available, status: { type: "downloading", version: "0.0.0-beta.4.7", percent: 50 } }));
+  expect(action()).toBeNull();
+  expect(container.textContent).toContain("Downloading update (50%)");
+  expect(sidebarItem()?.getAttribute("role")).toBe("progressbar");
+  expect(sidebarItem()?.getAttribute("aria-valuenow")).toBe("50");
+  expect(sidebarItem()?.textContent).toBe("50%");
+  expect(sidebarItem()?.querySelector<HTMLElement>(".sidebar-update-fill")?.style.width).toBe("50%");
+
+  await act(async () => notify({ ...available, status: { type: "ready", version: "0.0.0-beta.4.7" } }));
+  expect(action()?.textContent).toBe("Restart to update");
+  expect(sidebarItem()?.getAttribute("aria-label")).toBe("Restart to update");
+  expect(sidebarItem()?.textContent).toBe("Restart");
+  sidebarItem()!.click();
+  expect(updates.install).toHaveBeenCalledOnce();
+  updates.install.mockClear();
+  action()!.click();
+  expect(updates.install).toHaveBeenCalledOnce();
+
+  await act(async () => notify({ ...available, status: { type: "installing", version: "0.0.0-beta.4.7" } }));
+  expect(action()).toBeNull();
+  expect(container.textContent).toContain("Preparing a safe restart...");
+  // Installing needs nothing from you, so the sidebar shows nothing.
+  expect(sidebarItem()).toBeNull();
+});

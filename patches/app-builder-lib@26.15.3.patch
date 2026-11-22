@@ -1,0 +1,89 @@
+diff --git a/out/targets/nsis/nsisLang.js b/out/targets/nsis/nsisLang.js
+index cd7986e44e0b47f840b4ff34b75397ed75ff2f42..ee9e1122d018be66fc1bb91c1ba30f7b9ecfdd3b 100644
+--- a/out/targets/nsis/nsisLang.js
++++ b/out/targets/nsis/nsisLang.js
+@@ -66,6 +66,14 @@ async function writeCustomLangFile(data, packager) {
+ }
+ async function addCustomMessageFileInclude(input, packager, scriptGenerator, langConfigurator) {
+     const data = (0, js_yaml_1.load)(await (0, fs_extra_1.readFile)(path.join(nsisUtil_1.nsisTemplatesDir, input), "utf-8"));
++    // OhMyGame: build/messages.yml adds installer messages and replaces bundled ones.
++    if (input === "messages.yml") {
++        const custom = await (0, fs_extra_1.readFile)(path.join(packager.info.buildResourcesDir, input), "utf-8").catch(error => {
++            if (error.code === "ENOENT") return undefined;
++            throw error;
++        });
++        if (custom != null) Object.assign(data, (0, js_yaml_1.load)(custom));
++    }
+     const instructions = computeCustomMessageTranslations(data, langConfigurator).join("\n");
+     debug(instructions);
+     scriptGenerator.include(await writeCustomLangFile(instructions, packager));
+diff --git a/templates/nsis/include/extractAppPackage.nsh b/templates/nsis/include/extractAppPackage.nsh
+--- a/templates/nsis/include/extractAppPackage.nsh
++++ b/templates/nsis/include/extractAppPackage.nsh
+@@ -94,6 +94,10 @@
+   CreateDirectory "$PLUGINSDIR\7z-out"
+   ClearErrors
+   SetOutPath "$PLUGINSDIR\7z-out"
+-  Nsis7z::Extract "${FILE}"
++  !ifmacrodef customExtractUsing7za
++    !insertmacro customExtractUsing7za "${FILE}"
++  !else
++    Nsis7z::Extract "${FILE}"
++  !endif
+   Pop $R0
+   SetOutPath $R0
+@@ -127,2 +131,6 @@
+-    Nsis7z::Extract "${FILE}"
++    !ifmacrodef customExtractUsing7za
++      !insertmacro customExtractUsing7za "${FILE}"
++    !else
++      Nsis7z::Extract "${FILE}"
++    !endif
+     Goto DoneExtract7za
+@@ -137,2 +145,5 @@
+   DoneExtract7za:
++    !ifmacrodef customAppFilesCopied
++      !insertmacro customAppFilesCopied
++    !endif
+ !macroend
+diff --git a/templates/nsis/include/installUtil.nsh b/templates/nsis/include/installUtil.nsh
+--- a/templates/nsis/include/installUtil.nsh
++++ b/templates/nsis/include/installUtil.nsh
+@@ -212,2 +212,6 @@
++  !ifmacrodef customOldUninstallPrepare
++    !insertmacro customOldUninstallPrepare
++  !endif
++
+   # Retry counter
+   StrCpy $R5 0
+@@ -219,2 +223,6 @@
+-      MessageBox MB_RETRYCANCEL|MB_ICONEXCLAMATION "$(appCannotBeClosed)" /SD IDCANCEL IDRETRY OneMoreAttempt
++      !ifmacrodef customOldUninstallRetryFailed
++        !insertmacro customOldUninstallRetryFailed
++      !else
++        MessageBox MB_RETRYCANCEL|MB_ICONEXCLAMATION "$(appCannotBeClosed)" /SD IDCANCEL IDRETRY OneMoreAttempt
++      !endif
+       Return
+@@ -234,2 +242,5 @@
+       ${if} $R0 == 0
++        !ifmacrodef customOldUninstallFinished
++          !insertmacro customOldUninstallFinished
++        !endif
+         Return
+@@ -241,2 +252,5 @@
+   DoesNotExist:
++    !ifmacrodef customOldUninstallerLaunchFailed
++      !insertmacro customOldUninstallerLaunchFailed
++    !endif
+     SetErrors
+diff --git a/templates/nsis/uninstaller.nsh b/templates/nsis/uninstaller.nsh
+--- a/templates/nsis/uninstaller.nsh
++++ b/templates/nsis/uninstaller.nsh
+@@ -69,2 +69,7 @@
+       ClearErrors
+       Rename "$INSTDIR$R0\$R2" "$PLUGINSDIR\old-install$R0\$R2"
++      !ifmacrodef customMoveOldFile
++        ${If} ${Errors}
++          !insertmacro customMoveOldFile "$INSTDIR$R0\$R2" "$PLUGINSDIR\old-install$R0\$R2"
++        ${EndIf}
++      !endif

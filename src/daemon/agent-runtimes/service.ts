@@ -1,0 +1,1236 @@
+import { randomBytes, timingSafeEqual } from "node:crypto";
+import { mkdir, readFile, writeFile, stat, realpath, rm } from "node:fs/promises";
+import path from "node:path";
+import type {
+  SessionManager,
+  ToolDefinition,
+} from "@earendil-works/pi-coding-agent";
+import type { AgentModel, AgentUsageLimit } from "../../shared/contracts.js";
+import {
+  ACCOUNT_RUNTIME_IDS,
+  AGENT_RUNTIME_IDS,
+  isAccountRuntimeId,
+  isBuiltInAgentRuntimeId,
+  isAgentRuntimeId,
+  type AccountRuntimeId,
+  type AccountProfileIds,
+  type AgentRuntimeDiagnostic,
+  type AgentRuntimeId,
+  type AgentRuntimeLoginResponse,
+  type AgentRuntimeStatus,
+  type ApprovalDecision,
+  type ApprovalRequestDetails,
+  type UpdateAgentRuntimeRequest,
+  type AgentAccountProfile,
+  type AgentAccountProfileStatus,
+} from "../../shared/agent-runtimes.js";
+import type { SkillCatalogItem } from "../agent.js";
+import type { EffectiveMcpConfig, McpGuard, PluginMcpHost } from "../plugin-mcp-host.js";
+import {
+  agentRuntimeDefinition,
+  agentRuntimeIds,
+  findAgentRuntimeDefinition,
+} from "./definitions.js";
+import { AcpDriver } from "./acp.js";
+import {
+  AgentRuntimeCompatibilityError,
+  checkRuntimeVersionRequirement,
+  runtimeStartupError,
+} from "./compatibility.js";
+import {
+  privateFolder,
+  isReadableShim,
+  probeAuth,
+  probeModels,
+  probeVersion,
+  resolveBinary,
+  runCli,
+  type AuthProbe,
+} from "./discovery.js";
+import { agentEnvironment, loginShellPath, systemConfigDirectory } from "./environment.js";
+import { AgentProcess, stopAgentProcesses } from "./process.js";
+import {
+  recoverAgentProcesses,
+  recoverAgentDirectories,
+} from "./process-recovery.js";
+import { NativeCodingSession, type NativeDriver, type NativeTurnSink } from "./native-session.js";
+import type { HostedToolHooks } from "../tool-hooks.js";
+import { ToolBridge } from "./tool-bridge.js";
+import type { DriverContext, HttpBridgeHandlers, SaveGeneratedImage } from "./driver-context.js";
+import { AgentRuntimeSettingsStore } from "./settings.js";
+import { ClaudeCodeDriver } from "./claude-code.js";
+import { CodexAppServer } from "./codex-app-server.js";
+import { CodexDriver } from "./codex.js";
+import { codexServerIdentity } from "./codex-server-pool.js";
+import { OpenCodeDriver } from "./opencode.js";
+
+/**
+ * The client name Claude Code reports for OhMyGame's conversations. Run with
+ * `-p`, it otherwise reports the generic `sdk-cli`, which subscriptions count
+ * against the 5-hour limit about twice as fast for the same work
+ * (anthropics/claude-code#97074). OhMyGame's own name, rather than another
+ * client's, keeps the report accurate. Off the `sdk-*` names Claude Code also
+ * offers its claude.ai Artifact tools; turning them off keeps the tools the
+ * session had under `sdk-cli`.
+ * Sign-in and model checks keep the CLI's default: they send no model requests.
+ */
+const CLAUDE_CLIENT_ENV = {
+  CLAUDE_CODE_ENTRYPOINT: "ohmygame",
+  CLAUDE_CODE_DISABLE_ARTIFACT: "1",
+};
+
+const STATUS_TTL_MS = 60_000;
+
+/**
+ * Coding agents see OhMyGame's tools under their CLI's MCP names and follow
+ * their own planning habits, such as plan files; Pi needs neither line.
+ */
+const NATIVE_INSTRUCTIONS =
+  "OhMyGame's own tools (canvas checks, image, video, 3D and audio generation, game playtesting, questionnaire, update_plan and plugin services) come from its ohmygame tool server; your CLI may name them with a prefix such as mcp__ohmygame__ or ohmygame_. For clarifying choices use questionnaire in any turn; mark a recommended option only when you have a clear preference. Never use questionnaire for action permissions. In a planning turn, record the plan with update_plan before you finish, rather than writing a plan file or only describing it. The Skills your CLI lists are readable where it lists them, even outside the workspace: read a Skill's files directly when a request calls for it.";
+/** What a coding agent hears from OhMyGame: a project's instructions, then how to use OhMyGame's tools. */
+export function nativeAgentInstructions(projectInstructions: string): string {
+  return `${projectInstructions}\n\n${NATIVE_INSTRUCTIONS}`;
+}
+const MODELS_TTL_MS = 10 * 60_000;
+const MODELS_WAIT_MS = 6_000;
+
+/** A catalog load's result, or undefined when it is still loading after MODELS_WAIT_MS. */
+async function withinModelsWait<T>(load: Promise<T>): Promise<T | undefined> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  return Promise.race([
+    load,
+    new Promise<undefined>((resolve) => {
+      timer = setTimeout(() => resolve(undefined), MODELS_WAIT_MS);
+    }),
+  ]).finally(() => clearTimeout(timer));
+}
+const LOGIN_TIMEOUT_MS = 10 * 60_000;
+const LIMITS_VERSION = 2;
+
+interface ProbeCache {
+  signature: string;
+  version?: string;
+  auth: AuthProbe;
+  diagnostics: AgentRuntimeDiagnostic[];
+  checkedAt: number;
+  requirementError?: Error;
+}
+
+export interface NativeSessionRequest {
+  profileId?: string;
+  runtime: AgentRuntimeId;
+  model: string;
+  reasoningLevel?: string;
+  contextWindow?: number;
+  workspacePath: string;
+  sessionManager: SessionManager;
+  /** OhMyGame's tools for the project, as Pi gets them. */
+  tools: ToolDefinition[];
+  saveGeneratedImage?: SaveGeneratedImage;
+  toolHooks?: HostedToolHooks;
+  pluginMcp?: {
+    config: EffectiveMcpConfig;
+    host: PluginMcpHost;
+    agentDir: string;
+    guard?: McpGuard;
+  };
+  skillDirectories: string[];
+  instructions: string;
+  snapshotBeforeMessage?: () => Promise<string>;
+  turnNotice?: () => Promise<string | undefined>;
+  requestUserInput: NativeTurnSink["requestUserInput"];
+  requestApproval(
+    details: ApprovalRequestDetails,
+    toolCallId: string,
+    signal?: AbortSignal,
+  ): Promise<ApprovalDecision>;
+  skills?: () => SkillCatalogItem[];
+}
+
+/**
+ * The coding agents OhMyGame can run conversations with. Nothing here runs
+ * until something asks. Conversation model discovery only probes enabled
+ * agents; the image catalog can independently probe Codex for media use.
+ * A slow or broken CLI only delays its own status and models.
+ */
+export class AgentRuntimeService {
+  readonly settings: AgentRuntimeSettingsStore;
+  #revisions = new Map<string, number>();
+  #probes = new Map<string, ProbeCache>();
+  #probing = new Map<string, Promise<ProbeCache | undefined>>();
+  #models = new Map<
+    string,
+    { signature?: string; models: AgentModel[]; at: number }
+  >();
+  #modelLoads = new Map<string, Promise<AgentModel[]>>();
+  #bridges = new Map<
+    string,
+    { bridge: ToolBridge; handlers: HttpBridgeHandlers }
+  >();
+  #modelErrors = new Map<
+    string,
+    {
+      signature: string;
+      at: number;
+      diagnostic: AgentRuntimeDiagnostic;
+      cause?: Error;
+    }
+  >();
+  onLimitsReported?: () => void;
+  /** Each account's quota windows as last reported; they outlive the conversation that reported them. */
+  #limits = new Map<string, AgentUsageLimit[]>();
+  #changing = new Set<string>();
+  #logins = new Map<string, () => Promise<void>>();
+  #limitWrites: Promise<void> = Promise.resolve();
+  #pluginAgents: Promise<void> = Promise.resolve();
+  readonly #root: string;
+
+  constructor(
+    dataDirectory: string,
+    private readonly bridgeUrl: () => string | undefined,
+  ) {
+    this.settings = new AgentRuntimeSettingsStore(dataDirectory);
+    this.#root = path.join(dataDirectory, "agent-runtimes");
+  }
+
+  async load(): Promise<void> {
+    await this.settings.load();
+    await recoverAgentProcesses(path.join(this.#root, "processes"));
+    await recoverAgentDirectories(path.join(this.#root, "sessions"));
+    await recoverAgentDirectories(path.join(this.#root, "probes"));
+    try {
+      const stored = JSON.parse(
+        await readFile(path.join(this.#root, "limits.json"), "utf8"),
+      ) as Record<string, unknown>;
+      const current = stored.version === LIMITS_VERSION;
+      const reports = current && stored.limits && typeof stored.limits === "object" ? stored.limits as Record<string, unknown> : stored;
+      for (const [id, limits] of Object.entries(reports)) {
+        const known = isAgentRuntimeId(id) || ACCOUNT_RUNTIME_IDS.some((runtime) => id.startsWith(`${runtime}:`));
+        // Before version 2, System default reported for whichever folder OhMyGame was launched with.
+        if (known && Array.isArray(limits) && (current || !isAccountRuntimeId(id)))
+          this.#limits.set(id, limits.filter(isUsageLimit));
+      }
+    } catch {
+      // No limits reported yet, or a damaged file: they arrive with the next report.
+    }
+  }
+
+  /** Keeps the latest quota windows across restarts, since Claude Code reports them only during a conversation. */
+  #recordLimits(id: string, limits: AgentUsageLimit[]): void {
+    this.#limits.set(id, limits);
+    this.#recordLimitsCache();
+    this.onLimitsReported?.();
+  }
+
+  #recordLimitsCache(): void {
+    this.#limitWrites = this.#limitWrites
+      .then(async () => {
+        await mkdir(this.#root, { recursive: true, mode: 0o700 });
+        await writeFile(
+          path.join(this.#root, "limits.json"),
+          `${JSON.stringify({ version: LIMITS_VERSION, limits: Object.fromEntries(this.#limits) })}\n`,
+        );
+      })
+      .catch(() => {});
+  }
+
+  async statuses(recheck = false): Promise<AgentRuntimeStatus[]> {
+    // Built-in agents start now, pinning their accounts; plugin agents once they are known.
+    const builtIn = AGENT_RUNTIME_IDS.map((id) => this.status(id, recheck));
+    await this.#pluginAgents;
+    const plugins = agentRuntimeIds()
+      .filter((id) => !isBuiltInAgentRuntimeId(id))
+      .map((id) => this.status(id, recheck));
+    return Promise.all([...builtIn, ...plugins]);
+  }
+
+  /** Agents read the plugins' agents once this settles, as after startup or a plugin change. */
+  pluginAgentsChanging(work: Promise<void>): void {
+    this.#pluginAgents = work;
+  }
+
+  /** Whether the agent exists, once the plugins' agents are known. */
+  async known(id: AgentRuntimeId): Promise<boolean> {
+    await this.#pluginAgents;
+    return this.has(id);
+  }
+
+  /** Forgets what was checked about an agent, as when its plugin changes how it starts. */
+  forget(id: AgentRuntimeId): void {
+    this.#invalidate(id);
+  }
+
+  /** Whether the agent is built in, or added by a plugin that is installed and on. */
+  has(id: AgentRuntimeId): boolean {
+    return !!findAgentRuntimeDefinition(id);
+  }
+
+  /** Media can use Codex's sign-in without enabling it as a conversation agent. */
+  async codexImageConnection(recheck = false) {
+    const binary = await resolveBinary("codex-cli", this.settings.get("codex-cli").binaryPath, recheck);
+    if (!binary) return undefined;
+    const probe = await this.#probe("codex-cli", binary, recheck, "system");
+    return {
+      ...binary,
+      env: await this.#environment("codex-cli", binary.path, "system"),
+      auth: probe?.auth,
+      error: probe?.requirementError?.message,
+    };
+  }
+
+  async status(
+    id: AgentRuntimeId,
+    recheck = false,
+    profileId?: string,
+  ): Promise<AgentRuntimeStatus> {
+    profileId = isAccountRuntimeId(id) ? this.#profileId(id, profileId) : undefined;
+    const cacheKey = this.#key(id, profileId);
+    if (recheck) this.#invalidate(id);
+    const revision = this.#revisions.get(cacheKey);
+    const definition = agentRuntimeDefinition(id);
+    const settings = this.settings.get(id);
+    const binary = await resolveBinary(id, settings.binaryPath, recheck);
+    if (this.#revisions.get(cacheKey) !== revision) return this.status(id, false, profileId);
+    const limits = this.#limits.get(cacheKey);
+    const base = {
+      id,
+      name: definition.name,
+      ...(definition.testedVersion
+        ? { testedVersion: definition.testedVersion }
+        : {}),
+      ...(definition.acp ? { plugin: definition.acp.plugin, launch: commandLine([settings.binaryPath ?? definition.binaries[0]!, ...definition.acp.args]) } : {}),
+      ...(definition.iconRevision ? { iconRevision: definition.iconRevision } : {}),
+      enabled: settings.enabled,
+      autoContinue: settings.autoContinue,
+      ...(id === "claude-code-cli" ? { identifyAsOhMyGame: settings.identifyAsOhMyGame } : {}),
+      permissionMode: settings.permissionMode,
+      ...(isAccountRuntimeId(id) ? { defaultProfileId: settings.defaultProfileId ?? "system" } : {}),
+      ...(settings.binaryPath
+        ? { configuredBinaryPath: settings.binaryPath }
+        : {}),
+      ...(limits?.length ? { limits } : {}),
+    };
+    if (!binary) {
+      return {
+        ...base,
+        installed: false,
+        auth: { status: "unknown", billing: "unknown" },
+        diagnostics: [
+          {
+            code: settings.binaryPath ? "invalid-executable" : "not-installed",
+            message: settings.binaryPath
+              ? `The configured executable is missing or not executable: ${settings.binaryPath}`
+              : `${definition.name} was not found on PATH or in the usual install folders`,
+            ...(!settings.binaryPath && definition.installUrl
+              ? { command: definition.installUrl }
+              : {}),
+          },
+        ],
+      };
+    }
+    const probe = await this.#probe(id, binary, recheck, profileId);
+    if (this.#revisions.get(cacheKey) !== revision) return this.status(id, false, profileId);
+    // Enabling or rechecking a CLI checks the same protocol used by model
+    // discovery. A timeout remains a probe/catalog failure, not incompatibility.
+    if (settings.enabled) await this.#loadModels(id, profileId).catch(() => {});
+    if (this.#revisions.get(cacheKey) !== revision) return this.status(id, false, profileId);
+    return {
+      ...base,
+      installed: true,
+      binaryPath: binary.path,
+      binarySource: binary.source,
+      ...(probe?.version ? { version: probe.version } : {}),
+      auth: probe
+        ? {
+            status: probe.auth.status,
+            billing: probe.auth.billing,
+            ...(probe.auth.account ? { account: probe.auth.account } : {}),
+          }
+        : { status: "unknown", billing: "unknown" },
+      diagnostics: [
+        ...(probe?.diagnostics ?? [
+          {
+            code: "probe-failed",
+            message: `${definition.name} did not answer`,
+          },
+        ]),
+        ...(this.#modelErrors.has(cacheKey)
+          ? [this.#modelErrors.get(cacheKey)!.diagnostic]
+          : []),
+      ],
+      ...(probe ? { checkedAt: new Date(probe.checkedAt).toISOString() } : {}),
+    };
+  }
+
+  async update(
+    id: AgentRuntimeId,
+    request: UpdateAgentRuntimeRequest,
+  ): Promise<AgentRuntimeStatus> {
+    if (
+      request.binaryPath !== undefined &&
+      request.binaryPath !== "" &&
+      !path.isAbsolute(request.binaryPath)
+    )
+      throw new Error("The executable path must be absolute");
+    // Codex shims (.cmd/.ps1) resolve to the packaged native executable, and an
+    // ACP agent's npm shim to what it runs; other CLIs need a direct .exe path.
+    if (
+      request.binaryPath &&
+      /\.(?:cmd|bat|ps1)$/i.test(request.binaryPath) &&
+      !isReadableShim(id, request.binaryPath)
+    )
+      throw new Error(
+        "Choose the program itself (.exe); Windows command scripts cannot be started directly",
+      );
+    if (request.identifyAsOhMyGame !== undefined && id !== "claude-code-cli")
+      throw new Error("This setting is only available for Claude Code");
+    if (request.defaultProfileId !== undefined && (!isAccountRuntimeId(id) || !this.settings.profiles(id).some((profile) => profile.id === request.defaultProfileId)))
+      throw new Error("Choose an existing account configuration");
+    await this.settings.update(id, {
+      ...(request.defaultProfileId !== undefined ? { defaultProfileId: request.defaultProfileId } : {}),
+      ...(request.enabled !== undefined ? { enabled: request.enabled } : {}),
+      ...(request.autoContinue !== undefined ? { autoContinue: request.autoContinue } : {}),
+      ...(request.identifyAsOhMyGame !== undefined ? { identifyAsOhMyGame: request.identifyAsOhMyGame } : {}),
+      ...(request.permissionMode !== undefined
+        ? { permissionMode: request.permissionMode }
+        : {}),
+      ...(request.binaryPath !== undefined
+        ? { binaryPath: request.binaryPath }
+        : {}),
+    });
+    if (request.enabled !== undefined || request.permissionMode !== undefined || request.binaryPath !== undefined) this.#invalidate(id);
+    return this.status(id, request.binaryPath !== undefined);
+  }
+
+  /** Lists enabled agents. Pickers can take a snapshot while their CLIs load in the background. */
+  async models(profileIds: AccountProfileIds = {}, { background = false } = {}): Promise<{ models: AgentModel[]; loading: AgentRuntimeId[] }> {
+    const loading: AgentRuntimeId[] = [];
+    const load = async (id: AgentRuntimeId) => {
+      if (!this.settings.get(id).enabled) return [];
+      const profileId = isAccountRuntimeId(id) ? profileIds[id] : undefined;
+      if (background) {
+        const cached = this.#models.get(this.#key(id, profileId));
+        const ttl = cached?.signature ? MODELS_TTL_MS : STATUS_TTL_MS;
+        if (cached && Date.now() - cached.at < ttl) return cached.models;
+        void this.#loadModels(id, profileId).catch(() => {});
+        loading.push(id);
+        return cached?.models ?? [];
+      }
+      const result = await withinModelsWait(this.#loadModels(id, profileId).catch(() => [] as AgentModel[]));
+      if (result) return result;
+      loading.push(id);
+      return [];
+    };
+    // Built-in agents start now, pinning their accounts; plugin agents once they are known.
+    const builtIn = AGENT_RUNTIME_IDS.map(load);
+    await this.#pluginAgents;
+    const lists = await Promise.all([
+      ...builtIn,
+      ...agentRuntimeIds().filter((id) => !isBuiltInAgentRuntimeId(id)).map(load),
+    ]);
+    return { models: lists.flat(), loading };
+  }
+
+  /** Supplies display metadata for a saved model without waiting for a CLI. */
+  cachedModel(id: AgentRuntimeId, modelId: string, profileId?: string): AgentModel | undefined {
+    const settings = this.settings.get(id);
+    if (!settings.enabled) return undefined;
+    const selected = isAccountRuntimeId(id)
+      ? this.settings.resolveProfileId(id, profileId ?? settings.defaultProfileId ?? "system")
+      : "system";
+    if (this.#changing.has(`${id}:${selected}`)) return undefined;
+    return this.#models.get(this.#key(id, selected))?.models.find((model) => model.id === modelId);
+  }
+
+  async model(
+    id: AgentRuntimeId,
+    modelId: string,
+    profileId?: string,
+  ): Promise<AgentModel | undefined> {
+    if (!this.settings.get(id).enabled) return undefined;
+    const models = await this.#loadModels(id, profileId).catch(() => []);
+    return models.find((model) => model.id === modelId);
+  }
+
+  /**
+   * The models an account offers, or undefined when its catalog cannot be read
+   * in time (signed out, slow or failing), so callers do not judge a model by it.
+   */
+  async offeredModels(
+    id: AgentRuntimeId,
+    profileId?: string,
+  ): Promise<AgentModel[] | undefined> {
+    if (!this.settings.get(id).enabled) return undefined;
+    const models = await withinModelsWait(this.#loadModels(id, profileId).catch(() => undefined));
+    return models?.length ? models : undefined;
+  }
+
+  /** Starts the CLI's own sign-in. A browser page comes back when the CLI hands one out; otherwise the command to run. */
+  async login(id: AgentRuntimeId, profileId?: string): Promise<AgentRuntimeLoginResponse> {
+    const definition = agentRuntimeDefinition(id);
+    const binary = await resolveBinary(id, this.settings.get(id).binaryPath);
+    if (!binary) throw new Error(`${definition.name} is not installed`);
+    const loginProfileId = isAccountRuntimeId(id) ? this.#profileId(id, profileId) : undefined;
+    const env = await this.#environment(id, binary.path, loginProfileId);
+    await mkdir(this.#root, { recursive: true, mode: 0o700 });
+    const cacheKey = this.#key(id, loginProfileId);
+    await this.#logins.get(cacheKey)?.();
+    if (this.#changing.has(`${id}:${loginProfileId}`)) throw new Error("Account configuration is being changed");
+    const forget = () => {
+      if (!this.#changing.has(`${id}:${loginProfileId}`)) this.#invalidate(id, loginProfileId);
+      this.#logins.delete(cacheKey);
+    };
+    const loginCommand = signInCommand(id, binary.path, env);
+    if (id === "codex-cli") {
+      const server = new CodexAppServer(binary.path, this.#root, env, {
+        notification: (method) => {
+          if (method !== "account/login/completed") return;
+          forget();
+          void server.stop();
+        },
+      });
+      const stopLogin = () => server.stop();
+      this.#logins.set(cacheKey, stopLogin);
+      setTimeout(() => {
+        if (this.#logins.get(cacheKey) === stopLogin) { forget(); void server.stop(); }
+      }, LOGIN_TIMEOUT_MS).unref();
+      try {
+        await server.initialize();
+        const started = await server.request<{ authUrl?: unknown }>(
+          "account/login/start",
+          { type: "chatgpt" },
+        );
+        return typeof started.authUrl === "string"
+          ? { url: started.authUrl }
+          : { command: loginCommand };
+      } catch (cause) {
+        forget();
+        await server.stop();
+        throw cause;
+      }
+    }
+    if (id === "claude-code-cli") {
+      return new Promise((resolve) => {
+        let found = false;
+        const child = new AgentProcess({
+          binaryPath: binary.path,
+          args: ["auth", "login", "--claudeai"],
+          cwd: this.#root,
+          env,
+          onLine: (line) => {
+            const url = line.match(/https:\/\/\S+/)?.[0];
+            if (!url || found) return;
+            found = true;
+            resolve({ url });
+          },
+          onExit: () => {
+            forget();
+            if (!found) resolve({ command: loginCommand });
+          },
+        });
+        this.#logins.set(cacheKey, () => child.stop());
+        setTimeout(() => {
+          if (!found) {
+            found = true;
+            resolve({ command: loginCommand });
+          }
+        }, 15_000).unref();
+        setTimeout(() => {
+          void child.stop();
+        }, LOGIN_TIMEOUT_MS).unref();
+      });
+    }
+    return { command: loginCommand };
+  }
+
+  async createSession(
+    request: NativeSessionRequest,
+  ): Promise<NativeCodingSession> {
+    request = { ...request, profileId: isAccountRuntimeId(request.runtime) ? this.#profileId(request.runtime, request.profileId) : undefined };
+    if (!isBuiltInAgentRuntimeId(request.runtime)) await this.#pluginAgents;
+    const settings = this.settings.get(request.runtime);
+    const cacheKey = this.#key(request.runtime, request.profileId);
+    const definition = agentRuntimeDefinition(request.runtime);
+    if (!settings.enabled)
+      throw new Error(
+        `${definition.name} is turned off. Turn it on in Settings → Agents to continue.`,
+      );
+    const binary = await resolveBinary(request.runtime, settings.binaryPath);
+    if (!binary)
+      throw new Error(
+        `${definition.name} is not installed. Install it, then check again in Settings → Agents.`,
+      );
+    const probe = await this.#probe(request.runtime, binary, false, request.profileId);
+    if (probe?.requirementError) throw probe.requirementError;
+    // Do not offer a catalog during setup then reject the same CLI only after
+    // its first message. This uses the discovery cache and sends no model turn.
+    try {
+      await this.#loadModels(request.runtime, request.profileId);
+    } catch (cause) {
+      throw runtimeStartupError(cause);
+    }
+    await mkdir(path.join(this.#root, "sessions"), {
+      recursive: true,
+      mode: 0o700,
+    });
+    const folder = await privateFolder(
+      path.join(this.#root, "sessions"),
+      request.runtime,
+    );
+    let pluginTool:
+      { tool: ToolDefinition; close: () => Promise<void> } | undefined;
+    try {
+      if (
+        request.pluginMcp &&
+        Object.keys(request.pluginMcp.config.mcpServers).length
+      ) {
+        pluginTool = await request.pluginMcp.host.tool(
+          request.pluginMcp.config,
+          request.pluginMcp.agentDir,
+          request.pluginMcp.guard,
+          request.toolHooks,
+        );
+      }
+    } catch {
+      // Plugin servers that cannot start leave the agent without them, as a failed MCP server does in Pi.
+      pluginTool = undefined;
+    }
+    const bridge = new ToolBridge([
+      ...request.tools,
+      ...(pluginTool ? [pluginTool.tool] : []),
+    ], request.toolHooks);
+    const env = await this.#environment(request.runtime, binary.path, request.profileId);
+    if (request.runtime === "claude-code-cli" && settings.identifyAsOhMyGame)
+      Object.assign(env, CLAUDE_CLIENT_ENV);
+    // Codex conversations with the same executable, environment and Skills share one app server.
+    const codexServer =
+      request.runtime === "codex-cli"
+        ? await codexServerIdentity(
+            this.#root,
+            binary.path,
+            env,
+            request.skillDirectories,
+          )
+        : undefined;
+    const revoke = new Set<() => void>();
+    const context = (
+      resume: string | undefined,
+      model: string,
+      reasoningLevel: string | undefined,
+    ): DriverContext => ({
+      binaryPath: binary.path,
+      workspacePath: request.workspacePath,
+      env,
+      privateDirectory: folder.path,
+      processDirectory: path.join(this.#root, "processes"),
+      instructions: nativeAgentInstructions(request.instructions),
+      bridge,
+      saveGeneratedImage: request.saveGeneratedImage,
+      permissionMode: settings.permissionMode,
+      ...(codexServer ? { codexServer } : {}),
+      skillDirectories: request.skillDirectories,
+      httpBridge: async (handlers) => {
+        const registered = this.#registerBridge(bridge, handlers);
+        const stop = () => {
+          registered.revoke();
+          revoke.delete(stop);
+        };
+        revoke.add(stop);
+        handlers.signal.addEventListener("abort", () => revoke.delete(stop), {
+          once: true,
+        });
+        return { ...registered, revoke: stop };
+      },
+      model,
+      ...(request.contextWindow
+        ? { contextWindow: request.contextWindow }
+        : {}),
+      ...(reasoningLevel ? { reasoningLevel } : {}),
+      ...(resume ? { resume } : {}),
+    });
+    const createDriver = (
+      resume: string | undefined,
+      current: { model: string; reasoningLevel?: string },
+    ): NativeDriver => {
+      const driverContext = context(
+        resume,
+        current.model,
+        current.reasoningLevel,
+      );
+      if (request.runtime === "claude-code-cli")
+        return new ClaudeCodeDriver(driverContext);
+      if (request.runtime === "codex-cli")
+        return new CodexDriver(driverContext);
+      if (definition.acp)
+        return new AcpDriver(driverContext, {
+          name: definition.name,
+          args: definition.acp.args,
+          ...(definition.loginCommand
+            ? { loginCommand: definition.loginCommand }
+            : {}),
+        });
+      return new OpenCodeDriver(driverContext);
+    };
+    return new NativeCodingSession({
+      runtime: request.runtime,
+      ...(isAccountRuntimeId(request.runtime) ? { profileId: this.#profileId(request.runtime, request.profileId) } : {}),
+      model: request.model,
+      ...(request.reasoningLevel
+        ? { nativeReasoningLevel: request.reasoningLevel }
+        : {}),
+      sessionManager: request.sessionManager,
+      createDriver,
+      ...(request.snapshotBeforeMessage
+        ? { snapshotBeforeMessage: request.snapshotBeforeMessage }
+        : {}),
+      ...(request.turnNotice ? { turnNotice: request.turnNotice } : {}),
+      requestUserInput: request.requestUserInput,
+      requestApproval: request.requestApproval,
+      toolNames: bridge.names,
+      setActiveTools: (names) => bridge.setActive(names),
+      onLimits: (limits) => this.#recordLimits(cacheKey, limits),
+      accountLimits: () => this.#limits.get(cacheKey),
+      ...(request.skills ? { skills: request.skills } : {}),
+      dispose: async () => {
+        for (const stop of revoke) stop();
+        await pluginTool?.close().catch(() => {});
+        await folder.remove();
+      },
+    });
+  }
+
+  /**
+   * Answers an MCP request that came in over HTTP with a session's token.
+   * The token is compared in constant time and works only while a turn of
+   * that conversation runs; outside one, every call is refused.
+   */
+  async handleBridgeRequest(
+    authorization: string | undefined,
+    body: unknown,
+  ): Promise<{ status: number; body?: unknown }> {
+    const token = authorization?.match(/^Bearer\s+(.+)$/i)?.[1];
+    const entry = token ? this.#bridgeFor(token) : undefined;
+    if (!entry)
+      return {
+        status: 401,
+        body: { error: "Unknown or revoked bridge token" },
+      };
+    const messages = Array.isArray(body) ? body : [body];
+    const answers: unknown[] = [];
+    for (const message of messages) {
+      const method =
+        message && typeof message === "object"
+          ? (message as { method?: unknown }).method
+          : undefined;
+      if (
+        method === "tools/call" &&
+        (!entry.handlers.active() || entry.handlers.signal.aborted)
+      ) {
+        const id = (message as { id?: unknown }).id;
+        answers.push({
+          jsonrpc: "2.0",
+          id,
+          error: {
+            code: -32001,
+            message: "No turn of this conversation is running",
+          },
+        });
+        continue;
+      }
+      const answer = await entry.bridge.handle(
+        message,
+        (call, outcome) => {
+          if (!entry.handlers.signal.aborted && entry.handlers.active())
+            entry.handlers.observe(call, outcome);
+        },
+        entry.handlers.callSignal?.() ?? entry.handlers.signal,
+        entry.handlers.listAll ? "all" : "active",
+      );
+      if (answer) answers.push(answer);
+    }
+    if (!answers.length) return { status: 202 };
+    return { status: 200, body: Array.isArray(body) ? answers : answers[0] };
+  }
+
+  /** Stops every CLI still running: sessions let go of theirs without waiting, sign-ins may still be open. */
+  async close(): Promise<void> {
+    this.#bridges.clear();
+    await stopAgentProcesses();
+  }
+
+  #registerBridge(
+    bridge: ToolBridge,
+    handlers: HttpBridgeHandlers,
+  ): { url: string; token: string; revoke: () => void } {
+    const base = this.bridgeUrl();
+    if (!base) throw new Error("The daemon address is not known yet");
+    const token = randomBytes(32).toString("base64url");
+    this.#bridges.set(token, { bridge, handlers });
+    const revoke = () => {
+      this.#bridges.delete(token);
+      handlers.signal.removeEventListener("abort", revoke);
+    };
+    if (handlers.signal.aborted) revoke();
+    else handlers.signal.addEventListener("abort", revoke, { once: true });
+    return {
+      url: `${base}/agent-runtime-bridge/mcp`,
+      token,
+      revoke,
+    };
+  }
+
+  #bridgeFor(
+    token: string,
+  ): { bridge: ToolBridge; handlers: HttpBridgeHandlers } | undefined {
+    const presented = Buffer.from(token);
+    for (const [candidate, entry] of this.#bridges) {
+      const expected = Buffer.from(candidate);
+      if (
+        expected.length === presented.length &&
+        timingSafeEqual(expected, presented)
+      )
+        return entry;
+    }
+    return undefined;
+  }
+
+  #profileId(runtime: AccountRuntimeId, profileId?: string): string {
+    const selected = profileId ?? this.settings.get(runtime).defaultProfileId ?? "system";
+    if (this.#changing.has(`${runtime}:${selected}`)) throw new Error("Account configuration is being changed");
+    if (!this.settings.profiles(runtime).some((profile) => profile.id === selected)) throw new Error("Account configuration not found");
+    return selected;
+  }
+
+  #key(id: AgentRuntimeId, profileId?: string): string {
+    const selected = isAccountRuntimeId(id) ? this.#profileId(id, profileId) : "system";
+    return selected === "system" ? id : `${id}:${selected}`;
+  }
+
+  /** Read the last quota report without starting a CLI or refreshing authentication. */
+  cachedLimits(runtime: AgentRuntimeId, profileId?: string): AgentUsageLimit[] | undefined {
+    return this.#limits.get(this.#key(runtime, profileId));
+  }
+
+  accountDirectory(runtime: AccountRuntimeId, profileId: string): string {
+    return this.settings.profiles(runtime).find((profile) => profile.id === profileId)?.configDirectory ?? systemConfigDirectory(runtime);
+  }
+
+  async accountProfiles(runtime: AccountRuntimeId, recheck = false): Promise<AgentAccountProfileStatus[]> {
+    if (recheck) this.#invalidate(runtime);
+    return Promise.all(this.settings.profiles(runtime).map(async (profile) => {
+      const status = await this.status(runtime, false, profile.id);
+      return { ...profile, directory: this.accountDirectory(runtime, profile.id), auth: status.auth, ...(status.limits ? { limits: status.limits } : {}) };
+    }));
+  }
+
+  async addAccountProfile(runtime: AccountRuntimeId, name: string, configDirectory?: string) {
+    if (!name.trim() || name.trim().length > 80) throw new Error("Choose an account configuration name (1–80 characters)");
+    let directory = configDirectory ?? path.join(this.#root, "account-profiles", runtime, randomBytes(12).toString("hex"));
+    if (!path.isAbsolute(directory)) throw new Error("The configuration directory must be absolute");
+    if (configDirectory) directory = await this.#connectableDirectory(runtime, directory);
+    try {
+      if (!configDirectory) {
+        await mkdir(directory, { recursive: true, mode: 0o700 });
+        // A managed Codex home gets its own file-backed sign-in; do not edit imported configurations.
+        if (runtime === "codex-cli") await writeFile(path.join(directory, "config.toml"), 'cli_auth_credentials_store = "file"\n', { mode: 0o600, flag: "wx" });
+      }
+      return await this.settings.addProfile(runtime, name, directory, !configDirectory);
+    } catch (cause) {
+      if (!configDirectory) await rm(directory, { recursive: true, force: true });
+      throw cause;
+    }
+  }
+
+  /** A directory an account may connect to: it exists and belongs neither to the app nor to System default. */
+  async #connectableDirectory(runtime: AccountRuntimeId, configDirectory: string): Promise<string> {
+    const info = await stat(configDirectory).catch(() => undefined);
+    if (!info?.isDirectory()) throw new Error("Choose an existing configuration directory");
+    const directory = await realpath(configDirectory);
+    const managedRoot = await realpath(path.join(this.#root, "account-profiles")).catch(() => path.join(this.#root, "account-profiles"));
+    if (directory === managedRoot || directory.startsWith(`${managedRoot}${path.sep}`))
+      throw new Error("Managed account directories cannot be imported");
+    // Naming System default's directory explicitly gives Claude another Keychain entry and global config file.
+    const system = systemConfigDirectory(runtime);
+    if (directory === await realpath(system).catch(() => path.resolve(system)))
+      throw new Error("System default already uses this configuration directory");
+    return directory;
+  }
+
+  /**
+   * Renames an account or points it at another directory. Its id stays, so its
+   * conversations keep it; one whose native session is not in the new directory
+   * finds that session expired and continues with a history handoff.
+   */
+  async updateAccountProfile(
+    runtime: AccountRuntimeId,
+    profileId: string,
+    change: { name?: string; configDirectory?: string },
+    releaseSessions: () => Promise<void>,
+  ): Promise<AgentAccountProfile> {
+    if (profileId === "system") throw new Error("System default cannot be changed");
+    const profile = this.settings.profiles(runtime).find((profile) => profile.id === profileId);
+    if (!profile) throw new Error("Account configuration not found");
+    const name = change.name?.trim();
+    if (change.name !== undefined && (!name || name.length > 80)) throw new Error("Choose an account configuration name (1–80 characters)");
+    const named = name !== undefined ? { name } : {};
+    if (change.configDirectory !== undefined) {
+      if (profile.managed) throw new Error("A managed account's directory cannot be changed");
+      const configDirectory = await this.#connectableDirectory(runtime, change.configDirectory);
+      if (configDirectory !== profile.configDirectory)
+        return this.#whileProfileStopped(runtime, profileId, releaseSessions, () =>
+          this.settings.updateProfile(runtime, profileId, { ...named, configDirectory }));
+    }
+    return this.settings.updateProfile(runtime, profileId, named);
+  }
+
+  async removeAccountProfile(runtime: AccountRuntimeId, profileId: string, releaseSessions: () => Promise<void>): Promise<void> {
+    if (profileId === "system") throw new Error("System default cannot be deleted");
+    const profile = this.settings.profiles(runtime).find((profile) => profile.id === profileId);
+    if (!profile) throw new Error("Account configuration not found");
+    await this.#whileProfileStopped(runtime, profileId, releaseSessions, async () => {
+      if (profile.managed) {
+        const managedRoot = path.join(this.#root, "account-profiles", runtime);
+        if (!profile.configDirectory || path.dirname(profile.configDirectory) !== managedRoot)
+          throw new Error("Managed account directory is outside its reserved folder");
+        await this.#signOut(runtime, profile.configDirectory);
+        await rm(profile.configDirectory, { recursive: true, force: true });
+      }
+      await this.settings.removeProfile(runtime, profileId);
+    });
+  }
+
+  /** Stops everything using an account's directory and drops what was read from it, then runs `work`. */
+  async #whileProfileStopped<T>(
+    runtime: AccountRuntimeId,
+    profileId: string,
+    releaseSessions: () => Promise<void>,
+    work: () => Promise<T>,
+  ): Promise<T> {
+    const cacheKey = this.#key(runtime, profileId);
+    const changingKey = `${runtime}:${profileId}`;
+    const pending = [this.#probing.get(cacheKey), this.#modelLoads.get(cacheKey)];
+    const stopLogin = this.#logins.get(cacheKey);
+    this.#changing.add(changingKey);
+    try {
+      await releaseSessions();
+      await stopLogin?.();
+      this.#logins.delete(cacheKey);
+      await Promise.allSettled(pending);
+      // Invalidate before the registry changes; late probes cannot repopulate its cache.
+      this.#invalidate(runtime, profileId);
+      const result = await work();
+      this.#limits.delete(cacheKey);
+      this.#recordLimitsCache();
+      return result;
+    } finally {
+      this.#changing.delete(changingKey);
+    }
+  }
+
+  #invalidate(id: AgentRuntimeId, profileId?: string): void {
+    const key = (profile: string) => profile === "system" ? id : `${id}:${profile}`;
+    const keys = profileId !== undefined ? [key(profileId)]
+      : isAccountRuntimeId(id) ? this.settings.profiles(id).map((profile) => key(profile.id)) : [id];
+    for (const key of keys) {
+      this.#revisions.set(key, (this.#revisions.get(key) ?? 0) + 1);
+      this.#probes.delete(key);
+      this.#models.delete(key);
+      this.#modelErrors.delete(key);
+      this.#probing.delete(key);
+      this.#modelLoads.delete(key);
+    }
+  }
+
+  /** The CLI's executable and the environment its commands run in, or undefined when it is not installed. */
+  async cli(
+    id: AgentRuntimeId,
+  ): Promise<{ path: string; env: Record<string, string> } | undefined> {
+    const binary = await resolveBinary(id, this.settings.get(id).binaryPath);
+    return binary
+      ? { path: binary.path, env: await this.#environment(id, binary.path, "system") }
+      : undefined;
+  }
+
+  async #environment(
+    id: AgentRuntimeId,
+    binaryPath: string,
+    profileId?: string,
+  ): Promise<Record<string, string>> {
+    const configDirectory = isAccountRuntimeId(id)
+      ? this.settings.profiles(id).find((profile) => profile.id === this.#profileId(id, profileId))!.configDirectory
+      : undefined;
+    return this.#profileEnvironment(id, binaryPath, configDirectory);
+  }
+
+  async #profileEnvironment(
+    id: AgentRuntimeId,
+    binaryPath: string,
+    configDirectory?: string,
+  ): Promise<Record<string, string>> {
+    const env = agentEnvironment(
+      id,
+      binaryPath,
+      {},
+      process.env,
+      await loginShellPath(),
+    );
+    if (configDirectory) {
+      if (id === "claude-code-cli") {
+        delete env.CLAUDE_CODE_OAUTH_TOKEN;
+        env.CLAUDE_CONFIG_DIR = configDirectory;
+      } else if (id === "codex-cli") env.CODEX_HOME = configDirectory;
+    }
+    return env;
+  }
+
+  /**
+   * Signs a managed configuration out with its CLI before its directory goes.
+   * Claude keeps a macOS sign-in in a Keychain entry keyed to the directory,
+   * which removing the directory would leave behind. A missing CLI or a failed
+   * sign-out does not keep the directory.
+   */
+  async #signOut(id: AccountRuntimeId, configDirectory: string): Promise<void> {
+    const binary = await resolveBinary(id, this.settings.get(id).binaryPath).catch(() => undefined);
+    if (!binary) return;
+    const env = await this.#profileEnvironment(id, binary.path, configDirectory);
+    await runCli(binary.path, id === "claude-code-cli" ? ["auth", "logout"] : ["logout"], env, this.#root).catch(() => undefined);
+  }
+
+  async #probe(
+    id: AgentRuntimeId,
+    binary: { path: string; signature: string },
+    recheck: boolean,
+    profileId?: string,
+  ): Promise<ProbeCache | undefined> {
+    profileId = isAccountRuntimeId(id) ? this.#profileId(id, profileId) : undefined;
+    const cacheKey = this.#key(id, profileId);
+    const cached = this.#probes.get(cacheKey);
+    if (
+      !recheck &&
+      cached?.signature === binary.signature &&
+      Date.now() - cached.checkedAt < STATUS_TTL_MS
+    )
+      return cached;
+    const running = this.#probing.get(cacheKey);
+    if (running) return running;
+    const revision = this.#revisions.get(cacheKey);
+    const work = (async () => {
+      const definition = agentRuntimeDefinition(id);
+      const env = await this.#environment(id, binary.path, profileId);
+      const diagnostics: AgentRuntimeDiagnostic[] = [];
+      let version: string | undefined;
+      let auth: AuthProbe = { status: "unknown", billing: "unknown" };
+      try {
+        [version, auth] = await Promise.all([
+          probeVersion(binary.path, id, env),
+          probeAuth(binary.path, id, env),
+        ]);
+      } catch (cause) {
+        diagnostics.push({
+          code: "probe-failed",
+          message: cause instanceof Error ? cause.message : String(cause),
+        });
+      }
+      let requirementError: Error | undefined;
+      try {
+        checkRuntimeVersionRequirement(id, version);
+      } catch (cause) {
+        requirementError =
+          cause instanceof Error ? cause : new Error(String(cause));
+        diagnostics.push({
+          code:
+            cause instanceof AgentRuntimeCompatibilityError
+              ? "runtime-incompatible"
+              : "probe-failed",
+          message: requirementError.message,
+          ...(cause instanceof AgentRuntimeCompatibilityError &&
+          cause.capability
+            ? { capability: cause.capability }
+            : {}),
+        });
+      }
+      if (!version && !diagnostics.some((item) => item.code === "probe-failed"))
+        diagnostics.push({
+          code: "probe-failed",
+          message: `${definition.name} did not return a readable version`,
+        });
+      if (auth.status === "signed-out")
+        diagnostics.push({
+          code: "signed-out",
+          message: `${definition.name} is not signed in`,
+          command: signInCommand(id, binary.path, env),
+        });
+      const result: ProbeCache = {
+        signature: binary.signature,
+        ...(version ? { version } : {}),
+        auth,
+        diagnostics,
+        checkedAt: Date.now(),
+        ...(requirementError ? { requirementError } : {}),
+      };
+      if (this.#revisions.get(cacheKey) === revision) this.#probes.set(cacheKey, result);
+      return result;
+    })().finally(() => {
+      if (this.#probing.get(cacheKey) === work) this.#probing.delete(cacheKey);
+    });
+    this.#probing.set(cacheKey, work);
+    return work;
+  }
+
+  #loadModels(id: AgentRuntimeId, profileId?: string): Promise<AgentModel[]> {
+    profileId = isAccountRuntimeId(id) ? this.#profileId(id, profileId) : undefined;
+    const cacheKey = this.#key(id, profileId);
+    const running = this.#modelLoads.get(cacheKey);
+    if (running) return running;
+    const revision = this.#revisions.get(cacheKey);
+    const work = (async () => {
+      const settings = this.settings.get(id);
+      const binary = await resolveBinary(id, settings.binaryPath);
+      if (!binary) {
+        if (this.#revisions.get(cacheKey) === revision) this.#models.set(cacheKey, { models: [], at: Date.now() });
+        return [];
+      }
+      const cached = this.#models.get(cacheKey);
+      if (
+        cached?.signature === binary.signature &&
+        Date.now() - cached.at < MODELS_TTL_MS
+      )
+        return cached.models;
+      const probe = await this.#probe(id, binary, false, profileId);
+      if (probe?.requirementError) throw probe.requirementError;
+      const failed = this.#modelErrors.get(cacheKey);
+      if (
+        failed?.signature === binary.signature &&
+        failed.cause &&
+        Date.now() - failed.at < STATUS_TTL_MS
+      )
+        throw failed.cause;
+      const env = await this.#environment(id, binary.path, profileId);
+      await mkdir(path.join(this.#root, "probes"), {
+        recursive: true,
+        mode: 0o700,
+      });
+      const folder = await privateFolder(path.join(this.#root, "probes"), id);
+      try {
+        const { models, account, limits, signedOut } = await probeModels(
+          binary.path,
+          id,
+          env,
+          folder.path,
+        );
+        if (this.#revisions.get(cacheKey) !== revision) return [];
+        this.#models.set(cacheKey, {
+          signature: binary.signature,
+          models,
+          at: Date.now(),
+        });
+        this.#modelErrors.delete(cacheKey);
+        const name = agentRuntimeDefinition(id).name;
+        if (signedOut) {
+          const probe = this.#probes.get(cacheKey);
+          if (probe) probe.auth = { status: "signed-out", billing: probe.auth.billing };
+          this.#modelErrors.set(cacheKey, {
+            signature: binary.signature,
+            at: Date.now(),
+            diagnostic: {
+              code: "signed-out",
+              message: `${name} is not signed in`,
+              command: signInCommand(id, binary.path, env),
+            },
+          });
+        } else if (!models.length)
+          this.#modelErrors.set(cacheKey, {
+            signature: binary.signature,
+            at: Date.now(),
+            diagnostic: {
+              code: "models-unavailable",
+              message: `${name} returned an empty model catalog. Check sign-in and CLI protocol support.`,
+            },
+          });
+        if (limits) this.#recordLimits(cacheKey, limits);
+        const probe = this.#probes.get(cacheKey);
+        if (account && probe && !probe.auth.account)
+          probe.auth = { ...probe.auth, account };
+        return models;
+      } catch (cause) {
+        if (this.#revisions.get(cacheKey) === revision)
+          this.#modelErrors.set(cacheKey, {
+            signature: binary.signature,
+            at: Date.now(),
+            cause: cause instanceof Error ? cause : new Error(String(cause)),
+            diagnostic: {
+              code:
+                cause instanceof AgentRuntimeCompatibilityError
+                  ? "runtime-incompatible"
+                  : "models-unavailable",
+              message: cause instanceof Error ? cause.message : String(cause),
+              ...(cause instanceof AgentRuntimeCompatibilityError &&
+              cause.capability
+                ? { capability: cause.capability }
+                : {}),
+            },
+          });
+        throw cause;
+      } finally {
+        await folder.remove();
+      }
+    })().catch((cause: unknown) => {
+      // A failed or missing CLI settles a snapshot too. Keep the next picker
+      // poll from restarting the same discovery while its status is fresh.
+      if (this.#revisions.get(cacheKey) === revision) {
+        const at = this.#modelErrors.get(cacheKey)?.at ?? Date.now();
+        this.#models.set(cacheKey, { models: [], at });
+      }
+      throw cause;
+    }).finally(() => {
+      if (this.#modelLoads.get(cacheKey) === work) this.#modelLoads.delete(cacheKey);
+    });
+    this.#modelLoads.set(cacheKey, work);
+    return work;
+  }
+}
+
+/**
+ * The sign-in command a person can run for an account. A profile names its
+ * folder. System default clears the variable, which the person's terminal may
+ * set even when OhMyGame was launched without it.
+ */
+/** A command line for the person to read: a part that isn't plain is quoted, so spaces and line breaks show. */
+function commandLine(parts: readonly string[]): string {
+  return parts.map((part) => /^[\w@%+=:,./-]+$/.test(part) ? part : JSON.stringify(part)).join(" ");
+}
+
+function signInCommand(id: AgentRuntimeId, binaryPath: string, env: Record<string, string>): string {
+  const variable = id === "claude-code-cli" ? "CLAUDE_CONFIG_DIR" : id === "codex-cli" ? "CODEX_HOME" : undefined;
+  if (!variable) {
+    const definition = agentRuntimeDefinition(id);
+    // An agent that names no sign-in command signs in when it runs on its own.
+    return (
+      definition.loginCommand ??
+      (process.platform === "win32"
+        ? `& '${binaryPath.replaceAll("'", "''")}'`
+        : `'${binaryPath.replaceAll("'", "'\\''")}'`)
+    );
+  }
+  const directory = env[variable];
+  const args = id === "codex-cli" ? "login" : "auth login";
+  if (process.platform === "win32") {
+    const run = `& '${binaryPath.replaceAll("'", "''")}' ${args}`;
+    // Assigning $null removes the variable, without an error when it is absent.
+    return `$env:${variable} = ${directory ? `'${directory.replaceAll("'", "''")}'` : "$null"}; ${run}`;
+  }
+  const run = `'${binaryPath.replaceAll("'", "'\\''")}' ${args}`;
+  return directory ? `${variable}='${directory.replaceAll("'", "'\\''")}' ${run}` : `env -u ${variable} ${run}`;
+}
+
+function isUsageLimit(value: unknown): value is AgentUsageLimit {
+  const limit = value as AgentUsageLimit | null;
+  return (
+    !!limit &&
+    typeof limit.id === "string" &&
+    typeof limit.usedPercent === "number" &&
+    (limit.windowMinutes === undefined ||
+      typeof limit.windowMinutes === "number") &&
+    (limit.resetsAt === undefined || typeof limit.resetsAt === "number")
+  );
+}

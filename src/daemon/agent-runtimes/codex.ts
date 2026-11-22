@@ -1,0 +1,1145 @@
+import { nativeQuestions } from "./user-input.js";
+import { existsSync } from "node:fs";
+import path from "node:path";
+import { randomUUID } from "node:crypto";
+import {
+  FULL_ACCESS_PERMISSION_MODES,
+  isAgentPermissionMode,
+  type ApprovalDecision,
+  type ApprovalRequestDetails,
+} from "../../shared/agent-runtimes.js";
+import type {
+  NativeDriver,
+  NativeToolResult,
+  NativeTurnInput,
+  NativeTurnOutcome,
+  NativeTurnSink,
+} from "./native-session.js";
+import {
+  CodexAppServer,
+  CodexRequestError,
+  codexLimits,
+  requireCodexPermissionProfile,
+} from "./codex-app-server.js";
+import {
+  BridgeResults,
+  number,
+  PLANNING_DENIAL,
+  record,
+  textResult,
+  type DriverContext,
+} from "./driver-context.js";
+import {
+  acquireCodexServer,
+  type CodexServerLease,
+} from "./codex-server-pool.js";
+import { NativeSessionExpiredError, type NativeUsage } from "./native-session.js";
+import type { AgentContextUsage } from "../../shared/contracts.js";
+import { runtimeStartupError } from "./compatibility.js";
+import { importCodexImage } from "./codex-images.js";
+import { BRIDGE_SERVER_NAME } from "./tool-bridge.js";
+import { skillInstruction } from "./skills.js";
+import { EXTERNAL_MCP_SERVER_NAME } from "../../shared/external-mcp.js";
+
+/** A turn on a shared server must stop on its own: the process outlives the conversation. */
+const INTERRUPT_TIMEOUT_MS = 5_000;
+const TOOL_PREFIX = `${BRIDGE_SERVER_NAME}_`;
+
+/**
+ * What one turn's usage reports add up to, for the figures its final message
+ * records. Codex reports each request's usage only once it completes, so the
+ * turn's totals — its duration, its output growth, its cached share — are the
+ * figures that can be measured; a single request's span cannot.
+ */
+export interface TurnFigures {
+  /** Wall clock when the turn started. */
+  startedAt?: number;
+  /** The thread's output total before this turn's requests, reconstructed from its first report. */
+  baselineOutput?: number;
+  /** The thread's output total at the latest report. */
+  lastTotalOutput?: number;
+  /** Every report's prompt tokens, each with its cached share clamped to it. */
+  prompt: number;
+  cached: number;
+  /** Cumulative usage identifies reports even when requests have identical token counts. */
+  cacheReportKey?: string;
+}
+
+/** Folds a usage report into the turn's figures: its cached share, clamped to its prompt. */
+export function foldUsageReport(
+  figures: TurnFigures,
+  last: Record<string, unknown>,
+  total: Record<string, unknown> | undefined,
+): void {
+  const totalOutput = number(total?.outputTokens);
+  if (totalOutput > 0) {
+    // The first report reconstructs what the thread already held: its total,
+    // less the request the report is for.
+    if (figures.baselineOutput === undefined)
+      figures.baselineOutput = Math.max(0, totalOutput - number(last.outputTokens));
+    figures.lastTotalOutput = totalOutput;
+  }
+  const prompt = number(last.inputTokens);
+  if (prompt > 0) {
+    const key = total
+      ? JSON.stringify(["total", total.inputTokens, total.cachedInputTokens, total.cacheWriteInputTokens, total.outputTokens])
+      : JSON.stringify(["last", prompt, number(last.cachedInputTokens), number(last.outputTokens)]);
+    if (key !== figures.cacheReportKey) {
+      figures.prompt += prompt;
+      figures.cached += Math.max(0, Math.min(number(last.cachedInputTokens), prompt));
+      figures.cacheReportKey = key;
+    }
+  }
+}
+
+/** The turn's figures once it ends: output growth over its duration, and the cached share. */
+export function turnFiguresAt(
+  figures: TurnFigures,
+  endedAt: number,
+): { tokensPerSecond?: number; cacheHitPercent?: number } | undefined {
+  const output = figures.lastTotalOutput !== undefined && figures.baselineOutput !== undefined
+    ? figures.lastTotalOutput - figures.baselineOutput
+    : undefined;
+  const seconds = figures.startedAt !== undefined
+    ? (endedAt - figures.startedAt) / 1000
+    : undefined;
+  const cacheHitPercent = figures.prompt > 0
+    ? Math.round((figures.cached / figures.prompt) * 100)
+    : undefined;
+  if (output !== undefined && output > 0 && seconds !== undefined && seconds > 0)
+    return { tokensPerSecond: Math.round(output / seconds), ...(cacheHitPercent !== undefined ? { cacheHitPercent } : {}) };
+  return cacheHitPercent !== undefined ? { cacheHitPercent } : undefined;
+}
+
+interface CodexTurn {
+  sink: NativeTurnSink;
+  signal: AbortSignal;
+  resolve: (outcome: NativeTurnOutcome) => void;
+  turnId?: string;
+  error?: string;
+  readOnly?: boolean;
+  images: Map<string, Promise<void>>;
+  imageError?: string;
+  finishing?: boolean;
+  /** Events may arrive before turn/start's response identifies their turn. */
+  pending?: Array<{ method: string; params: Record<string, unknown> }>;
+  ready?: Promise<void>;
+  identified?: () => void;
+  bridged: BridgeResults;
+  figures: TurnFigures;
+  /** The latest report's usage, to record the turn's figures with. */
+  lastUsage?: { usage: NativeUsage; contextWindow?: number; contextTokens?: number };
+}
+
+/**
+ * Codex through its app server: one thread per conversation, one turn per
+ * message. OhMyGame's tools are the thread's dynamic tools, answered over the
+ * same pipe. Codex's built-in permission profiles and approval policy decide
+ * what it may do and what it asks; OhMyGame shows the question and returns
+ * the person's answer.
+ */
+export class CodexDriver implements NativeDriver {
+  #inputRequests = new Map<string | number, AbortController>();
+  #disposed = false;
+  readonly #privateKey = `private-${randomUUID()}`;
+  /** The Codex permission profile the person chose for work; planning uses its read-only one. */
+  readonly #writeProfile: string;
+  #limits: NonNullable<AgentContextUsage["limits"]> = [];
+  #lease?: CodexServerLease;
+  #starting?: Promise<CodexAppServer>;
+  #threadId?: string;
+  /** The thread's running total at the last report, to tell what each request spent. */
+  #countedTotal?: { threadId?: string; usage: NativeUsage };
+  #turn?: CodexTurn;
+  /** Manual compaction identifies its new turn by an event, so exclude earlier turns. */
+  #endedTurns = new Set<string>();
+
+  constructor(private readonly context: DriverContext) {
+    this.#threadId = context.resume;
+    this.#writeProfile = isAgentPermissionMode(
+      "codex-cli",
+      context.permissionMode,
+    )
+      ? context.permissionMode
+      : FULL_ACCESS_PERMISSION_MODES["codex-cli"];
+  }
+
+  async runTurn(
+    input: NativeTurnInput,
+    sink: NativeTurnSink,
+    signal: AbortSignal,
+  ): Promise<NativeTurnOutcome> {
+    if (signal.aborted) return { status: "aborted" };
+    let server: CodexAppServer;
+    let threadId: string;
+    try {
+      server = await this.#start();
+      if (signal.aborted) return { status: "aborted" };
+      threadId = await this.#thread(server, sink);
+      if (this.#limits.length) sink.limits?.(this.#limits);
+      if (signal.aborted) return { status: "aborted" };
+    } catch (cause) {
+      if (cause instanceof NativeSessionExpiredError) throw cause;
+      if (signal.aborted) return { status: "aborted" };
+      return {
+        status: "failed",
+        error: runtimeStartupError(cause).message,
+        resumable: Boolean(this.#threadId),
+        inputAccepted: false,
+      };
+    }
+    return new Promise<NativeTurnOutcome>((resolve, reject) => {
+      const turn: CodexTurn = {
+        sink,
+        signal,
+        resolve,
+        readOnly: input.readOnly,
+        images: new Map(),
+        pending: [],
+        bridged: new BridgeResults(),
+        figures: { startedAt: Date.now(), prompt: 0, cached: 0 },
+      };
+      turn.ready = new Promise<void>((ready) => { turn.identified = ready; });
+      this.#turn = turn;
+      server
+        .request<{ turn?: { id?: string } }>("turn/start", {
+          threadId,
+          input: codexInput(input, this.#lease?.skillsRoot),
+          ...(this.context.reasoningLevel
+            ? { effort: this.context.reasoningLevel }
+            : {}),
+          model: this.context.model,
+          collaborationMode: {
+            mode: input.readOnly ? "plan" : "default",
+            settings: { model: this.context.model, reasoning_effort: this.context.reasoningLevel ?? null, developer_instructions: null },
+          },
+          permissions: input.readOnly ? READ_PROFILE : this.#writeProfile,
+        })
+        .then(
+          (response) => {
+            if (this.#turn !== turn) {
+              if (response.turn?.id && (this.#disposed || signal.aborted))
+                void interruptTurn(server, threadId, response.turn.id);
+              return;
+            }
+            turn.turnId = response.turn?.id;
+            const pending = turn.pending!;
+            turn.pending = undefined;
+            turn.identified?.();
+            if (!turn.turnId) {
+              this.#turn = undefined;
+              resolve({ status: "failed", error: "Codex did not identify the turn" });
+              return;
+            }
+            for (const event of pending) this.#notification(event.method, event.params);
+          },
+          (cause) => {
+            if (this.#turn !== turn) return;
+            this.#turn = undefined;
+            turn.identified?.();
+            if (expiredThread(cause)) {
+              reject(new NativeSessionExpiredError(String(cause)));
+              return;
+            }
+            resolve({
+              status: "failed",
+              error: cause instanceof Error ? cause.message : String(cause),
+              ...(cause instanceof CodexRequestError
+                ? { resumable: true, inputAccepted: false as const }
+                : {}),
+            });
+          },
+        );
+    });
+  }
+
+  async interrupt(): Promise<void> {
+    const turn = this.#turn;
+    await turn?.ready;
+    if (this.#turn !== turn) return;
+    if (!turn?.turnId || !this.#lease || !this.#threadId) return;
+    await interruptTurn(this.#lease.server, this.#threadId, turn.turnId);
+  }
+
+  async compact(sink: NativeTurnSink, signal: AbortSignal): Promise<void> {
+    const server = await this.#start();
+    const threadId = await this.#thread(server, sink);
+    sink.compaction("start");
+    const outcome = await new Promise<NativeTurnOutcome>((resolve) => {
+      const turn: CodexTurn = { sink, signal, resolve, images: new Map(), bridged: new BridgeResults(), figures: { startedAt: Date.now(), prompt: 0, cached: 0 } };
+      this.#turn = turn;
+      server.request("thread/compact/start", { threadId }).catch((cause) => {
+        if (this.#turn !== turn) return;
+        this.#turn = undefined;
+        resolve({
+          status: "failed",
+          error: cause instanceof Error ? cause.message : String(cause),
+        });
+      });
+    });
+    sink.compaction(
+      "end",
+      outcome.status === "failed" ? { error: outcome.error } : {},
+    );
+    if (outcome.status === "failed") throw new Error(outcome.error);
+  }
+
+  /**
+   * Lets go of the shared server. Other conversations may still use it, so a
+   * turn of this thread is interrupted rather than ended with the process;
+   * the server stops with its last conversation.
+   */
+  async dispose(): Promise<void> {
+    this.#cancelInputs();
+    this.#disposed = true;
+    this.#turn?.identified?.();
+    await this.interrupt();
+    const turn = this.#turn;
+    this.#turn = undefined;
+    const lease = this.#lease;
+    this.#lease = undefined;
+    await lease?.release();
+    turn?.resolve({ status: "aborted" });
+  }
+
+  async #start(): Promise<CodexAppServer> {
+    if (this.#disposed) throw new Error("The agent session was closed");
+    if (this.#lease?.server.process.running) return this.#lease.server;
+    return (this.#starting ??= (async () => {
+      try {
+        const shared = this.context.codexServer;
+        const lease = await acquireCodexServer(
+          {
+            // Without a shared identity the server is this session's alone.
+            key: shared?.key ?? this.#privateKey,
+            directory: shared?.directory ?? this.context.privateDirectory,
+            shared: Boolean(shared),
+            binaryPath: this.context.binaryPath,
+            env: this.context.env,
+            processDirectory: this.context.processDirectory,
+            skillDirectories: this.context.skillDirectories,
+          },
+          {
+            notification: (method, params) =>
+              this.#notification(method, params),
+            request: (method, params, requestId) => this.#request(method, params, requestId),
+            exit: (failure) => {
+              this.#cancelInputs();
+              this.#lease = undefined;
+              const turn = this.#turn;
+              this.#turn = undefined;
+              turn?.identified?.();
+              turn?.resolve(
+                turn.signal.aborted
+                  ? { status: "aborted" }
+                  : {
+                      status: "failed", error: failure, resumable: Boolean(this.#threadId),
+                      ...(turn.pending ? { inputAccepted: false as const } : {}),
+                    },
+              );
+            },
+          },
+          codexLimits,
+        );
+        if (this.#disposed) {
+          await lease.release();
+          throw new Error("The agent session was closed");
+        }
+        this.#lease = lease;
+        this.#limits = lease.limits;
+        return lease.server;
+      } finally {
+        this.#starting = undefined;
+      }
+    })());
+  }
+
+  async #thread(server: CodexAppServer, sink: NativeTurnSink): Promise<string> {
+    const settings = {
+      cwd: this.context.workspacePath,
+      // Codex asks when a command needs more than its sandbox allows; full access never asks.
+      approvalPolicy:
+        this.#writeProfile === ":danger-full-access" ? "never" : "on-request",
+      permissions: this.#writeProfile,
+      model: this.context.model,
+      developerInstructions: this.context.instructions,
+      config: await codexConfig(server, this.context.workspacePath),
+    };
+    if (this.#threadId) {
+      // Bind first: the resume reports the thread's usage so far, which the
+      // pool would drop for an unbound thread.
+      this.#lease?.bind(this.#threadId);
+      try {
+        let resumed = await server.request<{
+          thread?: { id?: string };
+          activePermissionProfile?: { id?: string };
+        }>("thread/resume", { threadId: this.#threadId, ...settings });
+        // A live thread can return its last turn's read-only profile from resume,
+        // ignoring resume overrides. Apply the transition explicitly, then verify
+        // before delivering another prompt. Never weaken the profile check.
+        if (resumed.activePermissionProfile?.id === READ_PROFILE) {
+          await server.request("thread/settings/update", { threadId: this.#threadId, permissions: this.#writeProfile });
+          resumed = await server.request("thread/resume", { threadId: this.#threadId, ...settings });
+        }
+        requireCodexPermissionProfile(resumed, this.#writeProfile);
+        const id = resumed.thread?.id ?? this.#threadId;
+        this.#threadId = id;
+        this.#lease?.bind(id);
+        sink.nativeSession(id);
+        return id;
+      } catch (cause) {
+        if (expiredThread(cause))
+          throw new NativeSessionExpiredError(String(cause));
+        throw cause;
+      }
+    }
+    // Dynamic tools are fixed when the thread starts, including in planning.
+    // Names such as mcp are reserved by Codex, so prefix the host's tools.
+    const tools = this.context.bridge.list("all").map((tool) => ({
+      type: "function",
+      name: `${TOOL_PREFIX}${tool.name}`,
+      description: tool.description,
+      inputSchema: tool.inputSchema,
+    }));
+    const started = await server.request<{
+      thread?: { id?: string };
+      activePermissionProfile?: { id?: string };
+    }>("thread/start", { ...settings, dynamicTools: tools });
+    requireCodexPermissionProfile(started, this.#writeProfile);
+    const id = started.thread?.id;
+    if (!id) throw new Error("Codex did not start a thread");
+    this.#threadId = id;
+    this.#lease?.bind(id);
+    sink.nativeSession(id);
+    return id;
+  }
+
+  #notification(method: string, params: Record<string, unknown>): void {
+    if (method === "account/rateLimits/updated") {
+      this.#limits = codexLimits(params);
+      this.#turn?.sink.limits?.(this.#limits);
+      return;
+    }
+    if (params.threadId !== this.#threadId) return;
+    const turn = this.#turn;
+    if (turn?.pending) {
+      turn.pending.push({ method, params });
+      return;
+    }
+    if (method === "serverRequest/resolved") {
+      this.#inputRequests.get(params.requestId as string | number)?.abort();
+      return;
+    }
+    const nestedTurnId = record(params.turn)?.id;
+    const turnId = typeof params.turnId === "string"
+      ? params.turnId
+      : nestedTurnId;
+    if (typeof nestedTurnId === "string" && nestedTurnId !== turnId) return;
+    if (typeof turnId === "string" && this.#endedTurns.has(turnId)) return;
+    // Manual compaction identifies its turn by turn/started rather than an RPC response.
+    if (turn && !turn.turnId && method === "turn/started" && typeof turnId === "string")
+      turn.turnId = turnId;
+    if (turn && (turn.finishing || !turn.turnId || turnId !== turn.turnId)) return;
+    // A resumed thread reports its total before any turn; it is the baseline
+    // the next turn's spending is measured from, not spending of its own.
+    if (method === "thread/tokenUsage/updated")
+      this.#countSpent(params, this.#turn?.sink);
+    if (!turn) return;
+    const sink = turn.sink;
+    switch (method) {
+      case "item/agentMessage/delta":
+        if (typeof params.itemId === "string" && typeof params.delta === "string" && params.delta) {
+          sink.retryRecovered?.();
+          sink.text(params.itemId, params.delta);
+        }
+        return;
+      case "item/reasoning/summaryTextDelta":
+      case "item/reasoning/textDelta":
+        if (typeof params.itemId === "string" && typeof params.delta === "string" && params.delta) {
+          sink.retryRecovered?.();
+          sink.thinking(params.itemId, params.delta);
+        }
+        return;
+      case "item/started": {
+        const item = record(params.item) ?? {};
+        if (typeof item.id === "string") sink.retryRecovered?.();
+        this.#itemStarted(sink, item);
+        return;
+      }
+      case "item/completed": {
+        const item = record(params.item) ?? {};
+        if (item.type === "agentMessage" && typeof item.id === "string" && typeof item.text === "string" && item.text)
+          sink.retryRecovered?.();
+        this.#itemCompleted(sink, item);
+        return;
+      }
+      case "item/commandExecution/outputDelta":
+        // The whole output comes with the completed item; streamed output is not repeated in the record.
+        return;
+      case "thread/tokenUsage/updated": {
+        // `total` adds up the whole thread; `last` is the latest request,
+        // which is what the context holds and what a stored message records.
+        const usage = record(params.tokenUsage);
+        const last = record(usage?.last);
+        if (last) {
+          const message = {
+            input: number(last.inputTokens) - number(last.cachedInputTokens),
+            output: number(last.outputTokens),
+            cacheRead: number(last.cachedInputTokens),
+            cacheWrite: number(last.cacheWriteInputTokens),
+          };
+          const contextWindow = typeof usage?.modelContextWindow === "number"
+            ? usage.modelContextWindow
+            : undefined;
+          turn.lastUsage = {
+            usage: message,
+            contextWindow,
+            contextTokens: number(last.inputTokens) + number(last.outputTokens),
+          };
+          sink.usage(message, contextWindow, turn.lastUsage.contextTokens);
+          this.#countFigures(turn, last, record(usage?.total));
+        }
+        return;
+      }
+      case "error": {
+        const error = record(params.error);
+        const message = codexError(error?.message) || "Codex request failed";
+        if (params.willRetry === true) {
+          const count = /^Reconnecting\.\.\. (\d+)\/(\d+)$/.exec(message);
+          sink.retryStart?.({
+            ...(count ? { attempt: Number(count[1]), maxAttempts: Number(count[2]) } : {}),
+            errorMessage: message,
+          });
+        } else {
+          turn.error = message;
+          sink.error?.(message);
+        }
+        return;
+      }
+      case "turn/completed":
+        turn.finishing = true;
+        void this.#completeTurn(turn, record(params.turn) ?? {});
+        return;
+      default:
+        return;
+    }
+  }
+
+  #cancelInputs(): void {
+    for (const controller of this.#inputRequests.values()) controller.abort();
+    this.#inputRequests.clear();
+  }
+
+  /** Folds a usage report into the turn's figures. */
+  #countFigures(
+    turn: CodexTurn,
+    last: Record<string, unknown>,
+    total: Record<string, unknown> | undefined,
+  ): void {
+    foldUsageReport(turn.figures, last, total);
+  }
+
+  async #completeTurn(
+    turn: CodexTurn,
+    completed: Record<string, unknown>,
+  ): Promise<void> {
+    this.#cancelInputs();
+    // Image imports must reach the shared transcript before checkpoints and turn-end are recorded.
+    await Promise.all(turn.images.values());
+    if (this.#turn !== turn) return;
+    this.#turn = undefined;
+    if (turn.turnId) this.#endedTurns.add(turn.turnId);
+    // The turn's figures ride its last report's usage onto the final message,
+    // recorded once the turn is over: output growth over its duration, and the
+    // cached share of all the prompts its requests sent.
+    const measured = turnFiguresAt(turn.figures, Date.now());
+    if (measured && turn.lastUsage)
+      turn.sink.usage(
+        turn.lastUsage.usage,
+        turn.lastUsage.contextWindow,
+        turn.lastUsage.contextTokens,
+        measured,
+      );
+    if (completed.status === "interrupted" || turn.signal.aborted)
+      turn.resolve({ status: "aborted", resumable: true });
+    else if (completed.status === "failed" || turn.imageError)
+      turn.resolve({
+        status: "failed",
+        error:
+          turn.imageError ||
+          codexError(record(completed.error)?.message) ||
+          turn.error ||
+          "Codex could not finish the turn",
+        resumable: true,
+      });
+    else turn.resolve({ status: "completed" });
+  }
+
+  /**
+   * Records what a request spent: the growth of the thread's total, so a
+   * repeated report adds nothing. With no total seen yet for the thread, as
+   * in a turn that started it, the latest request is what was spent.
+   */
+  #countSpent(params: Record<string, unknown>, sink?: NativeTurnSink): void {
+    const usage = record(params.tokenUsage);
+    const last = record(usage?.last);
+    const total = record(usage?.total);
+    const threadId =
+      typeof params.threadId === "string" ? params.threadId : this.#threadId;
+    if (!total) {
+      if (last) sink?.spent(codexUsage(last));
+      return;
+    }
+    const now = codexUsage(total);
+    const before =
+      this.#countedTotal && this.#countedTotal.threadId === threadId
+        ? this.#countedTotal.usage
+        : undefined;
+    this.#countedTotal = { threadId, usage: now };
+    if (!sink) return;
+    if (before && grewFrom(before, now)) {
+      const spent = {
+        input: now.input - before.input,
+        output: now.output - before.output,
+        cacheRead: now.cacheRead - before.cacheRead,
+        cacheWrite: now.cacheWrite - before.cacheWrite,
+      };
+      if (spent.input + spent.output + spent.cacheRead + spent.cacheWrite > 0)
+        sink.spent(spent);
+    } else if (!before && last) sink.spent(codexUsage(last));
+  }
+
+  #itemStarted(sink: NativeTurnSink, item: Record<string, unknown>): void {
+    const id = typeof item.id === "string" ? item.id : undefined;
+    if (!id) return;
+    switch (item.type) {
+      case "imageGeneration":
+        sink.toolCall(id, "generate_image", {
+          source: "codex",
+          ...(typeof item.revisedPrompt === "string"
+            ? { prompt: item.revisedPrompt }
+            : {}),
+        });
+        sink.toolStarted(id);
+        return;
+      case "commandExecution":
+        sink.toolCall(id, "bash", { command: commandText(item.command) });
+        sink.toolStarted(id);
+        return;
+      case "fileChange": {
+        const changes = Array.isArray(item.changes)
+          ? (item.changes as Array<Record<string, unknown>>)
+          : [];
+        sink.toolCall(id, "edit", {
+          ...(typeof changes[0]?.path === "string"
+            ? { path: changes[0].path }
+            : {}),
+          ...(changes.length > 1
+            ? { files: changes.map((change) => change.path) }
+            : {}),
+        });
+        sink.toolStarted(id);
+        return;
+      }
+      case "dynamicToolCall":
+        sink.toolCall(
+          id,
+          this.#bridgeToolName(item.tool ?? "tool"),
+          record(item.arguments) ?? {},
+        );
+        sink.toolStarted(id);
+        return;
+      case "mcpToolCall":
+        sink.toolCall(
+          id,
+          `${String(item.server ?? "mcp")}__${String(item.tool ?? "tool")}`,
+          record(item.arguments) ?? {},
+        );
+        sink.toolStarted(id);
+        return;
+      case "webSearch":
+        sink.toolCall(id, "web_search", { query: String(item.query ?? "") });
+        sink.toolStarted(id);
+        return;
+      case "contextCompaction":
+        sink.compaction("start");
+        return;
+      default:
+        return;
+    }
+  }
+
+  #itemCompleted(sink: NativeTurnSink, item: Record<string, unknown>): void {
+    const id = typeof item.id === "string" ? item.id : undefined;
+    if (!id) return;
+    switch (item.type) {
+      case "imageGeneration": {
+        const turn = this.#turn;
+        if (
+          !turn ||
+          turn.finishing ||
+          turn.signal.aborted ||
+          turn.images.has(id)
+        )
+          return;
+        // Some versions only emit the completed item. The sink deduplicates starts by call id.
+        this.#itemStarted(sink, item);
+        const importing = (async () => {
+          try {
+            if (turn.readOnly)
+              throw new Error(
+                "Cannot import generated images during a planning turn",
+              );
+            if (item.status !== "completed" || item.failure)
+              throw new Error(
+                `Codex image generation failed (${String(item.status)})`,
+              );
+            const result = await importCodexImage(
+              item,
+              this.#threadId!,
+              this.context,
+            );
+            if (this.#turn === turn && !turn.signal.aborted)
+              sink.toolResult(id, result, false);
+          } catch (cause) {
+            if (this.#turn !== turn || turn.signal.aborted) return;
+            turn.imageError = `Codex image could not be delivered: ${cause instanceof Error ? cause.message : String(cause)}`;
+            sink.toolResult(id, textResult(turn.imageError), true);
+          }
+        })();
+        turn.images.set(id, importing);
+        return;
+      }
+      case "agentMessage":
+        sink.textDone(
+          id,
+          typeof item.text === "string" ? item.text : undefined,
+        );
+        return;
+      case "reasoning": {
+        const summary = Array.isArray(item.summary)
+          ? item.summary.filter((part) => typeof part === "string").join("\n\n")
+          : "";
+        sink.thinkingDone(id, summary || undefined);
+        return;
+      }
+      case "commandExecution":
+        sink.toolResult(
+          id,
+          textResult(
+            typeof item.aggregatedOutput === "string"
+              ? item.aggregatedOutput
+              : "",
+          ),
+          item.status === "failed" ||
+            (typeof item.exitCode === "number" && item.exitCode !== 0) ||
+            item.status === "declined",
+        );
+        return;
+      case "fileChange": {
+        const changes = Array.isArray(item.changes)
+          ? (item.changes as Array<Record<string, unknown>>)
+          : [];
+        sink.toolResult(
+          id,
+          textResult(
+            changes
+              .map(
+                (change) =>
+                  `${changeKind(change.kind)} ${String(change.path ?? "")}`,
+              )
+              .join("\n"),
+          ),
+          item.status === "failed" || item.status === "declined",
+        );
+        return;
+      }
+      case "dynamicToolCall": {
+        const stored = this.#turn?.bridged.take(id);
+        sink.toolResult(
+          id,
+          stored?.result ?? dynamicResult(item.contentItems),
+          stored ? stored.isError : item.success === false,
+        );
+        return;
+      }
+      case "mcpToolCall": {
+        const result = record(item.result);
+        sink.toolResult(
+          id,
+          item.error
+            ? textResult(String(record(item.error)?.message ?? item.error))
+            : textResult(result?.content),
+          Boolean(item.error) || item.status === "failed",
+        );
+        return;
+      }
+      case "webSearch":
+        sink.toolResult(
+          id,
+          textResult(
+            Array.isArray(item.results)
+              ? JSON.stringify(item.results).slice(0, 4_000)
+              : "",
+          ),
+          false,
+        );
+        return;
+      case "contextCompaction":
+        sink.compaction("end", {});
+        return;
+      default:
+        return;
+    }
+  }
+
+  #bridgeToolName(tool: unknown): string {
+    const name = String(tool ?? "");
+    // Existing native threads may still call the original unprefixed names.
+    return name.startsWith(TOOL_PREFIX) ? name.slice(TOOL_PREFIX.length) : name;
+  }
+
+  async #request(
+    method: string,
+    params: Record<string, unknown>,
+    requestId: string | number,
+  ): Promise<unknown> {
+    const turn = this.#turn;
+    await turn?.ready;
+    const matches = turn && !this.#disposed && this.#turn === turn && !turn.finishing &&
+      !turn.signal.aborted && typeof turn.turnId === "string" &&
+      params.threadId === this.#threadId && params.turnId === turn.turnId;
+    if (method === "item/tool/call") {
+      if (!matches) throw new Error("No matching turn is running");
+      const callId = String(params.callId ?? "");
+      const outcome = await this.context.bridge.call(
+        this.#bridgeToolName(params.tool),
+        params.arguments,
+        callId,
+        turn.signal,
+      );
+      if (this.#turn !== turn || turn.finishing || turn.signal.aborted)
+        throw new Error("The tool's turn ended");
+      turn.bridged.record(callId, outcome);
+      return {
+        contentItems: outcome.result.content.map((part) =>
+          part.type === "text"
+            ? { type: "inputText", text: part.text }
+            : {
+                type: "inputImage",
+                imageUrl: `data:${part.mimeType};base64,${part.data}`,
+              },
+        ),
+        success: !outcome.isError,
+      };
+    }
+    if (!matches)
+      return refusal(method);
+    const approval = codexApproval(method, params);
+    if (approval) {
+      // Planning never stops to ask: what Codex would ask about is not reading.
+      if (turn.readOnly) return refusal(method, PLANNING_DENIAL);
+      const decision = await turn.sink.requestApproval(approval, {
+        ...(typeof params.itemId === "string" ? { callId: params.itemId } : {}),
+        signal: turn.signal,
+      });
+      if (turn.signal.aborted || turn.finishing || this.#turn !== turn) return refusal(method);
+      return codexAnswer(method, params, decision);
+    }
+    if (method === "item/tool/requestUserInput") {
+      const input = nativeQuestions(params.questions, "codex");
+      input.blocking = params.isBlocking !== false;
+      const controller = new AbortController();
+      this.#inputRequests.set(requestId, controller);
+      try {
+        const result = await turn.sink.requestUserInput(input, {
+          callId: `codex:${requestId}`, signal: AbortSignal.any([turn.signal, controller.signal]),
+          // App action confirmations use this same protocol without a trusted discriminator.
+          allowAutomatic: false,
+        });
+        if (result.cancelled || controller.signal.aborted || turn.signal.aborted || this.#turn !== turn || turn.finishing) return { answers: {} };
+        return { answers: Object.fromEntries(result.answers.map((answer) => [answer.questionId, { answers: answer.values ?? [answer.value] }])) };
+      } finally {
+        if (this.#inputRequests.get(requestId) === controller) this.#inputRequests.delete(requestId);
+      }
+    }
+    if (method === "mcpServer/elicitation/request")
+      return { action: "decline" };
+    throw new Error(`Unsupported request ${method}`);
+  }
+}
+
+function expiredThread(cause: unknown): boolean {
+  return /thread (?:not found|.*does not exist)|no rollout found|failed to (?:load|find).*rollout|not found.*thread/i.test(String(cause));
+}
+
+function interruptTurn(server: CodexAppServer, threadId: string, turnId: string): Promise<void> {
+  return server.request("turn/interrupt", { threadId, turnId }, INTERRUPT_TIMEOUT_MS)
+    .then(() => {}, () => {});
+}
+
+/** Named Skills go as Codex's own Skill items; one that was not staged is asked for in words. */
+function codexInput(input: NativeTurnInput, skillsRoot?: string): Array<Record<string, unknown>> {
+  const skills = (input.skills ?? []).map((name) => {
+    const file = skillsRoot ? path.join(skillsRoot, name, "SKILL.md") : undefined;
+    return { name, ...(file && existsSync(file) ? { path: file } : {}) };
+  });
+  const unstaged = skills.filter((skill) => !skill.path).map((skill) => skill.name);
+  return [
+    { type: "text", text: unstaged.length ? `${skillInstruction(unstaged)}\n\n${input.text}` : input.text, text_elements: [] },
+    ...skills.flatMap((skill) => skill.path ? [{ type: "skill", name: skill.name, path: skill.path }] : []),
+    ...input.images.map((image) => ({
+      type: "image",
+      url: `data:${image.mimeType};base64,${image.data}`,
+    })),
+  ];
+}
+
+/** The command as the person would type it, without the login shell Codex wraps it in. */
+function commandText(value: unknown): string {
+  const text = Array.isArray(value)
+    ? value.map(String).join(" ")
+    : typeof value === "string"
+      ? value
+      : "";
+  const wrapped = text.match(/^\S*\/(?:ba|z)?sh -l?c (["'])([\s\S]*)\1$/);
+  return wrapped ? wrapped[2]! : text;
+}
+
+function changeKind(kind: unknown): string {
+  const type = record(kind)?.type;
+  return type === "add" ? "Added" : type === "delete" ? "Deleted" : "Updated";
+}
+
+function dynamicResult(items: unknown): NativeToolResult {
+  if (!Array.isArray(items)) return { content: [] };
+  return {
+    content: items.flatMap((item): NativeToolResult["content"] => {
+      const value = record(item);
+      if (value?.type === "inputText" && typeof value.text === "string")
+        return [{ type: "text", text: value.text }];
+      return [];
+    }),
+  };
+}
+
+function codexError(message: unknown): string {
+  if (typeof message !== "string") return "";
+  // Codex passes the model service's error body through as JSON text.
+  try {
+    const parsed = JSON.parse(message) as { error?: { message?: unknown } };
+    if (typeof parsed.error?.message === "string") return parsed.error.message;
+  } catch {
+    /* plain text */
+  }
+  return message;
+}
+
+const READ_PROFILE = ":read-only";
+
+const APPROVAL_METHODS = new Set([
+  "item/commandExecution/requestApproval",
+  "execCommandApproval",
+  "item/fileChange/requestApproval",
+  "applyPatchApproval",
+  "item/permissions/requestApproval",
+]);
+
+/** Keeps the person's Codex configuration, without a recursive connection to OhMyGame. */
+async function codexConfig(
+  server: CodexAppServer,
+  workspacePath: string,
+): Promise<Record<string, unknown>> {
+  try {
+    const read = await server.request<{ config?: Record<string, unknown> }>(
+      "config/read",
+      { cwd: workspacePath },
+    );
+    const config: Record<string, unknown> = {};
+    // Avoid recursively reconnecting to OhMyGame through the person's own MCP config.
+    if (record(record(read.config?.mcp_servers)?.[EXTERNAL_MCP_SERVER_NAME]))
+      config[`mcp_servers.${EXTERNAL_MCP_SERVER_NAME}.enabled`] = false;
+    // OpenAI returns reasoning only as summaries; without asking, Codex streams
+    // none and the timeline has nothing to show.
+    if (read.config?.model_reasoning_summary == null)
+      config.model_reasoning_summary = "concise";
+    return config;
+  } catch {
+    return {};
+  }
+}
+
+/** What Codex asks to be allowed, for the approval card; undefined for other requests. */
+export function codexApproval(
+  method: string,
+  params: Record<string, unknown>,
+): ApprovalRequestDetails | undefined {
+  if (!APPROVAL_METHODS.has(method)) return undefined;
+  const reason =
+    typeof params.reason === "string" && params.reason
+      ? { reason: params.reason }
+      : {};
+  if (
+    method === "item/commandExecution/requestApproval" ||
+    method === "execCommandApproval"
+  ) {
+    const amendment = Array.isArray(params.proposedExecpolicyAmendment)
+      ? params.proposedExecpolicyAmendment.map(String)
+      : [];
+    return {
+      kind: "command",
+      tool: "shell",
+      command: commandText(params.command),
+      ...reason,
+      ...(record(params.networkApprovalContext) ? { network: true } : {}),
+      always: amendment.length
+        ? { scope: "saved", rules: [amendment.join(" ")] }
+        : { scope: "session", rules: [] },
+    };
+  }
+  if (
+    method === "item/fileChange/requestApproval" ||
+    method === "applyPatchApproval"
+  ) {
+    const root =
+      typeof params.grantRoot === "string" ? params.grantRoot : undefined;
+    const files = Object.keys(record(params.fileChanges) ?? {});
+    return {
+      kind: "file",
+      tool: "apply_patch",
+      ...(root ? { path: root } : {}),
+      ...(!root && files.length
+        ? {
+            paths: files.map((file) => ({
+              path: file,
+              access: "write" as const,
+            })),
+          }
+        : {}),
+      ...reason,
+      always: { scope: "session", rules: root ? [root] : [] },
+    };
+  }
+  const permissions = record(params.permissions);
+  const files = record(permissions?.fileSystem);
+  const paths: NonNullable<ApprovalRequestDetails["paths"]> = [];
+  for (const access of ["read", "write"] as const)
+    for (const value of Array.isArray(files?.[access]) ? files[access] : [])
+      if (typeof value === "string") paths.push({ path: value, access });
+  for (const value of Array.isArray(files?.entries) ? files.entries : []) {
+    const entry = record(value);
+    const location = record(entry?.path);
+    if (
+      typeof location?.path === "string" &&
+      (entry?.access === "read" || entry?.access === "write")
+    )
+      paths.push({ path: location.path, access: entry.access });
+  }
+  return {
+    kind: "other",
+    tool: "permissions",
+    ...reason,
+    ...(paths.length
+      ? {
+          paths: [
+            ...new Map(
+              paths.map((entry) => [`${entry.access}:${entry.path}`, entry]),
+            ).values(),
+          ],
+        }
+      : {}),
+    ...(record(permissions?.network)?.enabled === true
+      ? { network: true }
+      : {}),
+    always: { scope: "session", rules: [] },
+  };
+}
+
+/** The person's answer in the form each Codex request expects. */
+export function codexAnswer(
+  method: string,
+  params: Record<string, unknown>,
+  decision: ApprovalDecision,
+): unknown {
+  if (decision === "deny") return refusal(method);
+  const always = decision === "allow-always";
+  switch (method) {
+    case "item/commandExecution/requestApproval": {
+      const amendment = params.proposedExecpolicyAmendment;
+      return {
+        decision: !always
+          ? "accept"
+          : Array.isArray(amendment) && amendment.length
+            ? {
+                acceptWithExecpolicyAmendment: {
+                  execpolicy_amendment: amendment,
+                },
+              }
+            : "acceptForSession",
+      };
+    }
+    case "execCommandApproval": {
+      const amendment = params.proposedExecpolicyAmendment;
+      return {
+        decision: !always
+          ? "approved"
+          : Array.isArray(amendment) && amendment.length
+            ? {
+                approved_execpolicy_amendment: {
+                  proposed_execpolicy_amendment: amendment,
+                },
+              }
+            : "approved_for_session",
+      };
+    }
+    case "item/fileChange/requestApproval":
+      return { decision: always ? "acceptForSession" : "accept" };
+    case "applyPatchApproval":
+      return { decision: always ? "approved_for_session" : "approved" };
+    default:
+      // A permission grant is what Codex asked for, for this turn or its session.
+      return {
+        permissions: record(params.permissions) ?? {},
+        scope: always ? "session" : "turn",
+      };
+  }
+}
+
+/** Declines a request in the form Codex expects for it. */
+function refusal(
+  method: string,
+  reason = "The person denied this request.",
+): unknown {
+  switch (method) {
+    case "item/permissions/requestApproval":
+      return { permissions: {}, scope: "turn" };
+    case "item/tool/requestUserInput":
+      return { answers: {} };
+    case "mcpServer/elicitation/request":
+      return { action: "decline", content: null };
+    case "execCommandApproval":
+    case "applyPatchApproval":
+      return { decision: { denied: { rejection: reason } } };
+    default:
+      return { decision: "decline" };
+  }
+}
+
+function codexUsage(usage: Record<string, unknown>): NativeUsage {
+  const cached = number(usage.cachedInputTokens);
+  return {
+    input: Math.max(0, number(usage.inputTokens) - cached),
+    output: number(usage.outputTokens),
+    cacheRead: cached,
+    cacheWrite: number(usage.cacheWriteInputTokens),
+  };
+}
+
+function grewFrom(before: NativeUsage, now: NativeUsage): boolean {
+  return (
+    now.input >= before.input &&
+    now.output >= before.output &&
+    now.cacheRead >= before.cacheRead &&
+    now.cacheWrite >= before.cacheWrite
+  );
+}

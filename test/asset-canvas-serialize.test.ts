@@ -1,0 +1,248 @@
+import { describe, expect, it } from "vitest";
+import { createAssetCanvasDocument, isAssetCanvasDocument, validateAssetCanvasDocument, withoutContentNodeSizes } from "../src/shared/asset-canvas.js";
+import { canvasHistoryKey, model3DViewLabels, toAssetCanvasNode } from "../src/renderer/asset-canvas-workspace.js";
+import type { Model3DModel } from "../src/shared/contracts.js";
+import { model3DModel } from "../src/shared/custom-models.js";
+import { MODEL_3D_PRESETS } from "../src/shared/model3d-presets.js";
+import { buildModel3DToolRequest, normalizeModel3DConfig } from "../src/shared/generation-config.js";
+import { MODEL3D_CONNECTION_ID } from "../src/shared/model3d-operations.js";
+
+describe("Asset Canvas node serialization", () => {
+  it("preserves background removal intent and rejects prompt or multi-image processing", () => {
+    const node = toAssetCanvasNode({ id: "cutout", type: "image", position: { x: 0, y: 0 }, data: { backgroundRemoval: true, prompt: "", images: [{ type: "library", assetId: "source" }], model: { provider: "plugin.fal", id: "cutout" } } });
+    const canvas = createAssetCanvasDocument();
+    canvas.nodes = [node]; canvas.editorLayout.nodes[node.id] = node.position;
+    expect(isAssetCanvasDocument(canvas)).toBe(true);
+    expect(node.data).toMatchObject({ backgroundRemoval: true, model: { provider: "plugin.fal", id: "cutout" } });
+    for (const patch of [{ prompt: "Redraw" }, { images: [{ type: "library", assetId: "a" }, { type: "library", assetId: "b" }] }, { presetId: "character-sheet" }, { sourceInput: true }, { effectBasePrompt: "Redraw" }, { generationMode: "all-actions" }]) {
+      const changed = structuredClone(canvas); Object.assign(changed.nodes[0]!.data, patch);
+      expect(() => validateAssetCanvasDocument(changed)).toThrow();
+    }
+  });
+
+  it("serializes explicit audio purposes and leaves old free-form nodes unchanged", () => {
+    for (const audioKind of [undefined, "speech", "sound-effect", "music"] as const) {
+      const canvas = createAssetCanvasDocument();
+      const node = toAssetCanvasNode({ id: "audio", type: "audio", position: { x: 0, y: 0 }, data: { prompt: "Keep mixed audio", audioKind, audioModel: { provider: "custom", id: "voice" } } });
+      canvas.nodes = [node];
+      canvas.editorLayout.nodes.audio = node.position;
+      validateAssetCanvasDocument(canvas);
+      expect(isAssetCanvasDocument(canvas)).toBe(true);
+      expect(node.data).toMatchObject({ prompt: "Keep mixed audio", model: { provider: "custom", id: "voice" } });
+      if (audioKind) expect(node.data).toHaveProperty("kind", audioKind);
+      else expect(node.data).not.toHaveProperty("kind");
+    }
+  });
+
+  it("round-trips pixel density groups while keeping legacy groups unchanged", () => {
+    const canvas = createAssetCanvasDocument();
+    const legacy = toAssetCanvasNode({ id: "legacy", type: "group", position: { x: 0, y: 0 }, width: 400, height: 300, data: { name: "Old assets" } });
+    const pixel = toAssetCanvasNode({ id: "pixel", type: "group", position: { x: 500, y: 0 }, width: 400, height: 300, data: { name: "Classic pixels", pixelStyle: "classic" } });
+    const image = toAssetCanvasNode({ id: "image", type: "image", position: { x: 500, y: 400 }, data: { prompt: "Snow tiles", presetId: "tileset", pixelStyle: "detailed" } });
+    canvas.nodes = [legacy, pixel, image];
+    canvas.editorLayout.nodes = {
+      legacy: { x: 0, y: 0, width: 400, height: 300 },
+      pixel: { x: 500, y: 0, width: 400, height: 300 },
+      image: { x: 500, y: 400 },
+    };
+    expect(legacy).toMatchObject({ type: "group", data: { name: "Old assets" } });
+    expect(legacy.data).not.toHaveProperty("pixelStyle");
+    expect(pixel).toMatchObject({ type: "group", data: { name: "Classic pixels", pixelStyle: "classic" } });
+    expect(image).toMatchObject({ type: "image", data: { pixelStyle: "detailed" } });
+    expect(isAssetCanvasDocument(canvas)).toBe(true);
+  });
+
+  it("omits inferred material styles for older daemons but preserves nondefault styles", () => {
+    for (const [presetId, materialStyle] of [["building", "pixel"], ["character-sheet", "general"], ["building", "general"]] as const) {
+      const node = toAssetCanvasNode({ id: materialStyle, type: "image", position: { x: 0, y: 0 }, data: { presetId, materialStyle, prompt: "Castle", resolution: "1K", aspectRatio: "1:1", images: [] } });
+      if (node.type !== "image") throw new Error("Expected an image node");
+      expect(node.data.presetId).toBe(presetId);
+      expect(node.data.materialStyle).toBe(presetId === "building" && materialStyle === "general" ? "general" : undefined);
+    }
+  });
+  it("keeps resize history and serialization while rejecting invalid node dimensions", () => {
+    const canvas = createAssetCanvasDocument();
+    const node = toAssetCanvasNode({ id: "notes", type: "text", position: { x: 0, y: 0 }, width: 600, height: 400, data: { text: "Notes" } });
+    canvas.nodes = [node]; canvas.editorLayout.nodes.notes = { x: 0, y: 0, width: 600, height: 400 };
+    expect(isAssetCanvasDocument(canvas)).toBe(true);
+    const resized = structuredClone(canvas); resized.nodes[0]!.width = 800;
+    expect(canvasHistoryKey(resized)).not.toBe(canvasHistoryKey(canvas));
+    resized.nodes[0]!.width = Infinity; expect(isAssetCanvasDocument(resized)).toBe(false);
+  });
+  it("rejects fixed sizes on nodes that size to their content", () => {
+    const canvas = createAssetCanvasDocument();
+    canvas.nodes = [{ id: "boat", type: "asset", position: { x: 0, y: 0 }, data: { assetId: "boat", mediaType: "image" } }];
+    canvas.editorLayout.nodes.boat = { x: 0, y: 0 };
+    expect(isAssetCanvasDocument(canvas)).toBe(true);
+    canvas.nodes[0]!.width = 330; canvas.editorLayout.nodes.boat = { x: 0, y: 0, width: 330 };
+    expect(isAssetCanvasDocument(canvas)).toBe(false);
+    expect(() => validateAssetCanvasDocument(canvas)).toThrow("Node boat: asset nodes size to their content");
+    canvas.nodes.push({ id: "notes", type: "text", position: { x: 0, y: 0 }, width: 600, height: 400, data: { text: "", instruction: "" } });
+    canvas.editorLayout.nodes.notes = { x: 0, y: 0, width: 600, height: 400 };
+    const restored = withoutContentNodeSizes(canvas);
+    expect(isAssetCanvasDocument(restored)).toBe(true);
+    expect(restored.editorLayout.nodes).toEqual({ boat: { x: 0, y: 0 }, notes: { x: 0, y: 0, width: 600, height: 400 } });
+    expect(restored.nodes[1]).toMatchObject({ width: 600, height: 400 });
+  });
+  it("uses protocol-specific reference labels rather than applying directions to every provider", () => {
+    expect(model3DViewLabels(model3DModel("hyper3d", "Hyper3D", MODEL_3D_PRESETS.hyper3d[0]!))).toEqual(["Reference 1", "Reference 2", "Reference 3", "Reference 4", "Reference 5"]);
+    expect(model3DViewLabels(model3DModel("tripo", "Tripo", MODEL_3D_PRESETS.tripo[0]!))).toEqual(["Front", "Left", "Back", "Right"]);
+    expect(model3DViewLabels(model3DModel("meshy", "Meshy", MODEL_3D_PRESETS.meshy[0]!))).toEqual(["Reference 1"]);
+  });
+  it("persists the same 3D parameters the current catalog displays", () => {
+    const model: Model3DModel = { provider: "custom-studio", providerName: "Studio", id: "props", name: "Props", maxReferenceImages: 1,
+      polycount: { min: 200, max: 2_000, default: 800, presets: [800] }, supportsTexture: false, supportsPbr: false };
+    const node = toAssetCanvasNode({ id: "3d", type: "model-3d", position: { x: 0, y: 0 }, data: {
+      model3DConfig: { model: { provider: model.provider, id: model.id }, targetPolycount: 4_000, texture: true, pbr: true }, images: [],
+    } }, [model]);
+    expect(node.data).toMatchObject({ model: { provider: model.provider, id: model.id }, targetPolycount: 800, texture: false, pbr: false });
+    const unavailable = toAssetCanvasNode({ id: "3d", type: "model-3d", position: { x: 0, y: 0 }, data: {
+      model3DConfig: { model: { provider: "disabled-studio", id: "props" }, targetPolycount: 4_000, texture: true, pbr: false }, images: [],
+    } }, [model]);
+    expect(unavailable.data).toMatchObject({ model: { provider: "disabled-studio", id: "props" }, targetPolycount: 4_000 });
+  });
+  it("records node changes in history independently of viewport movement and JSON key order", () => {
+    const canvas = createAssetCanvasDocument();
+    canvas.nodes = [{ id: "rules", type: "text", position: { x: 0, y: 0 }, data: { text: "Rules", instruction: "" } }];
+    const movedView = structuredClone(canvas); movedView.editorLayout.viewport = { x: 900, y: 600, zoom: 0.5 };
+    expect(canvasHistoryKey(movedView)).toBe(canvasHistoryKey(canvas));
+    movedView.nodes[0]!.data = { instruction: "", text: "Rules" };
+    expect(canvasHistoryKey(movedView)).toBe(canvasHistoryKey(canvas));
+    movedView.nodes[0]!.position.x = 200;
+    expect(canvasHistoryKey(movedView)).not.toBe(canvasHistoryKey(canvas));
+  });
+  it("stores only provider and id for a catalog text model", () => {
+    const catalogModel = { provider: "anthropic", id: "claude-3-haiku", name: "Claude 3 Haiku", providerName: "Anthropic", reasoningLevels: [] };
+    const node = toAssetCanvasNode({
+      id: "text-1",
+      type: "text",
+      position: { x: 0, y: 0 },
+      data: { text: "", instruction: "", textModel: catalogModel, reasoningLevel: "high" },
+    } as unknown as Parameters<typeof toAssetCanvasNode>[0]);
+    expect(node.data).toMatchObject({ model: { provider: "anthropic", id: "claude-3-haiku" } });
+    expect((node.data as { model: object }).model).toEqual({ provider: "anthropic", id: "claude-3-haiku" });
+    expect(node.data).toHaveProperty("reasoningLevel", "high");
+
+    const canvas = createAssetCanvasDocument();
+    canvas.nodes = [node];
+    canvas.editorLayout.nodes = { "text-1": { x: 0, y: 0 } };
+    expect(isAssetCanvasDocument(canvas)).toBe(true);
+    (node.data as { reasoningLevel: string }).reasoningLevel = "turbo";
+    expect(isAssetCanvasDocument(canvas)).toBe(false);
+  });
+  it.each(["text", "image", "video", "audio", "model-3d", "animate-3d", "asset", "document"] as const)("preserves %s node metadata without runtime fields", (type) => {
+    const node = toAssetCanvasNode({ id: "node", type, position: { x: 0, y: 0 }, title: "Player", description: "Main character", data: { documentId: "rules", assetId: "reference", text: "Rules", nodeDetails: { title: "Runtime name", label: "Runtime label", edit: () => {} } } });
+    expect(node).toMatchObject({ title: "Player", description: "Main character" });
+    expect(node.data).not.toHaveProperty("nodeDetails");
+  });
+  it("round-trips an audio node without runtime fields and accepts it as a saved board", () => {
+    const node = toAssetCanvasNode({ id: "narration", type: "audio", position: { x: 0, y: 0 }, data: {
+      prompt: "欢迎来到雾港。", promptSource: { type: "node", nodeId: "script" }, audioModel: { provider: "volcengine-tts", id: "seed-tts-2.0" },
+      voiceId: "zh_male_m191_uranus_bigtts", speed: 25, assetId: "audio-1", audioRuntime: { models: [], providers: [] },
+    } as unknown as Parameters<typeof toAssetCanvasNode>[0]["data"] });
+    expect(node.type).toBe("audio");
+    expect(node.data).toEqual({ prompt: "欢迎来到雾港。", promptSource: { type: "node", nodeId: "script" }, model: { provider: "volcengine-tts", id: "seed-tts-2.0" }, voiceId: "zh_male_m191_uranus_bigtts", speed: 25, assetId: "audio-1" });
+    const canvas = createAssetCanvasDocument();
+    canvas.nodes = [
+      node,
+      { id: "script", type: "text", position: { x: 0, y: 200 }, data: { text: "欢迎来到雾港。", instruction: "" } },
+    ];
+    canvas.editorLayout.nodes = { narration: { x: 0, y: 0 }, script: { x: 0, y: 200 } };
+    expect(isAssetCanvasDocument(canvas)).toBe(true);
+    if (canvas.nodes[0]!.type !== "audio") throw new Error("Expected audio node");
+    canvas.nodes[0]!.data.speed = 200;
+    expect(isAssetCanvasDocument(canvas)).toBe(false);
+  });
+  it("round-trips an audio node's length, loop and instrumental settings", () => {
+    const data = { prompt: "Quiet harbor theme", instrumental: false, durationSeconds: 60, loop: true, assetId: "music-1" };
+    const node = toAssetCanvasNode({ id: "music", type: "audio", position: { x: 10, y: 20 }, data: { ...data, audioModel: { provider: "audio-provider", id: "audio-model" } } });
+    expect(node).toMatchObject({ type: "audio", data: { ...data, model: { provider: "audio-provider", id: "audio-model" } } });
+    const board = createAssetCanvasDocument();
+    board.nodes = [node];
+    board.editorLayout.nodes = { music: { x: 10, y: 20 } };
+    expect(isAssetCanvasDocument(board)).toBe(true);
+  });
+  it("connects text and document nodes to an audio node as its prompt source", async () => {
+    const { connectionRelation } = await import("../src/renderer/asset-canvas-workspace.js");
+    const text = { id: "script", type: "text", position: { x: 0, y: 0 }, data: { text: "Welcome", instruction: "" } } as Parameters<typeof connectionRelation>[0];
+    const target = { id: "audio", type: "audio", position: { x: 200, y: 0 }, data: { prompt: "" } } as Parameters<typeof connectionRelation>[1];
+    expect(connectionRelation(text, target, undefined, [], [], [])).toBe("prompt");
+    target.data.promptSource = { type: "node", nodeId: "script" };
+    expect(connectionRelation(text, target, undefined, [], [], [])).toBeUndefined();
+    const image = { id: "art", type: "image", position: { x: 0, y: 100 }, data: { prompt: "", resolution: "1K", aspectRatio: "1:1", images: [] } } as Parameters<typeof connectionRelation>[0];
+    expect(connectionRelation(image, target, undefined, [], [], [])).toBeUndefined();
+  });
+});
+
+describe("3D processing node serialization", () => {
+  it("uses plugin processing limits when loaded and preserves an unresolved saved selection", () => {
+    const model: Model3DModel = { provider: "plugin.acme.flow.flow", id: "connection", name: "Flow", providerName: "Flow", protocol: "meshy", maxReferenceImages: 1,
+      polycount: { min: 100, max: 50000, default: 10000, presets: [10000] },
+      remeshPolycount: { min: 100, max: 20000, default: 4000, presets: [4000, 20000] } };
+    expect(normalizeModel3DConfig({ model, targetPolycount: 30000 }, model, "remesh").targetPolycount).toBe(4000);
+    expect(normalizeModel3DConfig({ model, targetPolycount: 20000 }, model, "remesh").targetPolycount).toBe(20000);
+    const saved = { model: { provider: model.provider, id: model.id }, targetPolycount: 1800000 };
+    expect(normalizeModel3DConfig(saved, undefined, "remesh").targetPolycount).toBe(1800000);
+    expect(buildModel3DToolRequest(saved, [], "remesh").targetPolycount).toBe(1800000);
+  });
+  it.each(["meshy", "tripo"])("uses %s remesh limits for a native connection saved without runtime catalog data", (provider) => {
+    const node = toAssetCanvasNode({ id: "remesh", type: "model-3d", position: { x: 0, y: 0 }, data: {
+      model3DOperation: "remesh", model3DSource: { type: "library", assetId: "source" }, images: [],
+      model3DConfig: { model: { provider, id: MODEL3D_CONNECTION_ID }, targetPolycount: 500_000, texture: true, pbr: false },
+    } });
+    if (node.type !== "model-3d") throw new Error("Expected model node");
+    expect(node.data.targetPolycount).toBe(provider === "meshy" ? 30_000 : 4_000);
+    expect(buildModel3DToolRequest(node.data, [], node.data.operation).targetPolycount).toBe(node.data.targetPolycount);
+  });
+  it("keeps remesh face counts above the geometry model's generation limit in saved requests", () => {
+    const node = toAssetCanvasNode({ id: "remesh", type: "model-3d", position: { x: 0, y: 0 }, data: {
+      model3DOperation: "remesh", model3DSource: { type: "library", assetId: "source" }, images: [],
+      model3DConfig: { model: { provider: "meshy", id: "meshy-t2" }, targetPolycount: 300_000, texture: true, pbr: false },
+    } });
+    if (node.type !== "model-3d") throw new Error("Expected model node");
+    const saved = JSON.parse(JSON.stringify(node.data));
+    expect(saved.targetPolycount).toBe(300_000);
+    expect(buildModel3DToolRequest(saved, [], saved.operation).targetPolycount).toBe(300_000);
+  });
+  it("keeps source, prompt links and operation versions in history and clipboard", async () => {
+    const { createCanvasClipboard, duplicateCanvasSelection, parseCanvasClipboard } = await import("../src/renderer/asset-canvas-clipboard.js");
+    const source = toAssetCanvasNode({ id: "source", type: "model-3d", position: { x: 0, y: 0 }, data: { images: [] } });
+    const text = toAssetCanvasNode({ id: "style", type: "text", position: { x: 0, y: 200 }, data: { text: "Gold" } });
+    const node = toAssetCanvasNode({ id: "texture", type: "model-3d", position: { x: 300, y: 0 }, data: {
+      model3DConfig: { model: { provider: "tripo", id: "P1-20260311" }, targetPolycount: 4000, texture: true, pbr: true },
+      model3DOperation: "retexture", model3DSource: { type: "node", nodeId: "source" }, prompt: "Worn metal", promptSource: { type: "node", nodeId: "style" },
+      model3DOptions: { textureModel: "v3.5-20260815", textureQuality: "detailed" }, images: [],
+    } });
+    expect(node.data).toMatchObject({ operation: "retexture", source: { nodeId: "source" }, promptSource: { nodeId: "style" }, options: { textureModel: "v3.5-20260815" } });
+    const value = createCanvasClipboard("project", [source, text, node], []);
+    expect(parseCanvasClipboard(JSON.stringify(value))).toBeDefined();
+    let next = 0;
+    const copy = duplicateCanvasSelection(value.nodes, [], { x: 500, y: 0 }, () => `copy-${++next}`);
+    expect(copy.nodes[2]!.data).toMatchObject({ source: { nodeId: "copy-1" }, promptSource: { nodeId: "copy-2" }, operation: "retexture" });
+  });
+  it.each(["v2.5-20260210", "v3.0-20260909"] as const)("keeps Tripo %s rig options without changing legacy Meshy nodes", (rigModel) => {
+    const node = toAssetCanvasNode({ id: "animation", type: "animate-3d", position: { x: 0, y: 0 }, data: {
+      images: [{ type: "library", assetId: "character" }], animationModel: { provider: "tripo", id: "P1-20260311" },
+      actionIds: ["preset:quadruped:walk"], model3DOptions: { rigModel, rigType: "quadruped", animateInPlace: true },
+    } });
+    const canvas = createAssetCanvasDocument(); canvas.nodes = [node]; canvas.editorLayout.nodes = { animation: node.position };
+    expect(isAssetCanvasDocument(canvas)).toBe(true);
+    expect(node.data).toMatchObject({ model: { provider: "tripo" }, actionIds: ["preset:quadruped:walk"], options: { rigModel } });
+    const legacy = toAssetCanvasNode({ id: "legacy", type: "animate-3d", position: { x: 0, y: 0 }, data: { actionIds: [0, 30] } });
+    expect(legacy.data).not.toHaveProperty("model"); expect(legacy.data).toMatchObject({ actionIds: [0, 30] });
+  });
+  it("removes processing model connections when the source node is deleted", async () => {
+    const { removeNodesAndReferences } = await import("../src/renderer/asset-canvas-workspace.js");
+    const result = removeNodesAndReferences([{ id: "texture", type: "model-3d", position: { x: 0, y: 0 }, data: { model3DSource: { type: "node", nodeId: "source" }, model3DOperation: "retexture" } }], new Set(["source"]));
+    expect(result[0]!.data.model3DSource).toBeUndefined();
+  });
+});
+
+it("serializes all audio settings without runtime state", () => {
+  const settings = { voiceId: "S_character", voiceKind: "cloned" as const, pitch: -4, volume: 20, speed: 10, language: "en", style: "warm", output: { format: "wav" as const, sampleRate: 48000 as const } };
+  const node = toAssetCanvasNode({ id: "scene", type: "audio", position: { x: 10, y: 20 }, data: { ...settings, audioModel: { provider: "volcengine-tts", id: "seed-audio-1.0" }, prompt: "Use @Audio8", audioAsset: { metadata: { durationMs: 1000 } } } });
+  expect(node.data).toMatchObject({ ...settings, prompt: "Use @Audio8", model: { provider: "volcengine-tts", id: "seed-audio-1.0" } });
+  expect(node.data).not.toHaveProperty("audioAsset");
+  const canvas = createAssetCanvasDocument(); canvas.nodes = [node]; canvas.editorLayout.nodes.scene = { x: 10, y: 20 };
+  expect(isAssetCanvasDocument(canvas)).toBe(true);
+});

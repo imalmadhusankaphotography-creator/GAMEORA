@@ -1,0 +1,101 @@
+appId: com.imalmadhusanka.gameora
+productName: GAMEORA
+copyright: "Copyright © 2026 Imal Madhusanka. Based on OhMyGame by WhiteTowerAI (Apache-2.0)."
+asar: true
+beforePack: scripts/prepare-desktop-typebox.mjs
+afterPack: scripts/check-packaged-desktop.mjs
+asarUnpack:
+  - node_modules/esbuild/**/*
+  - node_modules/@esbuild/**/*
+  - node_modules/ffmpeg-static/**/*
+  # sharp loads libvips from beside its native module, which cannot run from the ASAR.
+  - node_modules/sharp/**/*
+  - node_modules/@img/**/*
+
+directories:
+  output: release
+
+releaseInfo:
+  releaseNotesFile: .runtime/release-notes.md
+
+files:
+  - dist/desktop/**/*.js
+  - dist/desktop/**/*.cjs
+  - dist/daemon/**/*.js
+  - dist/daemon/assets/story-templates/**/*
+  - dist/daemon/assets/scene-templates/*.webp
+  - dist/daemon/assets/scene-templates/NOTICE.txt
+  - dist/daemon/assets/scene-templates/LICENSE.txt
+  - dist/shared/**/*.js
+  - dist/story-web/resources.json
+  - dist/multiplayer-sdk/resources.json
+  - dist/renderer/**/*
+  # Renderer source maps go to Sentry, not into the package, even if their upload failed.
+  - "!dist/renderer/**/*.map"
+  - "!node_modules/typebox/build/**/*.mjs"
+  # recheck falls back without its Java backend, which cannot run from the ASAR.
+  - "!node_modules/recheck-jar/**"
+  # The app never opens rooms itself: games get the browser SDK from
+  # dist/multiplayer-sdk/resources.json. PostgreSQL is only for the hosted game service.
+  - "!node_modules/@colyseus/sdk/**"
+  - "!node_modules/pg/**"
+  - "!node_modules/pg-*/**"
+  - "!node_modules/pgpass/**"
+  - "!node_modules/postgres-*/**"
+  - from: .runtime/typebox
+    to: node_modules/typebox/build
+
+extraResources:
+  - from: packages/plugin-ui
+    to: plugin-ui
+  - from: integrations/skills
+    to: integrations/skills
+  - from: .runtime/preinstalled-plugins
+    to: preinstalled-plugins
+  - from: .runtime/examples
+    to: examples
+  # Match from the parent so electron-builder retains Node's root node_modules.
+  - from: .runtime
+    to: runtime
+    filter:
+      - node/**/*
+  - from: .runtime/desktop-config.json
+    to: desktop-config.json
+
+mac:
+  icon: build/icon.icns
+  category: public.app-category.developer-tools
+  hardenedRuntime: true
+  notarize: true
+  target:
+    - dmg
+    - zip
+
+win:
+  icon: build/icon.ico
+  target:
+    - nsis
+  artifactName: GAMEORA-Setup-${version}.${ext}
+
+nsis:
+  include: build/installer.nsh
+  # The installer follows the app's UI languages; other systems get English.
+  installerLanguages:
+    - en_US
+    - zh_CN
+  shortcutName: GAMEORA
+  createDesktopShortcut: always
+  deleteAppDataOnUninstall: false
+  # Show the setup wizard so users can choose the install scope and location.
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+
+# GAMEORA updates itself from the GitHub Releases of its own repo.
+publish:
+  provider: github
+  owner: imalmadhusankaphotography-creator
+  repo: GAMEORA
+  releaseType: release
+
+dmg:
+  artifactName: OhMyGame-${version}-${arch}.${ext}

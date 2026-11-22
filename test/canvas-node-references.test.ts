@@ -1,0 +1,145 @@
+import { describe, expect, it } from "vitest";
+import type { AssetCanvasNode } from "../src/shared/contracts.js";
+import { createAssetCanvasDocument, isAssetCanvasDocument } from "../src/shared/asset-canvas.js";
+import { MAX_TEXT_NODE_REFERENCES } from "../src/shared/asset-canvas-schema.js";
+import { connectCanvasNodes, disconnectCanvasReference, connectionRelation, removeNodesAndReferences, toAssetCanvasNode } from "../src/renderer/asset-canvas-workspace.js";
+import { createCanvasClipboard, duplicateCanvasSelection, parseCanvasClipboard } from "../src/renderer/asset-canvas-clipboard.js";
+import { canvasChainRuns } from "../src/shared/canvas-chains.js";
+import { mergeCanvasDocument } from "../src/shared/canvas-workspace.js";
+import { imageModelsForProvider } from "../src/daemon/image-models.js";
+
+const position = { x: 0, y: 0 };
+const ref = (nodeId: string) => ({ type: "node" as const, nodeId });
+const source: AssetCanvasNode = { id: "brief", type: "text", position, data: { text: "A forest adventure", instruction: "" } };
+const document: AssetCanvasNode = { id: "document", type: "document", position, data: { documentId: "rules", references: [ref(source.id)] } };
+const image: AssetCanvasNode = { id: "image", type: "image", position, data: { prompt: "forest", resolution: "1K", aspectRatio: "1:1", images: [] } };
+const text: AssetCanvasNode = { id: "text", type: "text", position, data: { text: "", instruction: "Summarize", references: [ref(source.id), ref(document.id), ref(image.id)] } };
+function canvas(nodes: AssetCanvasNode[]) {
+  const canvas = createAssetCanvasDocument();
+  canvas.nodes = nodes;
+  canvas.editorLayout.nodes = Object.fromEntries(nodes.map((node) => [node.id, node.position]));
+  return canvas;
+}
+
+describe("Text and Document node references", () => {
+  it("saves multiple reference kinds and still accepts nodes without references", () => {
+    expect(isAssetCanvasDocument(canvas([source, document, image, text]))).toBe(true);
+    expect(isAssetCanvasDocument(canvas([source]))).toBe(true);
+    for (const node of [text, document]) {
+      const serialized = toAssetCanvasNode({ ...node, data: { ...node.data, textRuntime: undefined, documentRuntime: undefined } });
+      expect(serialized).toEqual(node);
+    }
+  });
+
+  it.each(["text", "document"] as const)("connects valid sources to %s with duplicate, self and capacity checks", (type) => {
+    const target = type === "text" ? { ...text, data: { ...text.data, references: [] } } : { ...document, data: { ...document.data, references: [] } };
+    for (const candidate of [source, image, { ...document, id: "other-doc", data: { documentId: "other" } }]) {
+      expect(connectionRelation(candidate, target, "out", [], [], [])).toBe("text-reference");
+    }
+    expect(connectionRelation(target, target, "out", [], [], [])).toBeUndefined();
+    expect(connectionRelation(source, { ...target, data: { ...target.data, references: [ref(source.id)] } }, "out", [], [], [])).toBeUndefined();
+    expect(connectionRelation(source, { ...target, data: { ...target.data, references: Array.from({ length: MAX_TEXT_NODE_REFERENCES }, (_, i) => ref(`ref-${i}`)) } }, "out", [], [], [])).toBeUndefined();
+    expect(connectionRelation({ id: "video", type: "asset", position, data: { assetId: "movie", mediaType: "video" } }, target, "out", [], [], [])).toBeUndefined();
+    if (type === "document") expect(connectionRelation({ ...document, id: "alias" }, target, "out", [], [], [])).toBeUndefined();
+  });
+
+  it.each(["missing", "self", "same-document", "audio", "duplicate", "over-limit"])("rejects %s references in persisted boards", (invalid) => {
+    const nodes: AssetCanvasNode[] = structuredClone([source, document, image, text]);
+    const target = nodes[1]! as Extract<AssetCanvasNode, { type: "document" }>;
+    if (invalid === "missing") target.data.references = [ref("missing")];
+    if (invalid === "self") target.data.references = [ref(target.id)];
+    if (invalid === "same-document") { nodes.push({ ...document, id: "alias" }); target.data.references = [ref("alias")]; }
+    if (invalid === "audio") { nodes.push({ id: "audio", type: "asset", position, data: { assetId: "audio", mediaType: "audio" } }); target.data.references = [ref("audio")]; }
+    if (invalid === "duplicate") target.data.references = [ref(source.id), ref(source.id)];
+    if (invalid === "over-limit") {
+      target.data.references = Array.from({ length: MAX_TEXT_NODE_REFERENCES + 1 }, (_, i) => ref(`extra-${i}`));
+      nodes.push(...target.data.references.map((reference): AssetCanvasNode => ({ ...source, id: reference.nodeId })));
+    }
+    expect(isAssetCanvasDocument(canvas(nodes))).toBe(false);
+  });
+
+  it("removes deleted sources from both text and document references and from merged remote edits", () => {
+    const nodes = [source, document, image, text];
+    const flow = removeNodesAndReferences(nodes, new Set([source.id]));
+    expect(flow.find((node) => node.id === document.id)?.data.references).toEqual([]);
+    expect(flow.find((node) => node.id === text.id)?.data.references).toEqual([ref(document.id), ref(image.id)]);
+    const base = canvas(nodes), local = structuredClone(base), remote = structuredClone(base);
+    remote.nodes = remote.nodes.filter((node) => node.id !== source.id);
+    const merged = mergeCanvasDocument(base, local, remote)!;
+    expect(merged.nodes.find((node) => node.id === document.id)?.data).toMatchObject({ references: [] });
+    expect(isAssetCanvasDocument(merged)).toBe(true);
+  });
+
+  it("copies internal references and drops links outside the selection", () => {
+    const copied = createCanvasClipboard("project", [source, document, text], []);
+    expect(parseCanvasClipboard(JSON.stringify(copied))).toEqual(copied);
+    let id = 0;
+    const result = duplicateCanvasSelection(copied.nodes, copied.edges, position, () => `copy-${++id}`);
+    expect(result.nodes[1]!.data).toMatchObject({ references: [ref("copy-1")] });
+    expect(result.nodes[2]!.data).toMatchObject({ references: [ref("copy-1"), ref("copy-2")] });
+    expect(isAssetCanvasDocument(canvas(result.nodes))).toBe(true);
+  });
+});
+
+describe("Image node reference capacity", () => {
+  it.each([[15, 16, true], [16, 16, false], [1, 2, true], [2, 2, false], [0, 0, false], [16, 20, false]] as const)(
+    "validates %i existing references against a model limit of %i",
+    (count, limit, accepted) => {
+      const models = imageModelsForProvider("relay", "Relay", ["gpt-image-2"]);
+      models[0] = { ...models[0]!, maxReferenceImages: limit, supportsReferenceImage: limit > 0 };
+      const target = { ...image, data: { ...image.data, model: { provider: "relay", id: "gpt-image-2" },
+        images: Array.from({ length: count }, (_, index) => ({ type: "library" as const, assetId: `reference-${index}` })),
+      } };
+      const candidate = { ...image, id: "new-reference" };
+      expect(connectionRelation(candidate, target, "out", [], [], models)).toBe(accepted ? "image-reference" : undefined);
+    },
+  );
+});
+
+it("counts the generations a chain can run, leaving out what makes nothing", () => {
+  const later: AssetCanvasNode = { ...image, id: "later", data: { ...image.data, images: [ref(image.id)] } };
+  const nodes = [source, { ...image, data: { ...image.data, images: [ref(source.id)] } }, later];
+  expect(canvasChainRuns(nodes, image.id)).toBe(2);
+  expect(canvasChainRuns(nodes, source.id)).toBe(2);
+  expect(canvasChainRuns(nodes, later.id)).toBe(1);
+  expect(canvasChainRuns(nodes, "gone")).toBe(0);
+});
+
+it("disconnects only the chosen semantic reference and preserves library inputs and unrelated links", () => {
+  const distinct = { ...image, id: "target", data: { ...image.data, images: [{ type: "library" as const, assetId: "kept" }], promptSource: ref(source.id) } };
+  const next = connectCanvasNodes([source, image, distinct], image.id, distinct.id, "image-reference");
+  expect(next[2]!.data.images).toEqual([{ type: "library", assetId: "kept" }, ref(image.id)]);
+  const removed = disconnectCanvasReference(next, distinct.id, image.id, "media-image");
+  expect(removed[2]!.data.images).toEqual([{ type: "library", assetId: "kept" }]);
+  expect(removed[2]!.data.promptSource).toEqual(ref(source.id));
+  expect(removed[1]).toBe(image);
+  const promptRemoved = disconnectCanvasReference(removed, distinct.id, source.id, "media-prompt");
+  expect(promptRemoved[2]!.data.promptSource).toBeUndefined();
+  expect(promptRemoved[2]!.data.images).toEqual([{ type: "library", assetId: "kept" }]);
+});
+
+it("connects plugin node inputs by port and media, and keeps them through save, removal and disconnection", () => {
+  const definition = {
+    id: "acme/frames:blend", plugin: "acme/frames", pluginName: "Frames", title: "Blend", params: [], output: "image" as const,
+    inputs: [{ id: "base", title: "Base", accepts: "image" as const }, { id: "layers", title: "Layers", accepts: "image" as const, multiple: true }, { id: "note", title: "Note", accepts: "text" as const, optional: true }],
+  };
+  const plugin = { id: "blend", type: "plugin" as const, position, data: { node: definition.id, params: { strength: 2 }, inputs: {} as Record<string, Array<ReturnType<typeof ref>>> } };
+  // Without its plugin a node takes nothing; with it, a drop fills the port it lands on, else the first that fits.
+  expect(connectionRelation(image, plugin, "out", [], [], [])).toBeUndefined();
+  expect(connectionRelation(image, plugin, "out", [], [], [], [], [], [definition])).toBe("plugin-input:base");
+  expect(connectionRelation(image, plugin, "out", [], [], [], [], [], [definition], "layers")).toBe("plugin-input:layers");
+  expect(connectionRelation(image, plugin, "out", [], [], [], [], [], [definition], "note")).toBeUndefined();
+  expect(connectionRelation(source, plugin, "out", [], [], [], [], [], [definition])).toBe("plugin-input:note");
+  let flow = connectCanvasNodes([source, image, plugin], image.id, plugin.id, "plugin-input:base");
+  const connected = flow[2]!;
+  // A single input that is full passes the next image to the multiple one; the same source isn't added twice.
+  expect(connectionRelation({ ...image, id: "other" }, connected, "out", [], [], [], [], [], [definition])).toBe("plugin-input:layers");
+  expect(connectionRelation(image, connected, "out", [], [], [], [], [], [definition], "base")).toBeUndefined();
+  expect(toAssetCanvasNode(connected)).toEqual({ ...plugin, data: { ...plugin.data, inputs: { base: [ref(image.id)] } } });
+  expect(isAssetCanvasDocument(canvas([source, image, toAssetCanvasNode(connected)]))).toBe(true);
+  flow = connectCanvasNodes(flow, source.id, plugin.id, "plugin-input:note");
+  expect(removeNodesAndReferences(flow, new Set([image.id])).find((node) => node.id === plugin.id)!.data.inputs).toEqual({ base: [], note: [ref(source.id)] });
+  expect(disconnectCanvasReference(flow, plugin.id, source.id, "plugin-input:note")[2]!.data.inputs).toEqual({ base: [ref(image.id)], note: [] });
+  // After an update drops the note input, the next connection drops what the node kept for it.
+  expect(connectCanvasNodes(flow, image.id, plugin.id, "plugin-input:layers", ["base", "layers"])[2]!.data.inputs).toEqual({ base: [ref(image.id)], layers: [ref(image.id)] });
+});

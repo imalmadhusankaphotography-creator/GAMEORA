@@ -1,0 +1,1347 @@
+import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { describe, expect, it, vi } from "vitest";
+import { AgentManager, conversationItems } from "../src/daemon/agent.js";
+import { projectPiToolNames } from "../src/daemon/agent-tools.js";
+import { CHECKPOINT_ENTRY } from "../src/daemon/checkpoint-extension.js";
+import type { StoredConversation } from "../src/daemon/conversations.js";
+import {
+  NATIVE_SESSION_ENTRY,
+  NATIVE_USAGE_ENTRY,
+  NativeCodingSession,
+  NativeSessionExpiredError,
+  latestNativeSession,
+  type NativeDriver,
+  type NativeTurnInput,
+  type NativeTurnOutcome,
+  type NativeTurnSink,
+} from "../src/daemon/agent-runtimes/native-session.js";
+import { handoffSummary } from "../src/daemon/agent-runtimes/handoff.js";
+import type {
+  AgentUsageLimit,
+  ProjectState,
+  RuntimeEvent,
+  ThreadItem,
+} from "../src/shared/contracts.js";
+import { RuntimeEventBus } from "../src/shared/events.js";
+
+type Script = (
+  input: NativeTurnInput,
+  sink: NativeTurnSink,
+  signal: AbortSignal,
+) => Promise<NativeTurnOutcome>;
+
+/** A protocol adapter that plays a script for each turn and records what it was given. */
+class ScriptedDriver implements NativeDriver {
+  readonly inputs: NativeTurnInput[] = [];
+  disposed = false;
+  constructor(
+    private readonly scripts: Script[],
+    readonly resume: string | undefined,
+  ) {}
+  async runTurn(
+    input: NativeTurnInput,
+    sink: NativeTurnSink,
+    signal: AbortSignal,
+  ): Promise<NativeTurnOutcome> {
+    this.inputs.push(input);
+    const script = this.scripts.shift();
+    if (!script) return { status: "completed" };
+    return script(input, sink, signal);
+  }
+  async interrupt(): Promise<void> {}
+  compactions = 0;
+  async compact(sink: NativeTurnSink): Promise<void> {
+    this.compactions++;
+    sink.compaction("start");
+    sink.compaction("end", { summary: "compacted" });
+  }
+  slowDispose?: () => Promise<void>;
+  dispose(): void | Promise<void> {
+    this.disposed = true;
+    return this.slowDispose?.();
+  }
+}
+
+function setup(
+  scripts: Script[],
+  options: {
+    snapshot?: () => Promise<string>;
+    sessionManager?: SessionManager;
+    accountLimits?: () => AgentUsageLimit[];
+    beforeCreate?: () => Promise<void>;
+  } = {},
+) {
+  const events = new RuntimeEventBus();
+  const project: ProjectState = {
+    id: "project-1",
+    name: "Project",
+    type: "general",
+    updatedAt: new Date(0).toISOString(),
+    workspacePath: "/tmp/project-1",
+    preview: { status: "waiting" },
+  };
+  const conversation: StoredConversation = {
+    sessionPath: "/tmp/conversation-1.jsonl",
+    summary: {
+      id: "conversation-1",
+      projectId: project.id,
+      title: "Conversation",
+      createdAt: new Date(0).toISOString(),
+      updatedAt: new Date(0).toISOString(),
+      messageCount: 0,
+    },
+  };
+  const sessionManager =
+    options.sessionManager ?? SessionManager.inMemory("/tmp/project-1");
+  const drivers: ScriptedDriver[] = [];
+  let manager!: AgentManager;
+  const createSession = async () => {
+    await options.beforeCreate?.();
+    return new NativeCodingSession({
+      runtime: "claude-code-cli",
+      model: "sonnet",
+      sessionManager,
+      createDriver: (resume) => {
+        const driver = new ScriptedDriver(scripts, resume);
+        drivers.push(driver);
+        return driver;
+      },
+      ...(options.snapshot ? { snapshotBeforeMessage: options.snapshot } : {}),
+      ...(options.accountLimits
+        ? { accountLimits: options.accountLimits }
+        : {}),
+      requestUserInput: async () => { throw new Error("Unexpected user input request"); }, requestApproval: (details, toolCallId, signal) =>
+        manager.askApproval(
+          project.id,
+          conversation.summary.id,
+          toolCallId,
+          details,
+          signal,
+        ),
+      toolNames: ["canvas_check"],
+    });
+  };
+  manager = new AgentManager(events, {
+    createSession,
+    activeToolNames: (_project, mode, session) =>
+      projectPiToolNames(
+        mode,
+        [],
+        session.getAllTools?.().map((tool) => tool.name),
+      ),
+    ...(options.snapshot
+      ? {
+          checkpoints: {
+            snapshot: options.snapshot,
+            changed: async () => ({ files: 0, items: [] }),
+          },
+        }
+      : {}),
+  });
+  const received: RuntimeEvent[] = [];
+  events.subscribe(project.id, (event) => received.push(event));
+  return { manager, project, conversation, sessionManager, drivers, received };
+}
+
+function items(sessionManager: SessionManager): ThreadItem[] {
+  return conversationItems(sessionManager.getBranch(), false);
+}
+
+describe("coding agent sessions", () => {
+  it.each(
+    (["codex-cli", "claude-code-cli"] as const).flatMap((runtime) =>
+      [34, 0, undefined].map((tokensPerSecond) => ({ runtime, tokensPerSecond })),
+    ),
+  )(
+    "persists final turn figures only for Codex ($runtime, $tokensPerSecond tok/s)",
+    async ({ runtime, tokensPerSecond }) => {
+      const sessionManager = SessionManager.inMemory("/tmp/project-figures");
+      const session = new NativeCodingSession({
+        runtime,
+        model: "test-model",
+        sessionManager,
+        toolNames: [],
+        requestUserInput: async () => { throw new Error("Unexpected user input request"); },
+        requestApproval: async () => "deny",
+        createDriver: () => new ScriptedDriver([
+          async (_input, sink) => {
+            sink.text("answer", "Done");
+            const usage = { input: 100, output: 20, cacheRead: 900, cacheWrite: 0 };
+            sink.usage(usage, 10_000, 1_020);
+            sink.usage(usage, 10_000, 1_020, { tokensPerSecond, cacheHitPercent: 67 });
+            return { status: "completed" };
+          },
+        ], undefined),
+      });
+      try {
+        await session.prompt("Work");
+        const entry = sessionManager.getBranch().findLast(
+          (item) => item.type === "message" && item.message.role === "assistant",
+        );
+        expect(entry).toMatchObject({
+          message: { provider: runtime, usage: { input: 100, output: 20, cacheRead: 900 } },
+        });
+        if (entry?.type !== "message") throw new Error("Expected an assistant message");
+        if (runtime === "codex-cli") {
+          expect(entry.message).toMatchObject({ cacheHitPercent: 67 });
+          if (tokensPerSecond !== undefined)
+            expect(entry.message).toHaveProperty("responseTokensPerSecond", tokensPerSecond);
+          else
+            expect(entry.message).not.toHaveProperty("responseTokensPerSecond");
+        } else {
+          expect(entry.message).not.toHaveProperty("responseTokensPerSecond");
+          expect(entry.message).not.toHaveProperty("cacheHitPercent");
+        }
+      } finally {
+        await session.dispose();
+      }
+    },
+  );
+
+  it.each(["", "Done"] as const)("keeps a recovered retry out of history (final text: %j)", async (text) => {
+    const { manager, project, conversation, received, sessionManager } = setup([
+      async (_input, sink) => {
+        if (text) sink.text("answer", "D");
+        sink.retryStart!({ attempt: 2, maxAttempts: 5, errorMessage: "Reconnecting... 2/5" });
+        if (text) {
+          sink.retryRecovered!();
+          sink.text("answer", "one");
+        }
+        return { status: "completed" };
+      },
+    ]);
+    try {
+      await expect(manager.prompt(project, conversation, "work").result).resolves.toBe("completed");
+      const retryStatuses = received.flatMap((event) =>
+        (event.type === "item.started" || event.type === "item.completed") && event.data.item.type === "retry"
+          ? [event.data.item.status] : []);
+      expect(retryStatuses).toEqual(["inProgress", "completed"]);
+      const assistants = items(sessionManager).filter((item) => item.type === "agentMessage");
+      expect(assistants.map(({ status, text }) => ({ status, text }))).toEqual(text ? [{ status: "completed", text }] : []);
+    } finally {
+      await manager.close();
+    }
+  });
+
+  it.each([
+    { retried: false, stopped: false },
+    { retried: true, stopped: false },
+    { retried: false, stopped: true },
+    { retried: true, stopped: true },
+  ])("reports a native error before settlement (retried: $retried, stopped: $stopped)", async ({ retried, stopped }) => {
+    const notificationError = "Connection reset";
+    const finalError = "Connection refused";
+    let activeSignal: AbortSignal;
+    let finish!: () => void;
+    const waiting = new Promise<void>((resolve) => { finish = resolve; });
+    const { manager, project, conversation, received, sessionManager } = setup([
+      async (_input, sink, signal) => {
+        activeSignal = signal;
+        if (retried) sink.retryStart!({ attempt: 2, errorMessage: "Reconnecting... 2/5" });
+        sink.error!(notificationError);
+        await waiting;
+        return signal.aborted ? { status: "aborted" } : { status: "failed", error: finalError };
+      },
+    ]);
+    try {
+      const run = manager.prompt(project, conversation, "work");
+      const settled = stopped
+        ? expect(run.result).resolves.toBe("cancelled")
+        : expect(run.result).rejects.toThrow(finalError);
+      await vi.waitFor(() => expect(received).toContainEqual(expect.objectContaining({
+        type: "item.completed",
+        data: { item: expect.objectContaining({
+          type: retried ? "retry" : "agentMessage",
+          status: "failed",
+          error: expect.objectContaining({ message: notificationError }),
+        }) },
+      })));
+      expect(received.some((event) => event.type === "agent.error")).toBe(false);
+      expect(items(sessionManager).some((item) => item.type === "agentMessage")).toBe(false);
+      if (stopped) {
+        const cancellation = manager.cancel(project.id, conversation.summary.id, run.turnId);
+        await vi.waitFor(() => expect(activeSignal.aborted).toBe(true));
+        finish();
+        await cancellation;
+      } else finish();
+      await settled;
+      const failures = items(sessionManager).filter((item) => item.type === "agentMessage" && item.status === "failed");
+      expect(failures).toEqual(stopped ? [] : [expect.objectContaining({ error: expect.objectContaining({ message: finalError }) })]);
+      if (retried || stopped) {
+        const transient = received.findLast((event) => event.type === "item.completed" && (retried
+          ? event.data.item.type === "retry" : event.data.item.id === `${run.turnId}:status`));
+        expect(transient).toMatchObject({ data: { item: stopped
+          ? { status: "completed" }
+          : { status: "failed", error: { message: finalError } } } });
+      }
+    } finally {
+      finish();
+      await manager.close();
+    }
+  });
+
+  it("releases changed runtime settings after a busy run and resumes on the next one", async () => {
+    let finish!: () => void;
+    const waiting = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    const { manager, project, conversation, drivers } = setup([
+      async (_input, sink) => {
+        sink.nativeSession("native-1");
+        await waiting;
+        return { status: "completed" };
+      },
+      async () => ({ status: "completed" }),
+    ]);
+    try {
+      const run = manager.prompt(project, conversation, "work");
+      await expect.poll(() => drivers[0]?.inputs.length).toBe(1);
+      manager.releaseRuntimeSessions("claude-code-cli");
+      expect(drivers[0]!.disposed).toBe(false);
+      finish();
+      await run.result;
+      expect(drivers[0]!.disposed).toBe(true);
+      await manager.prompt(project, conversation, "continue").result;
+      expect(drivers).toHaveLength(2);
+      expect(drivers[1]!.resume).toBe("native-1");
+      manager.releaseRuntimeSessions("claude-code-cli");
+      expect(drivers[1]!.disposed).toBe(true);
+    } finally {
+      finish();
+      await manager.close();
+    }
+  });
+
+  it("recreates a runtime whose settings changed while it was loading", async () => {
+    let finish!: () => void;
+    const waiting = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    let creating = false;
+    const { manager, project, conversation, drivers } = setup(
+      [async () => ({ status: "completed" })],
+      {
+        beforeCreate: async () => {
+          creating = true;
+          await waiting;
+        },
+      },
+    );
+    try {
+      const run = manager.prompt(project, conversation, "work");
+      await expect.poll(() => creating).toBe(true);
+      manager.releaseRuntimeSessions("claude-code-cli");
+      finish();
+      await run.result;
+      expect(drivers).toHaveLength(2);
+      expect(drivers[0]!.disposed).toBe(true);
+      expect(drivers[0]!.inputs).toHaveLength(0);
+      expect(drivers[1]!.inputs).toHaveLength(1);
+    } finally {
+      finish();
+      await manager.close();
+    }
+  });
+
+  function fixture(
+    scripts: Script[],
+    sessionManager = SessionManager.inMemory("/tmp/project-1"),
+    extra: Record<string, unknown> = {},
+  ) {
+    const drivers: ScriptedDriver[] = [];
+    const session = new NativeCodingSession({
+      runtime: "claude-code-cli",
+      model: "sonnet",
+      sessionManager,
+      toolNames: [],
+      requestUserInput: async () => { throw new Error("Unexpected user input request"); }, requestApproval: async () => "deny",
+      createDriver: (resume) => {
+        const driver = new ScriptedDriver(scripts, resume);
+        drivers.push(driver);
+        return driver;
+      },
+      ...extra,
+    });
+    return { session, sessionManager, drivers };
+  }
+
+  it.each(["claude-code-cli", "codex-cli"] as const)("only resumes a %s native session for the same account configuration", (runtime) => {
+    const manager = SessionManager.inMemory("/tmp/profile-test");
+    manager.appendCustomEntry(NATIVE_SESSION_ENTRY, { version: 2, runtime, state: "ready", sessionId: "thread-a", profileId: "personal" });
+    expect(latestNativeSession(manager.getBranch(), runtime, "personal")?.sessionId).toBe("thread-a");
+    expect(latestNativeSession(manager.getBranch(), runtime, "work")).toBeUndefined();
+    expect(latestNativeSession(manager.getBranch(), runtime)).toBeUndefined();
+  });
+
+  it("refuses to compact a native context that has not received the chat yet", async () => {
+    const sm = SessionManager.inMemory("/tmp/project-1");
+    sm.appendMessage({ role: "user", content: "keep the original requirement", timestamp: 1 });
+    sm.appendCustomEntry(NATIVE_SESSION_ENTRY, { version: 2, runtime: "claude-code-cli", state: "ready", sessionId: "thread-a", profileId: "personal" });
+    const { session, drivers } = fixture([
+      async (_input, sink) => {
+        sink.nativeSession("thread-b");
+        sink.textDone("a", "continued");
+        return { status: "completed" };
+      },
+    ], sm, { profileId: "work" });
+    await expect(session.compact()).rejects.toThrow("Send a message first");
+    expect(drivers.every((driver) => driver.compactions === 0)).toBe(true);
+    expect(latestNativeSession(sm.getBranch(), "claude-code-cli", "work")).toBeUndefined();
+    // The next message carries the chat to this account; compacting it is then allowed.
+    await session.prompt("continue");
+    expect(drivers.at(-1)!.inputs[0]!.text).toContain("keep the original requirement");
+    await session.compact();
+    expect(drivers.at(-1)!.compactions).toBe(1);
+    session.dispose();
+  });
+
+  it("stops an idle CLI and resumes the same native session with the next message", async () => {
+    const { session, drivers } = fixture(
+      [
+        async (_input, sink) => {
+          sink.nativeSession("native-1");
+          sink.textDone("a", "first");
+          return { status: "completed" };
+        },
+      ],
+      undefined,
+      { idleTimeoutMs: 5 },
+    );
+    await session.prompt("first request");
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(drivers[0]!.disposed).toBe(true);
+    expect(drivers[1]!.resume).toBe("native-1");
+    await session.prompt("second request");
+    expect(drivers[0]!.inputs).toHaveLength(1);
+    // The resumed CLI keeps its context, so the message is not wrapped in a handoff.
+    expect(drivers[1]!.inputs.map((input) => input.text)).toEqual([
+      "second request",
+    ]);
+    session.dispose();
+  });
+
+  it("invalidates native context when editing a later message and keeps it invalid after restart", async () => {
+    const { session, sessionManager, drivers } = fixture([
+      async (_input, sink) => {
+        sink.nativeSession("native-1");
+        sink.textDone("a", "first");
+        return { status: "completed" };
+      },
+      async (_input, sink) => {
+        sink.textDone("b", "second");
+        return { status: "completed" };
+      },
+    ]);
+    await session.prompt("first request");
+    await session.prompt("second request to remove");
+    const second = sessionManager
+      .getBranch()
+      .filter(
+        (entry) => entry.type === "message" && entry.message.role === "user",
+      )[1]!;
+    await session.navigateTree(second.id);
+    expect(drivers[0]!.disposed).toBe(true);
+    expect(drivers[1]!.resume).toBeUndefined();
+    expect(
+      latestNativeSession(sessionManager.getBranch(), "claude-code-cli"),
+    ).toBeUndefined();
+    session.dispose();
+    const restarted = fixture([], sessionManager);
+    await restarted.session.prompt("replacement second request");
+    expect(restarted.drivers[0]!.resume).toBeUndefined();
+    expect(restarted.drivers[0]!.inputs[0]!.text).toContain("first request");
+    expect(restarted.drivers[0]!.inputs[0]!.text).not.toContain(
+      "second request to remove",
+    );
+    restarted.session.dispose();
+  });
+
+  it("hands off Pi turns instead of resuming a stale native session", async () => {
+    const sm = SessionManager.inMemory("/tmp/project-1");
+    sm.appendMessage({ role: "user", content: "original", timestamp: 1 });
+    sm.appendCustomEntry(NATIVE_SESSION_ENTRY, {
+      version: 2,
+      state: "ready",
+      runtime: "claude-code-cli",
+      sessionId: "native-1",
+    });
+    sm.appendModelChange("pi-provider", "pi-model");
+    sm.appendMessage({
+      role: "user",
+      content: "new requirement handled by Pi",
+      timestamp: 2,
+    });
+    sm.appendModelChange("claude-code-cli", "sonnet");
+    const { session, drivers } = fixture([], sm);
+    await session.prompt("continue");
+    expect(drivers[0]!.resume).toBeUndefined();
+    expect(drivers[0]!.inputs[0]!.text).toContain(
+      "new requirement handled by Pi",
+    );
+    session.dispose();
+  });
+
+  it.each([false, true])("rebuilds an expired native session with one handoff and one stored user message (pending=%s)", async (pending) => {
+    const sm = SessionManager.inMemory("/tmp/project-1");
+    const originalId = sm.appendMessage({
+      role: "user",
+      content: "keep the original requirement" + (pending ? " details".repeat(300) + " UNSENT-END" : ""),
+      timestamp: 1,
+    });
+    sm.appendCustomEntry(NATIVE_SESSION_ENTRY, {
+      version: 2,
+      state: "ready",
+      runtime: "claude-code-cli",
+      sessionId: "expired",
+      ...(pending ? { pendingUserMessageId: originalId } : {}),
+    });
+    const { session, drivers } = fixture(
+      [
+        async () => {
+          throw new NativeSessionExpiredError("gone");
+        },
+        async (_input, sink) => {
+          sink.nativeSession("replacement");
+          sink.textDone("a", "continued");
+          return pending
+            ? { status: "failed", error: "temporary rejection", resumable: true, inputAccepted: false }
+            : { status: "completed" };
+        },
+      ],
+      sm,
+      { skills: () => [{ name: "review", description: "" }] },
+    );
+    await session.prompt("continue with $review");
+    expect(drivers.map((driver) => driver.inputs[0]!.skills)).toEqual([["review"], ["review"]]);
+    expect(drivers.map((driver) => driver.resume)).toEqual([
+      "expired",
+      undefined,
+    ]);
+    expect(drivers[1]!.inputs[0]!.text).toContain(
+      "keep the original requirement",
+    );
+    expect(
+      sm
+        .getBranch()
+        .filter(
+          (entry) => entry.type === "message" && entry.message.role === "user",
+        ),
+    ).toHaveLength(2);
+    expect(
+      latestNativeSession(sm.getBranch(), "claude-code-cli")?.sessionId,
+    ).toBe("replacement");
+    if (pending) {
+      expect(drivers[1]!.inputs[0]!.text).toContain("UNSENT-END");
+      expect(latestNativeSession(sm.getBranch(), "claude-code-cli")?.pendingUserMessageId).toBe(originalId);
+      await session.prompt("try again");
+      expect(drivers[1]!.inputs[1]!.text).toContain("UNSENT-END");
+      expect(latestNativeSession(sm.getBranch(), "claude-code-cli")?.pendingUserMessageId).toBeUndefined();
+    }
+    session.dispose();
+  });
+
+  it("persists a terminal stop when a native turn ends after a denied tool without final text", async () => {
+    const { session } = fixture([
+      async (_input, sink) => {
+        sink.toolCall("read-1", "read", { path: "/outside" });
+        sink.toolResult(
+          "read-1",
+          { content: [{ type: "text", text: "Denied" }] },
+          true,
+        );
+        return { status: "completed" };
+      },
+    ]);
+    await session.prompt("read file");
+    expect(
+      conversationItems(session.sessionManager.getBranch()).some(
+        (item) => item.type === "agentMessage" && item.status === "interrupted",
+      ),
+    ).toBe(false);
+    expect(session.messages.at(-1)).toMatchObject({
+      role: "assistant",
+      stopReason: "stop",
+    });
+    session.dispose();
+  });
+
+  it("queues steering until native writes finish and snapshots before delivery", async () => {
+    const order: string[] = [];
+    let release!: () => void;
+    let started!: () => void;
+    const ready = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    const { session, drivers } = fixture(
+      [
+        async () => {
+          order.push("first");
+          started();
+          await new Promise<void>((resolve) => {
+            release = resolve;
+          });
+          return { status: "completed" };
+        },
+        async () => {
+          order.push("steered");
+          return { status: "completed" };
+        },
+      ],
+      undefined,
+      {
+        snapshotBeforeMessage: async () => {
+          order.push("snapshot");
+          return "commit";
+        },
+      },
+    );
+    const run = session.prompt("first");
+    await ready;
+    await session.steer("steered");
+    expect(drivers[0]!.inputs).toHaveLength(1);
+    release();
+    await run;
+    expect(order).toEqual(["snapshot", "first", "snapshot", "steered"]);
+    session.dispose();
+  });
+
+  it("does not deliver a prompt cancelled while its checkpoint is pending", async () => {
+    let release!: (value: string) => void;
+    const { session, drivers } = fixture([], undefined, {
+      snapshotBeforeMessage: () =>
+        new Promise<string>((resolve) => {
+          release = resolve;
+        }),
+      cancellationTimeoutMs: 10,
+    });
+    const run = session.prompt("cancel before launch");
+    const cancelled = session.abort();
+    release("commit");
+    await Promise.all([run, cancelled]);
+    expect(drivers.flatMap((driver) => driver.inputs)).toEqual([]);
+    session.dispose();
+  });
+
+  describe("after the person stops a turn", () => {
+    const stoppedTurn = (reported: { status: "aborted"; resumable?: boolean }, id = "native-1"): Script =>
+      async (_input, sink, signal) => {
+        sink.nativeSession(id);
+        sink.text("a", "Working");
+        await new Promise<void>((resolve) =>
+          signal.addEventListener("abort", () => resolve(), { once: true }),
+        );
+        return reported;
+      };
+    const stop = async (session: NativeCodingSession, prompt: string, id = "native-1") => {
+      const run = session.prompt(prompt);
+      // Stop only once the agent has named its session: a fixed delay raced a slow runner.
+      await vi.waitFor(() =>
+        expect(
+          session.sessionManager.getBranch().some(
+            (entry) =>
+              entry.type === "custom" &&
+              entry.customType === NATIVE_SESSION_ENTRY &&
+              (entry.data as { sessionId?: string } | undefined)?.sessionId === id,
+          ),
+        ).toBe(true),
+      );
+      await session.abort();
+      await run;
+    };
+
+    it("continues the native session and says once that the turn was stopped", async () => {
+      const { session, sessionManager, drivers } = fixture([
+        stoppedTurn({ status: "aborted", resumable: true }),
+        async () => ({ status: "completed" }),
+        async () => ({ status: "completed" }),
+      ]);
+      await stop(session, "first");
+      expect(latestNativeSession(sessionManager.getBranch(), "claude-code-cli")).toMatchObject({
+        sessionId: "native-1",
+        interrupted: true,
+      });
+
+      await session.prompt("second");
+      await session.prompt("third");
+
+      expect(drivers).toHaveLength(1);
+      expect(drivers[0]!.disposed).toBeFalsy();
+      expect(drivers[0]!.inputs[1]!.text).toContain("stopped the previous turn");
+      expect(drivers[0]!.inputs[1]!.text).toContain("second");
+      expect(drivers[0]!.inputs[1]!.text).not.toContain("<conversation-handoff>");
+      expect(drivers[0]!.inputs[2]!.text).toBe("third");
+      expect(latestNativeSession(sessionManager.getBranch(), "claude-code-cli")?.interrupted).toBeUndefined();
+      session.dispose();
+    });
+
+    it("still says so after a restart", async () => {
+      const first = fixture([stoppedTurn({ status: "aborted", resumable: true })]);
+      await stop(first.session, "first");
+      first.session.dispose();
+
+      const second = fixture([async () => ({ status: "completed" })], first.sessionManager);
+      await second.session.prompt("second");
+
+      expect(second.drivers[0]!.resume).toBe("native-1");
+      expect(second.drivers[0]!.inputs[0]!.text).toContain("stopped the previous turn");
+      expect(second.drivers[0]!.inputs[0]!.text).not.toContain("<conversation-handoff>");
+      second.session.dispose();
+    });
+
+    it("rebuilds the context when the agent did not report the turn's end", async () => {
+      const { session, drivers } = fixture([
+        stoppedTurn({ status: "aborted" }),
+        async () => ({ status: "completed" }),
+      ]);
+      await stop(session, "first");
+      await session.prompt("second");
+
+      expect(drivers).toHaveLength(2);
+      expect(drivers[0]!.disposed).toBe(true);
+      expect(drivers[1]!.resume).toBeUndefined();
+      expect(drivers[1]!.inputs[0]!.text).toContain("<conversation-handoff>");
+      expect(drivers[1]!.inputs[0]!.text).not.toContain("stopped the previous turn");
+      session.dispose();
+    });
+
+    it("rebuilds the context when the agent had to be closed to stop it", async () => {
+      const { session, drivers } = fixture(
+        [
+          async (_input, sink, signal) => {
+            sink.nativeSession("native-1");
+            sink.text("a", "Working");
+            await new Promise<void>((resolve) =>
+              signal.addEventListener("abort", () => setTimeout(resolve, 30), { once: true }),
+            );
+            return { status: "aborted", resumable: true };
+          },
+          async () => ({ status: "completed" }),
+        ],
+        undefined,
+        { cancellationTimeoutMs: 1 },
+      );
+      await stop(session, "first");
+      await session.prompt("second");
+
+      expect(drivers).toHaveLength(2);
+      expect(drivers[1]!.inputs[0]!.text).toContain("<conversation-handoff>");
+      session.dispose();
+    });
+
+    it("hands over every tool the stop cut off, including calls still buffered", async () => {
+      const { session, sessionManager } = fixture([
+        async (_input, sink, signal) => {
+          sink.nativeSession("native-1");
+          sink.toolCall("a", "bash", { command: "started-command" });
+          sink.toolStarted("a");
+          sink.toolCall("b", "bash", { command: "buffered-command" });
+          sink.toolCall("c", "bash", { command: "other-buffered-command" });
+          await new Promise<void>((resolve) =>
+            signal.addEventListener("abort", () => resolve(), { once: true }),
+          );
+          return { status: "aborted" };
+        },
+      ]);
+      await stop(session, "first");
+
+      const summary = handoffSummary(sessionManager.getBranch())!;
+      expect(summary).toContain("- bash (started-command): Stopped");
+      expect(summary).toContain("- bash (buffered-command): Stopped");
+      expect(summary).toContain("- bash (other-buffered-command): Stopped");
+      session.dispose();
+    });
+
+    it("does not hold a forced close of one turn against the next", async () => {
+      const { session, drivers } = fixture(
+        [
+          async (_input, sink, signal) => {
+            sink.nativeSession("native-1");
+            sink.text("a", "Working");
+            await new Promise<void>((resolve) =>
+              signal.addEventListener("abort", () => setTimeout(resolve, 25), { once: true }),
+            );
+            return { status: "aborted" };
+          },
+          stoppedTurn({ status: "aborted", resumable: true }, "native-2"),
+          async () => ({ status: "completed" }),
+        ],
+        undefined,
+        { cancellationTimeoutMs: 20 },
+      );
+      const run = session.prompt("first");
+      await vi.waitFor(() => expect(drivers[0]!.inputs).toHaveLength(1));
+      drivers[0]!.slowDispose = () => new Promise((resolve) => setTimeout(resolve, 60));
+      // Cancelling a turn calls abort twice; the second one times out while the
+      // first is still closing the old driver.
+      const first = session.abort();
+      await new Promise((resolve) => setTimeout(resolve, 15));
+      await Promise.all([first, session.abort(), run]);
+
+      await stop(session, "second", "native-2");
+      await session.prompt("third");
+
+      expect(drivers).toHaveLength(2);
+      expect(drivers[1]!.disposed).toBeFalsy();
+      expect(drivers[1]!.inputs[1]!.text).toContain("stopped the previous turn");
+      session.dispose();
+    });
+
+    it("hands off instead when the conversation moved to another account", async () => {
+      const { session, sessionManager } = fixture([stoppedTurn({ status: "aborted", resumable: true })]);
+      await stop(session, "first");
+      session.dispose();
+
+      expect(latestNativeSession(sessionManager.getBranch(), "claude-code-cli", "work")).toBeUndefined();
+    });
+  });
+
+  it("rebuilds context for legacy or interrupted native metadata", () => {
+    for (const data of [
+      { version: 1, runtime: "claude-code-cli", sessionId: "legacy" },
+      {
+        version: 2,
+        state: "active",
+        runtime: "claude-code-cli",
+        sessionId: "interrupted",
+      },
+    ]) {
+      const sm = SessionManager.inMemory("/tmp/project-1");
+      sm.appendCustomEntry(NATIVE_SESSION_ENTRY, data);
+      expect(
+        latestNativeSession(sm.getBranch(), "claude-code-cli"),
+      ).toBeUndefined();
+    }
+  });
+
+  it("persists native compaction display records", async () => {
+    const { session, sessionManager } = fixture([
+      async (_input, sink) => {
+        sink.compaction("start");
+        sink.compaction("end", { summary: "kept context", tokensBefore: 200 });
+        return { status: "completed" };
+      },
+    ]);
+    await session.prompt("compact fixture");
+    expect(conversationItems(sessionManager.getBranch(), false)).toContainEqual(
+      expect.objectContaining({
+        type: "contextCompaction",
+        summary: "kept context",
+        tokensBefore: 200,
+      }),
+    );
+    session.dispose();
+  });
+  it("records a turn in the conversation the way OhMyGame's own agent does", async () => {
+    let commit = 0;
+    const { manager, project, conversation, sessionManager, received } = setup(
+      [
+        async (_input, sink) => {
+          sink.nativeSession("native-1");
+          sink.thinking("r1", "Planning");
+          sink.thinkingDone("r1");
+          sink.text("t1", "Checking ");
+          sink.text("t1", "the canvas");
+          sink.textDone("t1");
+          sink.toolCall("call-1", "canvas_check", {});
+          sink.toolStarted("call-1");
+          sink.toolResult(
+            "call-1",
+            {
+              content: [{ type: "text", text: "ok" }],
+              details: {
+                artifact: {
+                  type: "image",
+                  path: "art/cover.png",
+                  mediaType: "image/png",
+                },
+              },
+            },
+            false,
+          );
+          sink.text("t2", "Done");
+          sink.textDone("t2");
+          sink.usage(
+            { input: 100, output: 20, cacheRead: 0, cacheWrite: 0 },
+            1_000,
+            400,
+          );
+          sink.spent({ input: 100, output: 20, cacheRead: 300, cacheWrite: 0 });
+          sink.spent({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
+          return { status: "completed" };
+        },
+      ],
+      { snapshot: async () => (++commit).toString(16).padStart(40, "0") },
+    );
+
+    const run = manager.prompt(project, conversation, "Make a cover");
+    await expect(run.result).resolves.toBe("completed");
+
+    const stored = items(sessionManager);
+    expect(stored.map((item) => item.type)).toEqual([
+      "userMessage",
+      "reasoning",
+      "agentMessage",
+      "dynamicToolCall",
+      "agentMessage",
+    ]);
+    expect(stored[0]).toMatchObject({
+      type: "userMessage",
+      text: "Make a cover",
+      checkpointId: expect.any(String),
+    });
+    expect(stored[3]).toMatchObject({
+      type: "dynamicToolCall",
+      tool: "canvas_check",
+      status: "completed",
+      output: "ok",
+      artifact: { path: "art/cover.png" },
+    });
+    expect(stored[4]).toMatchObject({
+      type: "agentMessage",
+      text: "Done",
+      status: "completed",
+    });
+    // What the turn spent is kept apart from the messages, for Settings → Account.
+    expect(
+      sessionManager
+        .getEntries()
+        .flatMap((entry) =>
+          entry.type === "custom" && entry.customType === NATIVE_USAGE_ENTRY
+            ? [entry.data]
+            : [],
+        ),
+    ).toEqual([
+      {
+        version: 1,
+        runtime: "claude-code-cli",
+        model: "sonnet",
+        input: 100,
+        output: 20,
+        cacheRead: 300,
+        cacheWrite: 0,
+        at: expect.any(Number),
+      },
+    ]);
+    // The checkpoint is taken before the message is stored, as Pi's checkpoint extension does.
+    const branch = sessionManager.getBranch();
+    const checkpoint = branch.findIndex(
+      (entry) =>
+        entry.type === "custom" && entry.customType === CHECKPOINT_ENTRY,
+    );
+    const message = branch.findIndex(
+      (entry) => entry.type === "message" && entry.message.role === "user",
+    );
+    expect(checkpoint).toBeGreaterThanOrEqual(0);
+    expect(checkpoint).toBeLessThan(message);
+    expect(latestNativeSession(branch, "claude-code-cli")).toEqual({
+      version: 2,
+      state: "ready",
+      runtime: "claude-code-cli",
+      sessionId: "native-1",
+    });
+
+    const types = received.map((event) => event.type);
+    expect(types).toContain("checkpoint.created");
+    expect(types).toContain("item.agentMessage.delta");
+    expect(types).toContain("agent.completed");
+    expect(types).toContain("checkpoint.completed");
+    await expect(manager.contextUsage(project, conversation)).resolves.toEqual({
+      tokens: 400,
+      contextWindow: 1_000,
+      percent: 40,
+    });
+  });
+
+  it("reports the account's latest quota before the conversation's first turn", async () => {
+    const limits = [
+      { id: "claude/five_hour", usedPercent: 18, windowMinutes: 300 },
+    ];
+    const { manager, project, conversation } = setup([], {
+      accountLimits: () => limits,
+    });
+    await expect(manager.contextUsage(project, conversation)).resolves.toEqual({
+      tokens: null,
+      contextWindow: 0,
+      percent: null,
+      limits,
+    });
+  });
+
+  it("runs a message sent during a turn after it, in the same run", async () => {
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const { manager, project, conversation, sessionManager, drivers } = setup([
+      async (_input, sink) => {
+        await held;
+        sink.text("a", "first");
+        return { status: "completed" };
+      },
+      async (_input, sink) => {
+        sink.text("b", "second");
+        return { status: "completed" };
+      },
+    ]);
+    const run = manager.prompt(project, conversation, "one");
+    await expect.poll(() => drivers[0]?.inputs.length).toBe(1);
+    const queued = manager.prompt(project, conversation, "two");
+    expect(queued.queued).toBe(true);
+    // Admission reads project context asynchronously; finish it while the
+    // first turn is still held so this actually exercises the same-run queue.
+    await queued.result;
+    release();
+    await run.result;
+    expect(drivers[0]!.inputs.map((input) => input.text)).toEqual([
+      "one",
+      "two",
+    ]);
+    expect(
+      items(sessionManager)
+        .filter((item) => item.type === "agentMessage")
+        .map((item) => item.type === "agentMessage" && item.text),
+    ).toEqual(["first", "second"]);
+  });
+
+  it("stops a turn and keeps what the agent said before it was stopped", async () => {
+    let spoke!: () => void;
+    const said = new Promise<void>((resolve) => {
+      spoke = resolve;
+    });
+    const { manager, project, conversation, sessionManager, received } = setup([
+      async (_input, sink, signal) => {
+        sink.text("a", "Working");
+        spoke();
+        await new Promise<void>((resolve) =>
+          signal.addEventListener("abort", () => resolve(), { once: true }),
+        );
+        return { status: "aborted" };
+      },
+    ]);
+    const run = manager.prompt(project, conversation, "go");
+    // Stop only once the agent has spoken: a fixed delay raced a slow runner.
+    await said;
+    await manager.cancel(project.id, conversation.summary.id, run.turnId);
+    await expect(run.result).resolves.toBe("cancelled");
+    expect(received.map((event) => event.type)).toContain("agent.cancelled");
+    expect(
+      items(sessionManager).find((item) => item.type === "agentMessage"),
+    ).toMatchObject({ text: "Working", status: "cancelled" });
+  });
+
+  it("reports an agent's failure as the turn's error", async () => {
+    const { manager, project, conversation, received } = setup([
+      async () => ({
+        status: "failed",
+        error: "Claude Code exited with code 1: not signed in",
+      }),
+    ]);
+    const run = manager.prompt(project, conversation, "go");
+    await expect(run.result).rejects.toThrow("not signed in");
+    expect(
+      received.find((event) => event.type === "agent.error")?.data,
+    ).toEqual({ error: "Claude Code exited with code 1: not signed in", diagnostics: { provider: "claude-code-cli", model: "sonnet" } });
+  });
+
+  it("asks the person each time the agent asks, and passes always allowing back to the agent", async () => {
+    const decisions: string[] = [];
+    const { manager, project, conversation, received, sessionManager } = setup([
+      async (_input, sink) => {
+        decisions.push(
+          await sink.requestApproval(
+            {
+              kind: "command",
+              tool: "Bash",
+              command: "git push",
+              always: { scope: "saved", rules: ["Bash(git push:*)"] },
+            },
+            { callId: "call-1" },
+          ),
+        );
+        // The agent asks again only when its own rules say so; OhMyGame keeps no grants.
+        decisions.push(
+          await sink.requestApproval(
+            { kind: "command", tool: "Bash", command: "rm -rf build" },
+            { callId: "call-2" },
+          ),
+        );
+        return { status: "completed" };
+      },
+    ]);
+    received.length = 0;
+    const run = manager.prompt(project, conversation, "push it");
+    const answered = new Set<string>();
+    const next = async () => {
+      let item: Extract<ThreadItem, { type: "approvalRequest" }> | undefined;
+      await expect
+        .poll(() => {
+          item = received
+            .filter((event) => event.type === "item.started")
+            .map(
+              (event) =>
+                (event.data as { item: ThreadItem }).item as Extract<
+                  ThreadItem,
+                  { type: "approvalRequest" }
+                >,
+            )
+            .find(
+              (candidate) =>
+                candidate.type === "approvalRequest" &&
+                !answered.has(candidate.requestId),
+            );
+          return item;
+        })
+        .toBeTruthy();
+      answered.add(item!.requestId);
+      return item!;
+    };
+    const first = await next();
+    expect(first.request.command).toBe("git push");
+    expect(() =>
+      manager.answerApproval(
+        project.id,
+        conversation.summary.id,
+        "unknown",
+        "allow",
+      ),
+    ).toThrow();
+    manager.answerApproval(
+      project.id,
+      conversation.summary.id,
+      first.requestId,
+      "allow-always",
+    );
+    const second = await next();
+    // Without the agent's offer, the request can only be allowed once.
+    expect(() =>
+      manager.answerApproval(
+        project.id,
+        conversation.summary.id,
+        second.requestId,
+        "allow-always",
+      ),
+    ).toThrow("only be allowed once");
+    manager.answerApproval(
+      project.id,
+      conversation.summary.id,
+      second.requestId,
+      "allow",
+    );
+    await run.result;
+    expect(decisions).toEqual(["allow-always", "allow"]);
+    expect(
+      conversationItems(sessionManager.getBranch(), false).filter(
+        (item) => item.type === "approvalRequest",
+      ),
+    ).toEqual([
+      expect.objectContaining({ decision: "allow-always", status: "completed" }),
+      expect.objectContaining({ decision: "allow", status: "completed" }),
+    ]);
+  });
+
+  it("denies requests that are still waiting when the turn is stopped", async () => {
+    let decision: string | undefined;
+    const { manager, project, conversation, received } = setup([
+      async (_input, sink, signal) => {
+        decision = await sink.requestApproval(
+          {
+            kind: "file",
+            tool: "Write",
+            path: "/etc/hosts",
+          },
+          { signal },
+        );
+        return { status: signal.aborted ? "aborted" : "completed" };
+      },
+    ]);
+    const run = manager.prompt(project, conversation, "edit hosts");
+    await expect
+      .poll(() =>
+        received.some(
+          (event) =>
+            event.type === "item.started" &&
+            (event.data as { item: ThreadItem }).item.type ===
+              "approvalRequest",
+        ),
+      )
+      .toBe(true);
+    await manager.cancel(project.id, conversation.summary.id, run.turnId);
+    await run.result;
+    expect(decision).toBe("deny");
+  });
+
+  it("starts a new native session with a summary after going back before the one it had", async () => {
+    const sessionManager = SessionManager.inMemory("/tmp/project-1");
+    const { manager, project, conversation, drivers } = setup(
+      [
+        async (_input, sink) => {
+          sink.nativeSession("native-1");
+          sink.text("a", "Made hello.txt");
+          return { status: "completed" };
+        },
+        async (_input, sink) => {
+          sink.text("b", "Second answer");
+          return { status: "completed" };
+        },
+        async () => ({ status: "completed" }),
+      ],
+      { sessionManager },
+    );
+    await manager.prompt(project, conversation, "make hello").result;
+    await manager.prompt(project, conversation, "again").result;
+    // Editing the first message goes back to before the native session began.
+    const first = sessionManager
+      .getBranch()
+      .find(
+        (entry) => entry.type === "message" && entry.message.role === "user",
+      )!;
+    sessionManager.branch(first.id);
+    const fresh = new NativeCodingSession({
+      runtime: "claude-code-cli",
+      model: "sonnet",
+      sessionManager,
+      createDriver: (resume) => {
+        const driver = new ScriptedDriver([], resume);
+        drivers.push(driver);
+        return driver;
+      },
+      requestUserInput: async () => { throw new Error("Unexpected user input request"); }, requestApproval: async () => "deny",
+      toolNames: [],
+    });
+    expect(drivers.at(-1)!.resume).toBeUndefined();
+    await fresh.prompt("continue");
+    expect(drivers.at(-1)!.inputs[0]!.text).toContain("<conversation-handoff>");
+    expect(drivers.at(-1)!.inputs[0]!.text).toContain("User: make hello");
+    expect(drivers.at(-1)!.inputs[0]!.text).toMatch(/continue$/);
+  });
+
+  it("continues the native session of the same agent and hands off from another one", () => {
+    const sessionManager = SessionManager.inMemory("/tmp/project-1");
+    sessionManager.appendMessage({ role: "user", content: "hi", timestamp: 1 });
+    sessionManager.appendCustomEntry(NATIVE_SESSION_ENTRY, {
+      version: 2,
+      state: "ready",
+      runtime: "claude-code-cli",
+      sessionId: "claude-1",
+    });
+    expect(
+      latestNativeSession(sessionManager.getBranch(), "claude-code-cli")
+        ?.sessionId,
+    ).toBe("claude-1");
+    sessionManager.appendCustomEntry(NATIVE_SESSION_ENTRY, {
+      version: 2,
+      state: "ready",
+      runtime: "codex-cli",
+      sessionId: "codex-1",
+    });
+    // Codex held the conversation since; Claude Code's session has not seen that.
+    expect(
+      latestNativeSession(sessionManager.getBranch(), "claude-code-cli"),
+    ).toBeUndefined();
+    expect(
+      latestNativeSession(sessionManager.getBranch(), "codex-cli")?.sessionId,
+    ).toBe("codex-1");
+  });
+
+  it("marks planning turns read-only from the tools OhMyGame allows", async () => {
+    const { manager, project, conversation, drivers } = setup([
+      async () => ({ status: "completed" }),
+    ]);
+    await manager.prompt(project, conversation, "plan it", [], [], "planning")
+      .result;
+    expect(drivers[0]!.inputs[0]!.readOnly).toBe(true);
+  });
+});
+
+it("hands the agent the Skills a message names, leaving the message as written", async () => {
+  const driver = new ScriptedDriver([], undefined);
+  const session = new NativeCodingSession({
+    runtime: "codex-cli",
+    model: "model",
+    sessionManager: SessionManager.inMemory("/tmp/native-skills"),
+    toolNames: [],
+    requestUserInput: async () => { throw new Error("Unexpected user input request"); }, requestApproval: async () => "deny",
+    skills: () => [{ name: "review", description: "" }, { name: "map-design", description: "" }],
+    createDriver: () => driver,
+  });
+  await session.prompt("Use $map-design, then $review. It costs $5 and $unknown");
+  await session.prompt("No Skills here");
+  expect(driver.inputs.map(({ text, skills }) => ({ text, skills }))).toEqual([
+    { text: "Use $map-design, then $review. It costs $5 and $unknown", skills: ["map-design", "review"] },
+    { text: "No Skills here", skills: undefined },
+  ]);
+});
+
+it("does not duplicate delayed native text completions after a tool flushes the assistant", async () => {
+  const store = SessionManager.inMemory("/tmp/native-events");
+  const session = new NativeCodingSession({
+    runtime: "opencode-cli",
+    model: "model",
+    sessionManager: store,
+    toolNames: [],
+    requestUserInput: async () => { throw new Error("Unexpected user input request"); }, requestApproval: async () => "deny",
+    createDriver: () =>
+      new ScriptedDriver(
+        [
+          async (_input, sink) => {
+            sink.text("part-1", "Checking.");
+            sink.toolCall("tool-1", "read", { path: "file" });
+            sink.toolStarted("tool-1");
+            sink.textDone("part-1", "Checking.");
+            sink.toolResult("tool-1", { content: [] }, false);
+            sink.text("part-2", "Done.");
+            sink.textDone("part-2", "Done.");
+            sink.textDone("part-2", "Done.");
+            return { status: "completed" };
+          },
+        ],
+        undefined,
+      ),
+  });
+  await session.prompt("test event order");
+  const texts = session.messages.flatMap((message: any) =>
+    message.role === "assistant"
+      ? message.content
+          .filter((block: any) => block.type === "text")
+          .map((block: any) => block.text)
+      : [],
+  );
+  expect(texts).toEqual(["Checking.", "Done."]);
+  session.dispose();
+});
+
+it("keeps only the unseen suffix when a native text block continues across a tool", async () => {
+  const session = new NativeCodingSession({
+    runtime: "opencode-cli",
+    model: "model",
+    sessionManager: SessionManager.inMemory("/tmp/native-suffix"),
+    toolNames: [],
+    requestUserInput: async () => { throw new Error("Unexpected user input request"); }, requestApproval: async () => "deny",
+    createDriver: () =>
+      new ScriptedDriver(
+        [
+          async (_input, sink) => {
+            sink.text("part", "Before.");
+            sink.toolCall("tool", "read", {});
+            sink.toolStarted("tool");
+            sink.toolResult("tool", { content: [] }, false);
+            sink.text("part", " After.");
+            sink.textDone("part", "Before. After.");
+            return { status: "completed" };
+          },
+        ],
+        undefined,
+      ),
+  });
+  await session.prompt("test suffix");
+  expect(
+    session.messages.flatMap((message: any) =>
+      message.role === "assistant"
+        ? message.content
+            .filter((block: any) => block.type === "text")
+            .map((block: any) => block.text)
+        : [],
+    ),
+  ).toEqual(["Before.", " After."]);
+  session.dispose();
+});

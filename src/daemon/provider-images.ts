@@ -1,0 +1,395 @@
+import { SEEDANCE_RETIRED_PROVIDER } from "../shared/media-migration-errors.js";
+import type { MediaTaskJournal } from "./media-task-journal.js";
+import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
+import { CUSTOM_IMAGE_MODEL_APIS, type CustomProviderDetails, type ImageAspectRatio, type ImageModel, type ImageModelCatalog, type ImageModelRef, type ImageResolution, type ImageSize, type MediaProviderStatus } from "../shared/contracts.js";
+import { customImageModel } from "../shared/custom-models.js";
+import { imageModelsForProvider } from "./image-models.js";
+import { createImageProtocolAdapters, type ImageSource } from "./image-adapters.js";
+import { customMediaSource } from "./custom-media-source.js";
+import { supportedImageDimensions } from "./media-requests.js";
+import { assertTransparentImage, ImageGenerationError, type GeneratedImage, type ImageGenerationInput, type ImageGenerator, type ImageGenerationRecovery } from "./openai-image.js";
+import { listOpenRouterImageModels, listPublicOpenRouterImageModels, resolveOpenRouterMediaSource } from "./openrouter-media.js";
+import type { PluginMediaProviders } from "./plugin-media-providers.js";
+import { SEEDREAM_BASE_URL, SEEDREAM_PROVIDER_ID, SEEDREAM_PROVIDER_NAME, seedreamModel, seedreamModels } from "./seedream-models.js";
+
+const CAPABILITY_TTL_MS = 10 * 60_000;
+
+// Models without fixed pixel sizes (Seedream) take resolution + aspect ratio instead.
+const LEGACY_SIZE_ASPECT_RATIOS: Record<ImageSize, ImageAspectRatio> = {
+  "1024x1024": "1:1",
+  "1536x1024": "3:2",
+  "1024x1536": "2:3",
+};
+// Legacy sizes are about 1K; use the nearest resolution a model offers, preferring larger output.
+const LEGACY_SIZE_RESOLUTIONS: readonly ImageResolution[] = ["1K", "2K", "4K", "512"];
+
+interface ProviderImagesOptions {
+  seedanceSettingsMigrated?: boolean;
+  codexImages?: ImageGenerator & { catalog(signal?: AbortSignal): Promise<ImageModelCatalog> };
+  openAIConnection?: () => Promise<{ source?: ImageSource; models?: ImageModel[]; message?: string; connected?: boolean }>;
+  customProviders?: () => Promise<CustomProviderDetails[]>;
+  migrateLegacyModels?: (provider: string, models: ImageModel[]) => Promise<void>;
+  defaultModel?: () => ImageModelRef | undefined;
+  /** Plugins' model providers that make images. */
+  pluginImages?: Pick<PluginMediaProviders, "imageProviders" | "generateImage"> & Partial<Pick<PluginMediaProviders, "backgroundRemovalModels" | "removeBackground">>;
+}
+
+interface ImageSelection {
+  model: ImageModel;
+  source?: ImageSource;
+}
+
+export class ProviderImages implements ImageGenerator {
+  #capabilities?: { loadedAt: number; models: Promise<ImageModel[]> };
+
+  constructor(
+    private readonly runtime: () => Promise<ModelRuntime>,
+    private readonly request: typeof fetch = fetch,
+    private readonly seedreamApiKey: () => string | undefined = () => undefined,
+    private readonly isEnabled: (provider: string) => boolean = () => true,
+    private readonly options: ProviderImagesOptions = {},
+  ) {}
+
+  async models(signal?: AbortSignal): Promise<ImageModel[]> {
+    return (await this.catalog(signal)).models;
+  }
+
+  /** Every connected image provider with its models, or the reason it has none. */
+  async catalog(signal?: AbortSignal): Promise<ImageModelCatalog> {
+    const runtime = await this.runtime().catch(() => undefined);
+    const custom = runtime ? await this.#customImageProviders(runtime) : [];
+    const plugins = await this.#pluginProviders();
+    const entries = await Promise.all([
+      runtime ? this.#openRouterEntry(runtime, signal) : undefined,
+      runtime || this.options.openAIConnection ? this.#openAIEntry(runtime, signal) : undefined,
+      this.#seedreamEntry(),
+      ...custom.map((provider) => catalogEntry(provider.id, provider.name, () => this.#customModels(runtime!, provider, signal), "Choose and enable image models in Models.")),
+      ...plugins.map((provider) => catalogEntry(provider.id, provider.name, async () => provider.models, "")),
+      this.isEnabled("codex-cli") && this.options.codexImages ? this.options.codexImages.catalog(signal).then((catalog) => ({ models: catalog.models, status: catalog.providers[0]! })) : undefined,
+    ]);
+    const connected = entries.filter((entry): entry is CatalogEntry => Boolean(entry));
+    const models = connected.flatMap((entry) => entry.models);
+    const defaultModel = this.options.defaultModel?.();
+    const defaultIndex = models.findIndex((model) => model.provider === defaultModel?.provider && model.id === defaultModel.id);
+    if (defaultIndex > 0) models.unshift(...models.splice(defaultIndex, 1));
+    const backgroundRemovalModels = await this.backgroundRemovalModels();
+    return { models, providers: connected.map((entry) => entry.status), ...(defaultModel ? { defaultModel } : {}), ...(backgroundRemovalModels.length ? { backgroundRemovalModels } : {}) };
+  }
+
+  async backgroundRemovalModels() {
+    return (await this.options.pluginImages?.backgroundRemovalModels?.() ?? []).filter(model => this.isEnabled(model.provider));
+  }
+
+  async #openRouterEntry(runtime: ModelRuntime, signal?: AbortSignal): Promise<CatalogEntry | undefined> {
+    if (!this.isEnabled("openrouter")) return undefined;
+    const source = await resolveOpenRouterMediaSource(runtime, signal).catch(() => undefined);
+    if (!source) return undefined;
+    return catalogEntry("openrouter", "OpenRouter", () => listOpenRouterImageModels(source, this.request, signal), "OpenRouter lists no image models for this account.");
+  }
+
+  async #openAIEntry(runtime: ModelRuntime | undefined, signal?: AbortSignal): Promise<CatalogEntry | undefined> {
+    if (!this.isEnabled("openai")) return undefined;
+    if (this.options.openAIConnection) {
+      try {
+        const connection = await this.options.openAIConnection();
+        if (connection.connected === false) return undefined;
+        return catalogEntry("openai", "OpenAI", async () => connection.source
+          ? connection.models ?? await this.#sourceModels("openai", "OpenAI", connection.source, signal) : [],
+        connection.message ?? "Fetch or add image models, then enable them and save.");
+      } catch (cause) {
+        return { models: [], status: { provider: "openai", providerName: "OpenAI", state: "error", message: cause instanceof Error ? cause.message : String(cause) } };
+      }
+    }
+    if (!runtime) return undefined;
+    const provider = runtime.getProvider("openai");
+    if (!provider || !runtime.hasConfiguredAuth("openai")) return undefined;
+    // OpenAI rejects image requests made with a ChatGPT sign-in ("ChatPass credential is not
+    // authorized"), and its model list is empty, so don't ask; say what to do instead.
+    if (runtime.isUsingOAuth("openai")) {
+      return {
+        models: [],
+        status: { provider: "openai", providerName: provider.name, state: "empty", message: "Browser sign-in does not include image generation. Connect OpenAI with an API key, or choose another image provider." },
+      };
+    }
+    return catalogEntry("openai", provider.name, () => this.#compatibleModels(runtime, "openai", signal), "This OpenAI key or endpoint lists no GPT Image models.");
+  }
+
+  async #customImageProviders(runtime: ModelRuntime): Promise<CustomProviderDetails[]> {
+    const providers = await this.options.customProviders?.() ?? [];
+    return providers.filter((provider) => (provider.modelConfigurationVersion === 2
+      ? provider.models.some((model) => model.usages?.image) : CUSTOM_IMAGE_MODEL_APIS.some((api) => api === provider.api))
+      && this.isEnabled(provider.id) && runtime.hasConfiguredAuth(provider.id));
+  }
+
+  async #customModels(runtime: ModelRuntime, provider: CustomProviderDetails, signal?: AbortSignal): Promise<ImageModel[]> {
+    // compat: since beta.4.1, remove from beta.6 and 2026-11-08. Custom providers before modelConfigurationVersion 2.
+    if (provider.modelConfigurationVersion !== 2) {
+      const models = await this.#compatibleModels(runtime, provider.id, signal);
+      await this.options.migrateLegacyModels?.(provider.id, models);
+      return models;
+    }
+    return provider.models.filter((model) => !provider.hiddenModelIds.includes(model.id)).flatMap((model) => {
+      const image = customImageModel(provider, model);
+      return image ? [image] : [];
+    });
+  }
+
+  async #customSelection(runtime: ModelRuntime, provider: CustomProviderDetails, requestedId?: string, signal?: AbortSignal): Promise<ImageSelection | undefined> {
+    const models = await this.#customModels(runtime, provider, signal);
+    const model = requestedId ? models.find((candidate) => candidate.id === requestedId) : models[0];
+    if (!model) return undefined;
+    const settings = provider.models.find((candidate) => candidate.id === model.id)?.usages?.image;
+    const source = await customMediaSource(runtime, provider, settings?.baseUrl, signal);
+    return { model, source: { ...source,
+      ...(provider.preset === "google" || provider.api === "google-generative-ai" ? { apiKeyHeader: "x-goog-api-key" as const } : {}),
+      ...(settings?.outputFormat === "endpoint" ? { outputFormat: settings.outputFormat } : {}) } };
+  }
+
+  #seedreamEntry(): CatalogEntry | undefined {
+    if (this.options.seedanceSettingsMigrated || !this.isEnabled(SEEDREAM_PROVIDER_ID) || !this.seedreamApiKey()) return undefined;
+    return {
+      models: seedreamModels(),
+      status: { provider: SEEDREAM_PROVIDER_ID, providerName: SEEDREAM_PROVIDER_NAME, state: "ready" },
+    };
+  }
+
+  async removeBackground(model: ImageModelRef, bytes: Buffer, signal: AbortSignal | undefined, journal: MediaTaskJournal): Promise<GeneratedImage> {
+    if (!this.isEnabled(model.provider)) throw new ImageGenerationError("The selected background removal provider is disabled", 409);
+    if (!this.options.pluginImages?.removeBackground) throw new ImageGenerationError("Background removal is unavailable", 503);
+    return this.options.pluginImages.removeBackground(model, bytes, signal, journal);
+  }
+
+  async generate(input: ImageGenerationInput, signal?: AbortSignal, recovery?: ImageGenerationRecovery): Promise<GeneratedImage> {
+    const requested = input.imageModel ?? this.options.defaultModel?.();
+    if (this.options.seedanceSettingsMigrated && requested?.provider === SEEDREAM_PROVIDER_ID) throw new ImageGenerationError(SEEDANCE_RETIRED_PROVIDER, 409);
+    if (requested && !this.isEnabled(requested.provider)) throw new ImageGenerationError("The selected image provider is disabled. Enable it or choose another default image model.", 409);
+    const selection = await this.#selection(requested, signal);
+    const definition = selection?.model;
+    if (!selection || !definition) throw new ImageGenerationError(requested
+      ? "The selected image model is unavailable. Choose a connected image provider or update the default image model in Providers."
+      : "Image generation is not configured", 503);
+    if (recovery?.resuming && recovery.receiptRecorded && definition.protocol !== "plugin")
+      throw new ImageGenerationError("Restore the original image plugin to retry the saved task", 409);
+    if (input.images?.length && !definition.supportsReferenceImage) throw new ImageGenerationError("Reference images are not supported by the selected model", 400);
+    if (input.images && definition.maxReferenceImages !== undefined && input.images.length > definition.maxReferenceImages) throw new ImageGenerationError(`The selected image model supports up to ${definition.maxReferenceImages} reference images`, 400);
+    const required = definition.minReferenceImages ?? 0;
+    if ((input.images?.length ?? 0) < required) throw new ImageGenerationError(`The selected image model needs at least ${required} reference image${required === 1 ? "" : "s"}`, 400);
+    if (!input.prompt && !(definition.promptOptionalWithReference && input.images?.length))
+      throw new ImageGenerationError("Add a prompt before generating", 400);
+    const { imageModel: _, ...generationInput } = input;
+    if (definition.protocol === "codex-cli") {
+      if (!this.options.codexImages) throw new ImageGenerationError("Codex image generation is unavailable", 503);
+      // Canvas nodes retain size preferences when switching models; Codex manages its own dimensions.
+      const { size: _size, resolution: _resolution, aspectRatio: _aspectRatio, ...cliInput } = generationInput;
+      return this.options.codexImages.generate(cliInput, signal);
+    }
+    let { size, resolution, aspectRatio } = input;
+    const workflowResolution = definition.protocol === "plugin" && definition.supportsResolution === false;
+    const workflowRatio = definition.protocol === "plugin" && definition.supportsAspectRatio === false;
+    if (workflowResolution) resolution = undefined;
+    if (workflowRatio) aspectRatio = undefined;
+    if (workflowResolution && workflowRatio) size = undefined;
+    if (size !== undefined && definition.sizes.length === 0 && resolution === undefined && aspectRatio === undefined) {
+      const ratio = LEGACY_SIZE_ASPECT_RATIOS[size];
+      const mapped = LEGACY_SIZE_RESOLUTIONS
+        .map((candidate) => definition.generationOptions.find((option) => option.resolution === candidate && option.aspectRatio === ratio))
+        .find((option) => option !== undefined);
+      if (mapped) {
+        resolution = mapped.resolution;
+        aspectRatio = mapped.aspectRatio;
+        size = undefined;
+      }
+    }
+    if (size && !definition.sizes.includes(size)) throw new ImageGenerationError("Image size is not supported by the selected model", 400);
+    if (resolution || aspectRatio) {
+      const supported = definition.protocol === "plugin" && (workflowResolution || workflowRatio)
+        ? (workflowResolution || definition.generationOptions.some(option => option.resolution === resolution)) && (workflowRatio || definition.generationOptions.some(option => option.aspectRatio === aspectRatio))
+        : definition.generationOptions.some((option) => option.resolution === resolution && option.aspectRatio === aspectRatio);
+      if (!supported) throw new ImageGenerationError(`Image resolution and aspect ratio are not supported by the selected model. Supported dimensions: ${supportedImageDimensions(definition)}.`, 400);
+    }
+    if (definition.protocol === "plugin") {
+      if (!this.options.pluginImages) throw new ImageGenerationError("Image generation is unavailable", 503);
+      const { size: _size, resolution: _resolution, aspectRatio: _aspectRatio, ...rest } = generationInput;
+      const generated = await this.options.pluginImages.generateImage(definition, { ...rest, ...(resolution ? { resolution } : {}), ...(aspectRatio ? { aspectRatio } : {}) }, signal, recovery);
+      if (input.transparentBackground) await assertTransparentImage(generated.bytes);
+      return generated;
+    }
+    if (!selection.source) throw new ImageGenerationError("Image connection is unavailable", 503);
+    const adapter = createImageProtocolAdapters(this.request)[definition.protocol];
+    const generated = await adapter.generate(selection.source, selection.model.id, {
+      ...generationInput,
+      size,
+      resolution,
+      aspectRatio,
+      ...(definition.supportsResolution === false ? { resolution: undefined } : {}),
+      ...(definition.supportsAspectRatio === false ? { aspectRatio: undefined } : {}),
+    }, signal, definition);
+    if (input.transparentBackground) await assertTransparentImage(generated.bytes);
+    return generated;
+  }
+
+  async #selection(requested?: ImageModelRef, signal?: AbortSignal): Promise<ImageSelection | undefined> {
+    if (requested?.provider === "codex-cli") return this.#codexSelection(requested.id, signal);
+    // A plugin's provider needs no model runtime.
+    if (requested?.provider.startsWith("plugin.")) return this.#pluginSelection(requested.provider, requested.id);
+    if (requested?.provider === SEEDREAM_PROVIDER_ID) return this.#seedreamSelection(requested.id);
+    if (requested?.provider === "openai" && this.options.openAIConnection) return this.#configuredOpenAISelection(requested.id, signal);
+    let runtime: ModelRuntime;
+    try {
+      runtime = await this.runtime();
+    } catch (cause) {
+      signal?.throwIfAborted();
+      if (!requested) {
+        try {
+          const selection = await this.#configuredOpenAISelection(undefined, signal);
+          if (selection) return selection;
+        } catch { signal?.throwIfAborted(); }
+        return this.#seedreamSelection() ?? await this.#codexSelection(undefined, signal);
+      }
+      throw cause;
+    }
+    if (requested?.provider === "openrouter") return this.#openRouterSelection(runtime, requested.id, signal);
+    if (requested?.provider === "openai") return this.#compatibleSelection(runtime, "openai", requested.id, signal);
+    const custom = await this.#customImageProviders(runtime);
+    if (requested) {
+      const provider = custom.find((provider) => provider.id === requested.provider);
+      return provider ? this.#customSelection(runtime, provider, requested.id, signal) : undefined;
+    }
+    // Automatic selection can skip a failed catalog. An explicit selection above always
+    // keeps its provider, and a failed generation is never retried through another one.
+    const candidates = [
+      () => this.#openRouterSelection(runtime, undefined, signal),
+      () => this.options.openAIConnection ? this.#configuredOpenAISelection(undefined, signal) : this.#compatibleSelection(runtime, "openai", undefined, signal),
+      () => this.#seedreamSelection(),
+      ...custom.map((provider) => () => this.#customSelection(runtime, provider, undefined, signal)),
+      () => this.#pluginSelection(),
+      () => this.#codexSelection(undefined, signal),
+    ];
+    for (const select of candidates) {
+      signal?.throwIfAborted();
+      try {
+        const selection = await select();
+        if (selection) return selection;
+      } catch {
+        signal?.throwIfAborted();
+      }
+    }
+    return undefined;
+  }
+
+  /** Plugins' image providers that are on. */
+  async #pluginProviders(): Promise<Array<{ id: string; name: string; models: ImageModel[] }>> {
+    return (await this.options.pluginImages?.imageProviders() ?? []).filter((provider) => this.isEnabled(provider.id));
+  }
+
+  async #pluginSelection(providerId?: string, requestedId?: string): Promise<ImageSelection | undefined> {
+    const providers = await this.#pluginProviders();
+    const models = providers.filter((provider) => providerId === undefined || provider.id === providerId).flatMap((provider) => provider.models);
+    const model = requestedId ? models.find((candidate) => candidate.id === requestedId) : models[0];
+    return model ? { model } : undefined;
+  }
+
+  async #codexSelection(id?: string, signal?: AbortSignal): Promise<ImageSelection | undefined> {
+    if (!this.isEnabled("codex-cli") || !this.options.codexImages) return undefined;
+    const catalog = await this.options.codexImages.catalog(signal);
+    const model = id ? catalog.models.find((model) => model.id === id) : catalog.models[0];
+    return model ? { model } : undefined;
+  }
+
+  async #openRouterSelection(runtime: ModelRuntime, requestedId?: string, signal?: AbortSignal): Promise<ImageSelection | undefined> {
+    if (!this.isEnabled("openrouter")) return undefined;
+    const source = await resolveOpenRouterMediaSource(runtime, signal);
+    if (!source) return undefined;
+    const models = await listOpenRouterImageModels(source, this.request, signal);
+    const model = requestedId ? models.find((candidate) => candidate.id === requestedId) : models[0];
+    return model ? { model, source } : undefined;
+  }
+
+  #seedreamSelection(requestedId?: string): ImageSelection | undefined {
+    if (this.options.seedanceSettingsMigrated || !this.isEnabled(SEEDREAM_PROVIDER_ID)) return undefined;
+    const apiKey = this.seedreamApiKey();
+    const model = requestedId ? seedreamModel(requestedId) : seedreamModels()[0];
+    return apiKey && model ? { model, source: { baseUrl: SEEDREAM_BASE_URL, apiKey } } : undefined;
+  }
+
+  async #compatibleModels(runtime: ModelRuntime, providerId: string, signal?: AbortSignal, source?: ImageSource): Promise<ImageModel[]> {
+    const provider = runtime.getProvider(providerId);
+    if (!provider || !runtime.hasConfiguredAuth(providerId)) return [];
+    source ??= await runtimeSource(runtime, providerId, signal);
+    return this.#sourceModels(providerId, provider.name, source, signal);
+  }
+
+  async #sourceModels(providerId: string, providerName: string, source: ImageSource, signal?: AbortSignal): Promise<ImageModel[]> {
+    const [ids, catalog] = await Promise.all([modelIds(source, this.request, signal), this.#capabilityCatalog(signal)]);
+    return imageModelsForProvider(providerId, providerName, ids, catalog);
+  }
+
+  async #configuredOpenAISelection(requestedId?: string, signal?: AbortSignal): Promise<ImageSelection | undefined> {
+    if (!this.isEnabled("openai") || !this.options.openAIConnection) return undefined;
+    const connection = await this.options.openAIConnection();
+    if (!connection.source) return undefined;
+    const models = connection.models ?? await this.#sourceModels("openai", "OpenAI", connection.source, signal);
+    const model = requestedId ? models.find((candidate) => candidate.id === requestedId) : models[0];
+    return model ? { model, source: connection.source } : undefined;
+  }
+
+  /** Capabilities for models reached directly; a failed lookup falls back to each family's defaults. */
+  #capabilityCatalog(signal?: AbortSignal): Promise<ImageModel[]> {
+    if (!this.#capabilities || Date.now() - this.#capabilities.loadedAt > CAPABILITY_TTL_MS) {
+      const models = listPublicOpenRouterImageModels(this.request, signal).catch(() => {
+        this.#capabilities = undefined;
+        return [];
+      });
+      this.#capabilities = { loadedAt: Date.now(), models };
+    }
+    return this.#capabilities.models;
+  }
+
+  async #compatibleSelection(runtime: ModelRuntime, providerId: string, requestedId?: string, signal?: AbortSignal): Promise<ImageSelection | undefined> {
+    if (!this.isEnabled(providerId) || !runtime.hasConfiguredAuth(providerId) || runtime.isUsingOAuth(providerId)) return undefined;
+    const source = await runtimeSource(runtime, providerId, signal);
+    const models = await this.#compatibleModels(runtime, providerId, signal, source);
+    const model = requestedId ? models.find((candidate) => candidate.id === requestedId) : models[0];
+    return model ? { model, source } : undefined;
+  }
+}
+
+interface CatalogEntry {
+  models: ImageModel[];
+  status: MediaProviderStatus;
+}
+
+async function catalogEntry(provider: string, providerName: string, list: () => Promise<ImageModel[]>, emptyMessage: string): Promise<CatalogEntry> {
+  try {
+    const models = await list();
+    return {
+      models,
+      status: models.length ? { provider, providerName, state: "ready" } : { provider, providerName, state: "empty", message: emptyMessage },
+    };
+  } catch (cause) {
+    return { models: [], status: { provider, providerName, state: "error", message: cause instanceof Error ? cause.message : String(cause) } };
+  }
+}
+
+async function runtimeSource(runtime: ModelRuntime, provider: string, signal?: AbortSignal): Promise<ImageSource> {
+  const definition = runtime.getProvider(provider);
+  const resolution = await runtime.getAuth(provider, { signal });
+  const apiKey = resolution?.auth?.apiKey;
+  if (!definition?.baseUrl || !apiKey) throw new ImageGenerationError("Image generation is not configured", 503);
+  return {
+    baseUrl: resolution.auth.baseUrl ?? definition.baseUrl,
+    apiKey,
+    headers: Object.fromEntries(Object.entries(resolution.auth.headers ?? {}).filter((entry): entry is [string, string] => typeof entry[1] === "string")),
+  };
+}
+
+async function modelIds(source: ImageSource, request: typeof fetch, signal?: AbortSignal): Promise<string[]> {
+  const timeout = AbortSignal.timeout(10_000);
+  const response = await request(`${source.baseUrl.replace(/\/$/, "")}/models`, {
+    headers: { ...source.headers, authorization: `Bearer ${source.apiKey}` },
+    signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
+  });
+  if (!response.ok) throw new Error(`Model request failed (${response.status})`);
+  const body = await response.json() as { data?: Array<{ id?: unknown }> };
+  return (body.data ?? []).flatMap((model) => typeof model.id === "string" ? [model.id] : []);
+}

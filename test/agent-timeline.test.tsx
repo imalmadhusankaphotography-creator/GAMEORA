@@ -1,0 +1,1861 @@
+// @vitest-environment happy-dom
+import path from "node:path";
+import { act } from "react";
+import { createRoot } from "react-dom/client";
+import { renderToStaticMarkup } from "react-dom/server";
+import { describe, expect, it, vi } from "vitest";
+import type { ComponentProps } from "react";
+import type { ThreadItem, Turn } from "../src/shared/contracts.js";
+
+// The 3D viewer needs a GPU; here its place in the page is what matters.
+vi.mock("@google/model-viewer", () => {
+  customElements.define("model-viewer", class extends HTMLElement {
+    paused = true;
+    play() {}
+    pause() {}
+  });
+  return {};
+});
+
+// Inspect the expanded contents in presentation tests. Mount behavior is tested separately.
+const lazyDetailsPath = path.resolve("src/renderer/lazy-details.tsx");
+vi.doMock(lazyDetailsPath, () => ({
+  LazyDetails: ({ className, summary, children }: { className: string; summary: React.ReactNode; children: React.ReactNode }) =>
+    <details className={className}>{summary}{children}</details>,
+}));
+
+const { AgentTimeline: ThreadTimeline } = await import("../src/renderer/agent-timeline.js");
+
+it("does not mount the contents of a collapsed detail", async () => {
+  const { LazyDetails: ActualDetails } = await vi.importActual<typeof import("../src/renderer/lazy-details.js")>(lazyDetailsPath);
+  const html = renderToStaticMarkup(<ActualDetails className="test-details" summary={<summary>Inspect</summary>}>
+    <div>Expensive content</div>
+  </ActualDetails>);
+  expect(html).toContain("Inspect");
+  expect(html).not.toContain("Expensive content");
+});
+
+function AgentTimeline({ items, activeTurnId, failedTurnId, cancelledTurnId, ...props }: Omit<ComponentProps<typeof ThreadTimeline>, "turns"> & { items: ThreadItem[]; activeTurnId?: string; failedTurnId?: string; cancelledTurnId?: string }) {
+  const grouped = new Map<string, ThreadItem[]>();
+  for (const item of items) grouped.set(item.turnId, [...(grouped.get(item.turnId) ?? []), item]);
+  const turns: Turn[] = [...grouped].map(([id, turnItems]) => ({
+    id,
+    conversationId: "conversation-1",
+    status: id === activeTurnId ? "inProgress" : id === failedTurnId ? "failed" : id === cancelledTurnId ? "cancelled" : "completed",
+    items: turnItems,
+  }));
+  return <ThreadTimeline {...props} turns={turns} />;
+}
+
+describe("AgentTimeline", () => {
+  it.each(["completed", "cancelled"] as const)("renders %s questions with shared timeline details", (status) => {
+    const html = renderToStaticMarkup(<AgentTimeline items={[user(), {
+      id: "question", turnId: "turn-1", type: "userInputRequest", requestId: "request", status,
+      questions: [{ id: "platform", prompt: "Which platform?", allowOther: true, options: [] }],
+      ...(status === "completed" ? { answers: [{ questionId: "platform", value: "web", label: "Web", custom: false }] } : {}),
+    }]} />);
+    const host = document.createElement("div");
+    host.innerHTML = html;
+    const details = host.querySelector(".questionnaire-outcome")!;
+    expect(details.querySelector("summary.timeline-event-expandable")?.textContent).toBe(status === "completed" ? "Questions answered" : "Questions not answered");
+    expect(details.querySelector("dt")?.textContent).toBe("Which platform?");
+    expect(details.querySelector("dd")?.textContent).toBe(status === "completed" ? "Web" : undefined);
+  });
+
+  it("opens long histories at their latest turns and reveals older messages", async () => {
+    const turns = Array.from({ length: 81 }, (_, i): Turn => ({
+      id: String(i), conversationId: "history", status: "completed",
+      items: [{ ...user(), id: "user-" + i, turnId: String(i), text: `Message [${i}]` }],
+    }));
+    const container = document.createElement("div");
+    const root = createRoot(container);
+    try {
+      await act(async () => root.render(<ThreadTimeline turns={turns} />));
+      expect(container.textContent).toContain("Message [80]");
+      expect(container.textContent).not.toContain("Message [40]");
+      const previous = () => [...container.querySelectorAll("button")].find((button) => button.textContent === "Show earlier messages");
+      await act(async () => previous()!.click());
+      expect(container.textContent).toContain("Message [40]");
+      await act(async () => previous()!.click());
+      expect(container.textContent).toContain("Message [0]");
+      expect(previous()).toBeUndefined();
+    } finally { await act(async () => root.unmount()); }
+  });
+
+  it("places Branch in new chat immediately after Copy for every persisted completed response", () => {
+    const response: ThreadItem = { id: "response", turnId: "turn-1", type: "agentMessage", text: "Done", status: "completed", phase: "final_answer", branchEntryId: "stored-response" };
+    const html = renderToStaticMarkup(<AgentTimeline items={[user(), response]} onBranch={() => {}} />);
+    expect(html).toMatch(/aria-label="Copy response"[\s\S]*?<\/button><button[^>]*aria-label="Branch in new chat"/);
+    expect(html).not.toMatch(/aria-label="Branch in new chat"[^>]*disabled/);
+    const pending = renderToStaticMarkup(<AgentTimeline items={[user(), { ...response, branchEntryId: undefined }]} onBranch={() => {}} />);
+    expect(pending).toMatch(/aria-label="Branch in new chat"[^>]*disabled/);
+  });
+  it("shows per-call line counts only for successful file edits", () => {
+    const edit: ThreadItem = { id: "edit-1", turnId: "turn-1", type: "dynamicToolCall", toolCallId: "call-1", tool: "edit", status: "completed", arguments: { path: "game.ts" }, output: "Updated", lineChanges: { added: 3, removed: 1 } };
+    const html = renderToStaticMarkup(<AgentTimeline items={[user(), edit]} activeTurnId="turn-1" />);
+    expect(html).toContain('aria-label="Lines added: 3; lines removed: 1"');
+    expect(html).toContain('class="change-count-added"');
+    expect(html).toContain('class="change-count-removed"');
+    for (const status of ["failed", "inProgress"] as const) {
+      expect(renderToStaticMarkup(<AgentTimeline items={[user(), { ...edit, status }]} />)).not.toContain("change-counts");
+    }
+  });
+
+  it("shows a completed call's Diff while the turn runs, and keeps failure output", () => {
+    const edit: ThreadItem = { id:"edit",turnId:"turn-1",type:"dynamicToolCall",toolCallId:"edit",tool:"edit",status:"completed",arguments:{path:"src/render.ts"},lineChanges:{added:1,removed:1},fileDiff:{hunks:[[{kind:"removed",text:"old code",before:12},{kind:"added",text:"new code",after:12}]],truncated:true} };
+    const html = renderToStaticMarkup(<AgentTimeline items={[user(),edit]} activeTurnId="turn-1" />);
+    expect(html).toContain("Diff");
+    expect(html).toContain("old code");
+    expect(html).toContain("turn-change-line-added");
+    expect(html).toContain("turn-change-line-removed");
+    expect(html).toContain("truncated");
+    for(const status of ["inProgress","failed"] as const) {
+      const pending = renderToStaticMarkup(<AgentTimeline items={[user(),{...edit,status,output:"Could not find exact text"}]} activeTurnId="turn-1" />);
+      expect(pending).not.toContain("old code");
+      expect(pending).not.toContain("change-counts");
+      expect(pending).toContain("Could not find exact text");
+    }
+  });
+
+  it("does not render structured plans in conversation history", () => {
+    const html = renderToStaticMarkup(<AgentTimeline items={[
+      user(),
+      { id: "turn-1:plan", turnId: "turn-1", type: "plan", plan: { steps: [{ step: "Inspect files", status: "completed" }] } },
+    ]} />);
+
+    expect(html).not.toContain("Inspect files");
+    expect(html).not.toContain("Worked for");
+  });
+
+  it("shows initial Thinking in a stable shimmering header without a loading icon", () => {
+    const html = renderToStaticMarkup(
+      <AgentTimeline items={[user()]} activeTurnId="turn-1" />,
+    );
+
+    expect(html).toContain("Thinking");
+    expect(html).toContain("work-summary-thinking");
+    expect(html).toContain("work-activity-active");
+    expect(html).toContain('<span class="activity-shimmer">Thinking<span class="activity-shimmer-highlight" aria-hidden="true">Thinking</span></span>');
+    expect(html).not.toContain("solar-refresh-linear spin");
+    expect(html).not.toContain("Working for");
+    expect(html).not.toContain("Worked");
+    expect(html).not.toContain("<details");
+  });
+
+  it("streams a rolling thought summary line while thinking stays collapsed", () => {
+    const html = renderToStaticMarkup(<AgentTimeline items={[
+      user(),
+      { id: "thinking", turnId: "turn-1", type: "reasoning", text: "Reviewing the setup.\n\n**Planning Vite app creation**", status: "inProgress" },
+    ]} activeTurnId="turn-1" />);
+
+    expect(html).toContain('<span class="thought-label activity-shimmer">Thinking<span class="activity-shimmer-highlight" aria-hidden="true">Thinking</span></span>');
+    expect(html).toContain('class="thought-stream-summary"');
+    expect(html).toContain('<span class="markdown-content thought-stream-text"><strong>Planning Vite app creation</strong></span>');
+    expect(html).toContain('<div class="markdown-content thought-text"><p>Reviewing the setup.</p>');
+    expect(html).toContain("<p><strong>Planning Vite app creation</strong></p>");
+    expect(html).not.toContain("**Planning Vite app creation**");
+    expect(html).not.toContain('class="thought-activity" open');
+  });
+
+  it.each(["", "Planning the build"])("labels thinking that opens a turn once (%j)", (text) => {
+    const host = document.createElement("div");
+    host.innerHTML = renderToStaticMarkup(<AgentTimeline items={[
+      user(),
+      { id: "thinking", turnId: "turn-1", type: "reasoning", text, status: "inProgress" },
+    ]} activeTurnId="turn-1" />);
+    host.querySelectorAll(".activity-shimmer-highlight").forEach((highlight) => highlight.remove());
+    expect(host.textContent?.split("Thinking")).toHaveLength(2);
+  });
+
+  it("keeps a thought's streamed time once its turn ends, and gives none from history alone", async () => {
+    vi.useFakeTimers();
+    const container = document.createElement("div");
+    const root = createRoot(container);
+    const thought = (status: "inProgress" | "completed"): ThreadItem => ({ id: "timed-thought", turnId: "turn-1", type: "reasoning", text: "Weighing it", status, timestamp: Date.now() });
+    await act(async () => root.render(<AgentTimeline items={[user(), thought("inProgress")]} activeTurnId="turn-1" />));
+    await act(async () => { vi.advanceTimersByTime(3_000); });
+    await act(async () => root.render(<AgentTimeline items={[user(), thought("completed"), tool()]} activeTurnId="turn-1" />));
+    expect(container.querySelector(".thought-label")?.textContent).toBe("Thought · 3s");
+    await act(async () => root.render(<AgentTimeline items={[user(), thought("completed"), tool(), assistant("final", "Done.", "final_answer")]} />));
+    expect(container.querySelector(".thought-label")?.textContent).toBe("Thought · 3s");
+    act(() => root.unmount());
+    vi.useRealTimers();
+
+    // Parts of one message share its time.
+    const history = renderToStaticMarkup(<AgentTimeline items={[
+      user(),
+      { id: "first-part", turnId: "turn-1", type: "reasoning", text: "One", status: "completed", timestamp: 5_000 },
+      { id: "second-part", turnId: "turn-1", type: "reasoning", text: "Two", status: "completed", timestamp: 5_000 },
+      assistant("final", "Done.", "final_answer"),
+    ]} />);
+    expect(history).toContain('<span class="thought-label">Thought</span>');
+  });
+
+  it("keeps completed tools visible when work begins", () => {
+    const html = renderToStaticMarkup(
+      <AgentTimeline items={[user(), tool()]} activeTurnId="turn-1" />,
+    );
+
+    expect(html).toContain("Working for");
+    expect(html.match(/<div class="work-summary work-summary-active">([\s\S]*?)<\/div>/)?.[1]).not.toContain("solar-refresh-linear");
+    expect(html).toContain("Thinking");
+    expect(html).toContain("Read package.json");
+    expect(html).toContain('class="tool-activity-group"');
+    expect(html).toContain('<span class="tool-label activity-shimmer" title="Thinking" role="status">Thinking<span class="activity-shimmer-highlight" aria-hidden="true">Thinking</span></span>');
+    expect(html).toContain('<summary class="tool-group-summary tool-group-summary-thinking"><span class="tool-label activity-shimmer"');
+    expect(html).not.toContain('class="thinking-activity"');
+    expect(html).not.toContain('class="tool-activity-group" open');
+    expect(html).not.toContain("<details class=\"work-activity\"");
+  });
+
+  it("uses Working while streaming a direct answer but does not retain Worked after completion", () => {
+    const streaming = renderToStaticMarkup(<AgentTimeline items={[
+      user(),
+      { ...assistant("response", "Hello"), status: "inProgress", phase: undefined },
+    ]} activeTurnId="turn-1" />);
+    const complete = renderToStaticMarkup(<AgentTimeline items={[
+      user(),
+      assistant("response", "Hello", "final_answer"),
+    ]} />);
+
+    expect(streaming).toContain("Hello");
+    expect(streaming).not.toContain("Thinking");
+    expect(streaming).toContain("Working for");
+    expect(complete).toContain("Hello");
+    expect(complete).not.toContain("Worked");
+  });
+
+  it("shows Thinking while the next model step is pending after commentary", () => {
+    const html = renderToStaticMarkup(<AgentTimeline items={[
+      user(),
+      tool(),
+      assistant("commentary", "I will write the game files.", "commentary"),
+    ]} activeTurnId="turn-1" />);
+
+    expect(html).toContain("I will write the game files.");
+    expect(html).toContain("Thinking");
+    expect(html.indexOf("I will write the game files.")).toBeLessThan(html.lastIndexOf("Thinking"));
+    expect(html.indexOf("Thinking")).toBeLessThan(html.indexOf('</div></section>'));
+  });
+
+  it("does not add Thinking while commentary is still streaming", () => {
+    const html = renderToStaticMarkup(<AgentTimeline items={[
+      user(),
+      tool(),
+      { ...assistant("commentary", "I will write the game files."), status: "inProgress", phase: undefined },
+    ]} activeTurnId="turn-1" />);
+
+    expect(html).toContain("I will write the game files.");
+    expect(html).not.toContain("thinking-activity");
+  });
+
+  it("shows Thinking after stalled text", () => {
+    const html = renderToStaticMarkup(<AgentTimeline items={[
+      user(),
+      { ...assistant("commentary", "I will write the game files."), status: "inProgress", phase: undefined, timestamp: 1 },
+    ]} activeTurnId="turn-1" />);
+
+    expect(html.indexOf("I will write the game files.")).toBeLessThan(html.indexOf("Thinking"));
+  });
+
+  it("shows Thinking once live text stalls for a second while the elapsed time keeps counting", async () => {
+    vi.useFakeTimers();
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    await act(async () => root.render(<AgentTimeline items={[
+      user(),
+      { ...assistant("commentary", "I will write the game files."), status: "inProgress", phase: undefined },
+    ]} activeTurnId="turn-1" />));
+    expect(container.textContent).not.toContain("Thinking");
+    expect(container.textContent).toContain("Working for 1s");
+    await act(async () => { vi.advanceTimersByTime(1_000); });
+    expect(container.textContent).toContain("Thinking");
+    expect(container.textContent).toContain("Working for 2s");
+    await act(async () => { vi.advanceTimersByTime(3_000); });
+    expect(container.textContent).toContain("Working for 5s");
+    act(() => root.unmount());
+    container.remove();
+    vi.useRealTimers();
+  });
+
+  it("keeps unclassified text in the stable Working container until its phase is known", () => {
+    const streaming = renderToStaticMarkup(<AgentTimeline items={[
+      user(),
+      { ...assistant("commentary", "I will inspect it."), status: "inProgress", phase: undefined },
+    ]} activeTurnId="turn-1" />);
+    const commentary = renderToStaticMarkup(<AgentTimeline items={[
+      user(),
+      assistant("commentary", "I will inspect it.", "commentary"),
+    ]} activeTurnId="turn-1" />);
+
+    expect(streaming).not.toContain("Thinking");
+    expect(streaming).toContain("Working for");
+    expect(commentary.indexOf("Working for")).toBeLessThan(commentary.indexOf("I will inspect it."));
+    expect(commentary).toContain("Thinking");
+  });
+
+  it("keeps completed and failed tools visible while waiting for the next step", () => {
+    const html = renderToStaticMarkup(<AgentTimeline items={[
+      user(),
+      tool(),
+      {
+        id: "failed-tool",
+        turnId: "turn-1",
+        type: "dynamicToolCall",
+        toolCallId: "failed-tool",
+        tool: "bash",
+        status: "failed",
+        arguments: { command: "npm run build" },
+        output: "private build output",
+      },
+    ]} activeTurnId="turn-1" />);
+
+    expect(html).toContain("Thinking");
+    expect(html).not.toContain("Read a file, one action failed");
+    expect(html).toContain("Ran npm run build");
+    expect(html).not.toContain('class="tool-activity-details" open');
+    expect(html).toContain("private build output");
+  });
+
+  it("keeps completed Pi thinking as a collapsed Thought row", () => {
+    const html = renderToStaticMarkup(<AgentTimeline items={[
+      user(),
+      { id: "thinking", turnId: "turn-1", type: "reasoning", text: "Inspect the project structure.", status: "completed" },
+    ]} />);
+
+    expect(html).toContain("Thought");
+    expect(html).toContain("Inspect the project structure.");
+    expect(html).not.toContain('class="thought-activity" open');
+  });
+
+  it("keeps Thinking before a final answer inside the Worked fold", () => {
+    const html = renderToStaticMarkup(<AgentTimeline items={[
+      user(),
+      { id: "thinking", turnId: "turn-1", type: "reasoning", text: "private", status: "completed" },
+      assistant("response", "Done.", "final_answer"),
+    ]} />);
+
+    expect(html).toContain("Done.");
+    expect(html).toContain("Thought");
+    expect(html).toContain("Worked for");
+    expect(html).not.toContain("Thinking");
+  });
+
+  it("keeps a stopped turn's reasoning text in its Thought fold", () => {
+    const html = renderToStaticMarkup(<AgentTimeline items={[
+      { ...user(), timestamp: 1_000 },
+      { id: "thinking", turnId: "turn-1", type: "reasoning", text: "private reasoning", status: "completed", timestamp: 2_000 },
+      { id: "stopped", turnId: "turn-1", type: "agentMessage", text: "", status: "cancelled", timestamp: 4_000 },
+    ]} cancelledTurnId="turn-1" />);
+
+    expect(html).toContain("You stopped after 3s");
+    expect(html).toContain("Thought");
+    expect(html).toContain("private reasoning");
+    expect(html).toContain('class="work-activity work-activity-stopped"');
+    expect(html).not.toContain('<details class="work-activity"');
+    expect(html).not.toContain('<span class="muted-text">Stopped</span>');
+  });
+
+  it("keeps completed work inside a stopped turn", () => {
+    const html = renderToStaticMarkup(<AgentTimeline items={[
+      { ...user(), timestamp: 1_000 },
+      { ...tool(), timestamp: 2_000 },
+      { id: "stopped", turnId: "turn-1", type: "agentMessage", text: "", status: "cancelled", timestamp: 4_000 },
+    ]} cancelledTurnId="turn-1" />);
+
+    expect(html).toContain("You stopped after 3s");
+    expect(html).toContain("Read a file");
+    expect(html).toContain("Read package.json");
+    expect(html).toContain('class="work-activity work-activity-stopped"');
+    expect(html).not.toContain('<details class="work-activity"');
+    expect(html).not.toContain("Stopped while thinking");
+  });
+
+  it("shows zero seconds when a turn is stopped in under a second", () => {
+    const html = renderToStaticMarkup(<AgentTimeline items={[
+      { ...user(), timestamp: 1_000 },
+      { id: "stopped", turnId: "turn-1", type: "agentMessage", text: "", status: "cancelled", timestamp: 1_500 },
+    ]} cancelledTurnId="turn-1" />);
+
+    expect(html).toContain("You stopped after 0s");
+    expect(html).not.toContain("&lt;1s");
+  });
+
+  it("keeps the latest tool before Thinking after earlier commentary", () => {
+    const html = renderToStaticMarkup(<AgentTimeline items={[
+      user(),
+      { id: "thinking", turnId: "turn-1", type: "reasoning", text: "private", status: "completed" },
+      assistant("commentary", "I will inspect it.", "commentary"),
+      tool(),
+    ]} activeTurnId="turn-1" />);
+
+    expect(html).toContain("Working for");
+    expect(html).not.toContain("thinking-block");
+    expect(html).toContain("I will inspect it.");
+    expect(html).toContain("Thinking");
+    expect(html).toContain("Read package.json");
+  });
+
+  it("omits completed Thinking while preserving the surrounding event order", () => {
+    const html = renderToStaticMarkup(<AgentTimeline items={[
+      user(),
+      assistant("commentary", "I will inspect it.", "commentary"),
+      tool(),
+      { id: "thinking", turnId: "turn-1", type: "reasoning", text: "private", status: "completed" },
+      assistant("next", "I will update it.", "commentary"),
+    ]} activeTurnId="turn-1" />);
+
+    expect(html.indexOf("I will inspect it.")).toBeLessThan(html.indexOf("Read package.json"));
+    expect(html.indexOf("Read package.json")).toBeLessThan(html.indexOf("I will update it."));
+    expect(html).toContain("Thinking");
+  });
+
+  it("shows the live summary as soon as thinking after a tool has text", () => {
+    const render = (text: string) => renderToStaticMarkup(<AgentTimeline items={[
+      user(),
+      assistant("commentary", "I will inspect it.", "commentary"),
+      tool(),
+      { id: "thinking", turnId: "turn-1", type: "reasoning", text, status: "inProgress" },
+    ]} activeTurnId="turn-1" />);
+
+    const waiting = render("   ");
+    expect(waiting).toContain('class="tool-group-summary tool-group-summary-thinking"');
+    expect(waiting).not.toContain('class="thought-stream-summary"');
+
+    const html = render("Planning the next edit");
+    expect(html).toContain("Working for");
+    expect(html).toContain("Thinking");
+    expect(html).toContain('<span class="markdown-content thought-stream-text">Planning the next edit</span>');
+    expect(html).toContain("package.json");
+    expect(html).toContain("tool-activity-group");
+    expect(html).not.toContain("tool-group-summary-thinking");
+    expect(html).not.toContain('class="thinking-activity"');
+  });
+
+  it("restores the tool summary before rendering subsequent text", () => {
+    const html = renderToStaticMarkup(<AgentTimeline items={[
+      user(),
+      tool(),
+      { ...assistant("commentary", "I found the relevant file."), status: "inProgress", phase: undefined },
+    ]} activeTurnId="turn-1" />);
+
+    expect(html).toContain("Read a file");
+    expect(html.indexOf("Read a file")).toBeLessThan(html.indexOf("I found the relevant file."));
+    expect(html).not.toContain('title="Thinking">Thinking</span>');
+  });
+
+  it("keeps tools and settled reasoning when completed reasoning returns to the generic status", () => {
+    const html = renderToStaticMarkup(<AgentTimeline items={[
+      user(),
+      tool(),
+      { id: "thinking", turnId: "turn-1", type: "reasoning", text: "Planning the next edit", status: "completed" },
+    ]} activeTurnId="turn-1" />);
+
+    expect(html).toContain("Thinking");
+    expect(html).toContain("Planning the next edit");
+    expect(html).toContain("Read package.json");
+  });
+
+  it("drops Thinking from the final tool aggregation", () => {
+    const html = renderToStaticMarkup(<AgentTimeline items={[
+      user(),
+      assistant("commentary", "I will inspect it.", "commentary"),
+      tool(),
+      { id: "thinking", turnId: "turn-1", type: "reasoning", text: "private", status: "completed" },
+      assistant("response", "Done.", "final_answer"),
+    ]} />);
+
+    expect(html).toContain("Read package.json");
+    expect(html).toContain("Read a file");
+    expect(html).toContain("tool-activity-group");
+    expect(html).not.toContain("Thinking");
+  });
+
+  it("groups Codex commentary and tools while keeping the final answer outside", () => {
+    const html = renderToStaticMarkup(<AgentTimeline items={[
+      user(),
+      assistant("commentary", "I will inspect it.", "commentary"),
+      tool(),
+      assistant("response", "Done.", "final_answer"),
+    ]} />);
+
+    expect(html).toContain("Worked for");
+    expect(html.indexOf("I will inspect it.")).toBeLessThan(html.indexOf("Read package.json"));
+    expect(html.indexOf("Read package.json")).toBeLessThan(html.indexOf("Done."));
+    expect(html.indexOf('class="work-items"')).toBeLessThan(html.indexOf("I will inspect it."));
+    expect(html.indexOf("Done.")).toBeGreaterThan(html.indexOf("</details>"));
+  });
+
+  it("shows a right-facing arrow for collapsed Worked", () => {
+    const html = renderToStaticMarkup(<AgentTimeline items={[
+      user(),
+      tool(),
+      assistant("response", "Done.", "final_answer"),
+    ]} />);
+
+    expect(html).toContain("solar-alt-arrow-right-linear work-chevron");
+  });
+
+  it("renders a failed stream as an error card inside Worked", () => {
+    const html = renderToStaticMarkup(<AgentTimeline items={[user(), {
+      id: "assistant-error",
+      turnId: "turn-1",
+      type: "agentMessage",
+      text: "I started checking the project.",
+      status: "failed",
+      error: { code: "stream_error", message: "OpenAI Responses stream ended before a terminal response event" },
+    }]} failedTurnId="turn-1" />);
+
+    expect(html).toContain("Worked for");
+    expect(html).toContain("I started checking the project.");
+    expect(html).toContain("Response interrupted");
+    // The provider's response waits behind Details.
+    expect(html).not.toContain("OpenAI Responses stream ended before a terminal response event");
+    expect(html).toContain('class="agent-error-card" role="alert"');
+    expect(html).toContain('class="work-activity work-activity-failed"');
+    expect(html).not.toContain('<details class="work-activity"');
+    expect(html).not.toContain('class="message-error"');
+  });
+
+  it("replaces missing model credentials with an actionable setup message", () => {
+    const html = renderToStaticMarkup(<AgentTimeline items={[user(), {
+      id: "assistant-error",
+      turnId: "turn-1",
+      type: "agentMessage",
+      text: "",
+      status: "failed",
+      error: { code: "model_not_configured", message: "No API key found for the selected model. Use /login to log into a provider via OAuth or API key. See: /local/path/providers.md" },
+    }]} failedTurnId="turn-1" />);
+
+    expect(html).toContain("Model setup required");
+    expect(html).toContain("Choose an available model or connect its provider in Settings");
+    expect(html).not.toContain("No API key");
+    expect(html).not.toContain("/local/path/providers.md");
+    expect(html).toContain(">Open settings</button>");
+  });
+
+  it("shows DNS guidance on the card and keeps its diagnostics behind Details", () => {
+    const html = renderToStaticMarkup(<AgentTimeline items={[user(), {
+      id: "assistant-error", turnId: "turn-1", type: "agentMessage", text: "", status: "failed",
+      error: { code: "dns_error", message: "Connection error.", diagnostics: {
+        provider: "deepseek", model: "deepseek-chat", endpoint: "https://api.deepseek.com/", requestId: "req-123", retryAttempts: 3,
+        network: { source: "manual", proxyUrl: "http://localhost:7890/" },
+        causes: [{ code: "ENOTFOUND", message: "getaddrinfo api.deepseek.com" }],
+      } },
+    }]} failedTurnId="turn-1" />);
+    expect(html).toContain("<strong>DNS lookup failed</strong>");
+    expect(html).toContain("A hostname could not be resolved");
+    expect(html).toContain('aria-expanded="false">Details</button>');
+    expect(html).toContain(">Open settings</button>");
+    expect(html).not.toContain("agent-error-rows");
+    expect(html).not.toContain("ENOTFOUND");
+  });
+
+  it("opens an error card's diagnostics and copies them", async () => {
+    const writeText = vi.fn(async () => {});
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    await act(async () => root.render(<AgentTimeline items={[user(), {
+      id: "assistant-error", turnId: "turn-1", type: "agentMessage", text: "", status: "failed",
+      error: { code: "dns_error", message: "Connection error.", diagnostics: {
+        provider: "deepseek", requestId: "req-123", retryAttempts: 5, network: { source: "manual", proxyUrl: "http://localhost:7890/" },
+        causes: [{ code: "ENOTFOUND", message: "getaddrinfo api.deepseek.com" }],
+      } },
+    }]} failedTurnId="turn-1" />));
+    const button = (label: string) => [...container.querySelectorAll("button")].find((item) => item.textContent === label)!;
+    await act(async () => button("Details").click());
+    const rows = container.querySelector(".agent-error-rows")?.textContent;
+    expect(rows).toContain("ENOTFOUND");
+    expect(rows).toContain("req-123");
+    expect(rows).toContain("Manual proxy");
+    // Beside a reconnect's own "3/3", this count has to say it covers the whole turn.
+    expect(rows).toContain("Total retries this turn");
+    await act(async () => button("Copy diagnostics").click());
+    expect(writeText).toHaveBeenCalledWith(expect.stringContaining("DNS lookup failed"));
+    expect(button("Diagnostics copied")).toBeTruthy();
+    await act(async () => button("Hide details").click());
+    expect(container.querySelector(".agent-error-rows")).toBeNull();
+    await act(async () => button("Open settings").click());
+    expect(window.location.hash).toBe("#/settings/network");
+    act(() => root.unmount());
+    container.remove();
+  });
+
+  it("says when copying an error's diagnostics fails, and lets the copied note expire", async () => {
+    vi.useFakeTimers();
+    const writeText = vi.fn<(text: string) => Promise<void>>(async () => { throw new Error("denied"); });
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    await act(async () => root.render(<AgentTimeline items={[user(), {
+      id: "assistant-error", turnId: "turn-1", type: "agentMessage", text: "", status: "failed",
+      error: { code: "timeout", message: "Request timed out." },
+    }]} failedTurnId="turn-1" />));
+    const button = (label: string) => [...container.querySelectorAll("button")].find((item) => item.textContent === label);
+    await act(async () => button("Details")!.click());
+    await act(async () => button("Copy diagnostics")!.click());
+    expect(container.textContent).toContain("Could not copy. Select the details above to copy them manually.");
+    writeText.mockResolvedValue(undefined);
+    await act(async () => button("Copy diagnostics")!.click());
+    expect(button("Diagnostics copied")).toBeTruthy();
+    await act(async () => { vi.advanceTimersByTime(1_500); });
+    expect(button("Copy diagnostics")).toBeTruthy();
+    act(() => root.unmount());
+    container.remove();
+    vi.useRealTimers();
+  });
+
+  it.each([
+    ["model_not_configured", "#/settings/providers"], ["authentication_failed", "#/settings/providers"],
+    ["runtime_incompatible", "#/settings/agents"], ["runtime_probe_failed", "#/settings/agents"],
+    ["connection_refused", "#/settings/network"], ["tls_error", "#/settings/network"],
+  ] as const)("sends %s to the settings that fix it", async (code, hash) => {
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    await act(async () => root.render(<AgentTimeline items={[user(), {
+      id: "assistant-error", turnId: "turn-1", type: "agentMessage", text: "", status: "failed", error: { code, message: "failed" },
+    }]} failedTurnId="turn-1" />));
+    await act(async () => [...container.querySelectorAll("button")].find((item) => item.textContent === "Open settings")!.click());
+    expect(window.location.hash).toBe(hash);
+    act(() => root.unmount());
+    container.remove();
+  });
+
+  describe("continue after a usage limit", () => {
+    const stopped = (turnId: string): ThreadItem => ({ id: `${turnId}-error`, turnId, type: "agentMessage", text: "", status: "failed", error: { code: "quota_exceeded", message: "failed" } });
+    const turn = (id: string): Turn => ({ id, conversationId: "conversation-1", status: "failed", items: [stopped(id)] });
+    const limitResume = (state: "armed" | "off" | "skipped") => ({ at: Date.UTC(2026, 9, 26, 12), state });
+
+    it("shows a switch on the latest turn's card only, which changes the setting", async () => {
+      const container = document.createElement("div");
+      const root = createRoot(container);
+      const onLimitResumeChange = vi.fn();
+      await act(async () => root.render(<ThreadTimeline turns={[turn("turn-1"), turn("turn-2")]} limitResume={limitResume("armed")} onLimitResumeChange={onLimitResumeChange} />));
+      const cards = container.querySelectorAll(".agent-error-card");
+      expect(cards).toHaveLength(2);
+      expect(cards[0]!.querySelector('[role="switch"]')).toBeNull();
+      const toggle = cards[1]!.querySelector<HTMLButtonElement>('[role="switch"]')!;
+      expect(toggle.getAttribute("aria-checked")).toBe("true");
+      expect(cards[1]!.textContent).toContain("Continues automatically");
+      await act(async () => toggle.click());
+      expect(onLimitResumeChange).toHaveBeenCalledExactlyOnceWith(false);
+      await act(async () => root.unmount());
+    });
+
+    it("keeps the switch on the failed turn's card when a model change follows it", () => {
+      const modelChange: Turn = { id: "turn-2", conversationId: "conversation-1", status: "completed", items: [] };
+      expect(renderToStaticMarkup(<ThreadTimeline turns={[turn("turn-1"), modelChange]} limitResume={limitResume("armed")} />)).toContain('role="switch"');
+    });
+
+    it("shows the switch off with when the limit resets, so it can be turned back on", async () => {
+      const container = document.createElement("div");
+      const root = createRoot(container);
+      const onLimitResumeChange = vi.fn();
+      await act(async () => root.render(<ThreadTimeline turns={[turn("turn-1")]} limitResume={limitResume("off")} onLimitResumeChange={onLimitResumeChange} />));
+      const toggle = container.querySelector<HTMLButtonElement>('[role="switch"]')!;
+      expect(toggle.getAttribute("aria-checked")).toBe("false");
+      expect(container.textContent).toContain("Continue after reset is off");
+      await act(async () => toggle.click());
+      expect(onLimitResumeChange).toHaveBeenCalledExactlyOnceWith(true);
+      await act(async () => root.unmount());
+    });
+
+    it("shows nothing once the person began writing, or without a schedule", () => {
+      expect(renderToStaticMarkup(<ThreadTimeline turns={[turn("turn-1")]} limitResume={limitResume("skipped")} />)).not.toContain('role="switch"');
+      expect(renderToStaticMarkup(<ThreadTimeline turns={[turn("turn-1")]} />)).not.toContain('role="switch"');
+    });
+  });
+
+  it.each(["quota_exceeded", "rate_limited", "access_denied", "stream_error"] as const)("offers no settings shortcut for %s", (code) => {
+    const html = renderToStaticMarkup(<AgentTimeline items={[user(), {
+      id: "assistant-error", turnId: "turn-1", type: "agentMessage", text: "", status: "failed", error: { code, message: "failed" },
+    }]} failedTurnId="turn-1" />);
+    expect(html).not.toContain(">Open settings</button>");
+  });
+
+  it("previews an unclassified error on one line while keeping its full response for Details", () => {
+    const message = "Unexpected gateway response\n  upstream request failed with additional diagnostic context";
+    const html = renderToStaticMarkup(<AgentTimeline items={[user(), {
+      id: "assistant-error", turnId: "turn-1", type: "agentMessage", text: "", status: "failed", error: { message },
+    }]} failedTurnId="turn-1" />);
+    expect(html).toContain("<strong>Model request failed</strong>");
+    const preview = html.match(/<p class="agent-error-preview"[^>]*>([\s\S]*?)<\/p>/)?.[1];
+    expect(preview).toBe("Unexpected gateway response upstream request failed with additional diagnostic context");
+    expect(html).not.toContain(">Open settings</button>");
+    expect(html).not.toContain("activity-shimmer");
+  });
+
+  it.each([
+    ["authentication_failed", "Authentication failed"], ["quota_exceeded", "Provider quota exhausted"],
+    ["invalid_request", "Model request rejected"], [undefined, "Model request failed"],
+  ] as const)("does not call %s a connection error", (code, title) => {
+    const html = renderToStaticMarkup(<AgentTimeline items={[user(), {
+      id: "assistant-error", turnId: "turn-1", type: "agentMessage", text: "", status: "failed",
+      error: { ...(code ? { code } : {}), message: "Provider rejected the request" },
+    }]} failedTurnId="turn-1" />);
+    expect(html).toContain(title);
+    expect(html).not.toContain("Connection error");
+  });
+
+  it("renders only the final connection error when a turn has multiple failed attempts", () => {
+    const failedMessage = (id: string, text: string, error: string): ThreadItem => ({
+      id,
+      turnId: "turn-1",
+      type: "agentMessage",
+      text,
+      status: "failed",
+      error: { code: "connection_reset", message: error },
+    });
+    const html = renderToStaticMarkup(<AgentTimeline items={[
+      user(),
+      failedMessage("attempt-1", "First partial response.", "first disconnect"),
+      failedMessage("attempt-2", "Second partial response.", "second disconnect"),
+      failedMessage("attempt-3", "Third partial response.", "final disconnect"),
+    ]} failedTurnId="turn-1" />);
+
+    expect(html.match(/<strong>Connection interrupted<\/strong>/g)).toHaveLength(1);
+    expect(html.match(/class="agent-error-card"/g)).toHaveLength(1);
+    expect(html).not.toContain("first disconnect");
+    expect(html).not.toContain("second disconnect");
+    expect(html.indexOf("Third partial response.")).toBeLessThan(html.indexOf("Connection interrupted"));
+  });
+
+  it("shows only one expandable reconnect row for a retried stream error", () => {
+    const error = "OpenAI Responses stream ended before a terminal response event";
+    const html = renderToStaticMarkup(<AgentTimeline items={[user(), {
+      id: "assistant-error",
+      turnId: "turn-1",
+      type: "agentMessage",
+      text: "I started checking the project.",
+      status: "failed",
+      error: { message: error },
+    }, {
+      id: "retry",
+      turnId: "turn-1",
+      type: "retry",
+      status: "inProgress",
+      attempt: 1,
+      maxAttempts: 3,
+      delayMs: 1_000,
+      error: { message: error },
+    }]} activeTurnId="turn-1" />);
+
+    expect(html).toContain("Reconnecting 1/3");
+    expect(html.match(/OpenAI Responses stream ended before a terminal response event/g)).toHaveLength(1);
+    expect(html.match(/connection-activity-details/g)).toHaveLength(1);
+    expect(html).toContain("tool-detail-chevron");
+    expect(html).not.toContain("solar-refresh-linear spin");
+    expect(html).toContain('<span class="tool-label activity-shimmer" title="Reconnecting 1/3" role="status">Reconnecting 1/3');
+  });
+
+  it.each([
+    { counts: {}, label: "Reconnecting…" },
+    { counts: { attempt: 2 }, label: "Reconnecting, attempt 2" },
+  ])("shows only the reconnect counts the runtime reported", ({ counts, label }) => {
+    const html = renderToStaticMarkup(<AgentTimeline items={[user(), {
+      id: "retry", turnId: "turn-1", type: "retry", status: "inProgress",
+      ...counts, error: { message: "Stream disconnected" },
+    }]} activeTurnId="turn-1" />);
+    expect(html).toContain(`title="${label}" role="status"`);
+  });
+
+  it("shows a reported native error before the turn settles", () => {
+    const html = renderToStaticMarkup(<AgentTimeline items={[user(), {
+      id: "turn-1:status", turnId: "turn-1", type: "agentMessage", text: "",
+      status: "failed", error: { code: "connection_refused", message: "Connection refused" },
+    }]} activeTurnId="turn-1" />);
+    expect(html).toContain('<div class="agent-error-card" role="alert">');
+    expect(html).toContain("<strong>Connection refused</strong>");
+    expect(html).not.toContain('class="thinking-activity"');
+  });
+
+  it("keeps reconnecting static after later activity appears", () => {
+    const html = renderToStaticMarkup(<AgentTimeline items={[user(), {
+      id: "retry",
+      turnId: "turn-1",
+      type: "retry",
+      status: "inProgress",
+      attempt: 1,
+      maxAttempts: 3,
+      delayMs: 1_000,
+      error: { message: "stream disconnected" },
+    }, assistant("commentary", "I resumed the work.", "commentary")]} activeTurnId="turn-1" />);
+
+    expect(html).toContain("Reconnecting 1/3");
+    expect(html).not.toContain('<summary>Details');
+    expect(html).toContain('<span class="tool-label" title="Reconnecting 1/3">Reconnecting 1/3</span>');
+    expect(html).not.toContain("solar-refresh-linear spin");
+    expect(html).not.toContain('class="tool-label activity-shimmer" title="Reconnecting');
+  });
+
+  it.each([20, 30])("shimmers a reused retry row with timestamp %s after another failed attempt", (timestamp) => {
+    const html = renderToStaticMarkup(<AgentTimeline items={[user(), {
+      id: "retry", turnId: "turn-1", type: "retry", status: "inProgress", attempt: 2, maxAttempts: 3,
+      delayMs: 1_000, error: { message: "stream disconnected again" }, timestamp,
+    }, {
+      ...assistant("attempt-1", "Partial reply", "commentary"), status: "failed", timestamp: 20,
+      error: { message: "stream disconnected" },
+    }]} activeTurnId="turn-1" />);
+    expect(html).toContain('<span class="tool-label activity-shimmer" title="Reconnecting 2/3" role="status">Reconnecting 2/3');
+    expect(html).not.toContain("Thinking");
+  });
+
+  it("stops reconnect shimmer after reasoning resumes even when that reasoning is hidden", () => {
+    const html = renderToStaticMarkup(<AgentTimeline items={[user(), {
+      id: "retry", turnId: "turn-1", type: "retry", status: "inProgress", attempt: 1, maxAttempts: 3,
+      delayMs: 1_000, error: { message: "stream disconnected" }, timestamp: 10,
+    }, {
+      id: "thinking", turnId: "turn-1", type: "reasoning", status: "completed", text: "Resumed reasoning", timestamp: 20,
+    }]} activeTurnId="turn-1" />);
+    expect(html).toContain('<span class="tool-label" title="Reconnecting 1/3">Reconnecting 1/3</span>');
+    const summary = html.match(/<summary class="tool-activity tool-row timeline-activity connection-activity">([\s\S]*?)<\/summary>/)?.[1];
+    expect(summary).not.toContain("activity-shimmer");
+  });
+
+  it("does not present an intermediate stream failure as a final connection error", () => {
+    const html = renderToStaticMarkup(<AgentTimeline items={[user(), {
+      id: "assistant-error",
+      turnId: "turn-1",
+      type: "agentMessage",
+      text: "I started checking the project.",
+      status: "failed",
+      error: { message: "stream disconnected" },
+    }]} activeTurnId="turn-1" />);
+
+    expect(html).toContain("I started checking the project.");
+    expect(html).not.toContain("Connection error");
+  });
+
+  it("does not render an empty failed message between tool groups", () => {
+    const failedTool = (id: string): ThreadItem => ({
+      ...tool(),
+      id,
+      toolCallId: id,
+      status: "failed",
+    });
+    const writtenFile = (id: string, path: string): ThreadItem => ({
+      ...tool(),
+      id,
+      toolCallId: id,
+      tool: "write",
+      arguments: { path },
+    });
+    const html = renderToStaticMarkup(<AgentTimeline items={[
+      user(),
+      failedTool("failed-tool-1"),
+      failedTool("failed-tool-2"),
+      {
+        id: "assistant-error",
+        turnId: "turn-1",
+        type: "agentMessage",
+        text: "",
+        status: "failed",
+        error: { message: "stream disconnected" },
+      },
+      writtenFile("write-1", "one.ts"),
+      writtenFile("write-2", "two.ts"),
+      writtenFile("write-3", "three.ts"),
+    ]} />);
+
+    expect(html).toContain("Actions failed");
+    expect(html).toContain("Edited files");
+    expect(html).not.toContain("2 actions failed");
+    expect(html).not.toContain("Edited 3 files");
+    expect(html.match(/class="tool-activity-group"/g)).toHaveLength(2);
+    expect(html).not.toContain("assistant-failed");
+    expect(html).not.toContain("stream disconnected");
+  });
+
+  it("does not show a retry after reconnection succeeds", () => {
+    const html = renderToStaticMarkup(<AgentTimeline items={[user(), {
+      id: "retry",
+      turnId: "turn-1",
+      type: "retry",
+      status: "completed",
+      attempt: 1,
+      maxAttempts: 3,
+      delayMs: 1_000,
+      error: { message: "stream disconnected" },
+    }, assistant("response", "Done.", "final_answer")]} />);
+
+    expect(html).not.toContain("Reconnecting 1/3");
+    expect(html).not.toContain("Connection error");
+    expect(html).not.toContain("solar-refresh-linear spin");
+    expect(html).toContain("Done.");
+  });
+
+  it("uses a failed retry as the single terminal connection error", () => {
+    const html = renderToStaticMarkup(<AgentTimeline items={[user(), {
+      id: "retry",
+      turnId: "turn-1",
+      type: "retry",
+      status: "failed",
+      attempt: 3,
+      maxAttempts: 3,
+      delayMs: 4_000,
+      error: { code: "stream_error", message: "stream disconnected" },
+    }, {
+      id: "assistant-error",
+      turnId: "turn-1",
+      type: "agentMessage",
+      text: "",
+      status: "failed",
+      error: { message: "stream disconnected" },
+    }]} failedTurnId="turn-1" />);
+
+    expect(html.match(/<strong>Response interrupted<\/strong>/g)).toHaveLength(1);
+    expect(html.match(/class="agent-error-card"/g)).toHaveLength(1);
+  });
+
+  it("keeps an unclassified completed process message inside Worked", () => {
+    const html = renderToStaticMarkup(<AgentTimeline items={[user(), {
+      id: "assistant-process",
+      turnId: "turn-1",
+      type: "agentMessage",
+      text: "I am checking the project.",
+      status: "completed",
+    }]} />);
+
+    expect(html).toContain("Worked for");
+    expect(html.indexOf("Worked for")).toBeLessThan(html.indexOf("I am checking the project."));
+  });
+
+  it("uses the same assistant message style for commentary and final text", () => {
+    const html = renderToStaticMarkup(<AgentTimeline items={[
+      user(),
+      assistant("commentary", "I am checking the project.", "commentary"),
+      assistant("final", "The project is ready.", "final_answer"),
+    ]} />);
+
+    expect(html).not.toContain("commentary-message");
+    expect(html.match(/class="assistant-message assistant-completed"/g)).toHaveLength(2);
+  });
+
+  it("shows completed and current tools while a consecutive group is running", () => {
+    const html = renderToStaticMarkup(<AgentTimeline items={[
+      user(),
+      { ...tool(), id: "read", toolCallId: "read" },
+      {
+        id: "edit",
+        turnId: "turn-1",
+        type: "dynamicToolCall",
+        toolCallId: "edit",
+        tool: "edit",
+        status: "inProgress",
+        arguments: { path: "src/app.ts" },
+      },
+    ]} activeTurnId="turn-1" />);
+
+    expect(html).toContain('class="tool-label activity-shimmer" title="Edit Files">Edit Files<span class="activity-shimmer-highlight" aria-hidden="true">Edit Files</span></span>');
+    expect(html).toContain('class="tool-label" title="Editing src/app.ts">Editing src/app.ts</span>');
+    expect(html).toContain("package.json");
+    expect(html).toContain('class="tool-activity-group"');
+    expect(html.match(/class="tool-label activity-shimmer"/g)).toHaveLength(1);
+    expect(html).not.toContain("solar-refresh-linear spin");
+  });
+
+  it("collapses an earlier activity group after commentary starts a new stage", () => {
+    const html = renderToStaticMarkup(<AgentTimeline items={[
+      user(),
+      { ...tool(), id: "read-1", toolCallId: "read-1" },
+      { ...tool(), id: "read-2", toolCallId: "read-2", arguments: { path: "src/app.ts" } },
+      assistant("commentary", "Now I will run the checks.", "commentary"),
+      {
+        id: "check",
+        turnId: "turn-1",
+        type: "dynamicToolCall",
+        toolCallId: "check",
+        tool: "bash",
+        status: "inProgress",
+        arguments: { command: "npm test" },
+      },
+    ]} activeTurnId="turn-1" />);
+
+    expect(html).toContain("Read files");
+    expect(html).toMatch(/<summary class="tool-group-summary"><svg[^>]*class="solar solar-file-text-linear"/);
+    expect(html).toContain("Now I will run the checks.");
+    expect(html).toContain("Running npm test");
+    expect(html.indexOf("Read files")).toBeLessThan(html.indexOf("Now I will run the checks."));
+    expect(html.indexOf("Now I will run the checks.")).toBeLessThan(html.indexOf("Running npm test"));
+  });
+
+  it("reuses a completed mixed tool group row for Thinking", () => {
+    const html = renderToStaticMarkup(<AgentTimeline items={[
+      user(),
+      tool(),
+      {
+        id: "edit",
+        turnId: "turn-1",
+        type: "dynamicToolCall",
+        toolCallId: "edit",
+        tool: "edit",
+        status: "completed",
+        arguments: { path: "src/app.ts" },
+      },
+      {
+        id: "bash",
+        turnId: "turn-1",
+        type: "dynamicToolCall",
+        toolCallId: "bash",
+        tool: "bash",
+        status: "completed",
+        arguments: { command: "npm run typecheck" },
+      },
+    ]} activeTurnId="turn-1" />);
+
+    expect(html).toContain('<span class="tool-label activity-shimmer" title="Thinking" role="status">Thinking<span class="activity-shimmer-highlight" aria-hidden="true">Thinking</span></span>');
+    expect(html).toContain('<summary class="tool-group-summary tool-group-summary-thinking"><span class="tool-label activity-shimmer"');
+    expect(html).not.toContain('class="thinking-activity"');
+    expect(html).not.toContain("Edited a file, read a file, ran a command");
+    expect(html).toContain("Read package.json");
+    expect(html).toContain("Edited src/app.ts");
+    expect(html).toContain("Ran npm run typecheck");
+  });
+
+  it("shows the Godot brand and operation for MCP tool calls", () => {
+    const html = renderToStaticMarkup(<AgentTimeline items={[
+      user(),
+      {
+        id: "mcp",
+        turnId: "turn-1",
+        type: "mcpToolCall",
+        toolCallId: "mcp",
+        server: "ohmygame-godot",
+        tool: "create_scene",
+        status: "inProgress",
+        arguments: { scenePath: "main.tscn" },
+      },
+    ]} activeTurnId="turn-1" />);
+
+    expect(html).toContain("Godot: Create scene");
+    expect(html).toContain("tool-brand-godot");
+    expect(html).not.toContain("Preparing mcp");
+  });
+
+  it("says which calls wait behind the one that is running", () => {
+    const call = (id: string, name: string, status: "preparing" | "inProgress", args?: unknown): ThreadItem =>
+      ({ ...tool(), id, toolCallId: id, tool: name, status, arguments: args });
+    const html = renderToStaticMarkup(<AgentTimeline items={[
+      user(),
+      call("running", "animate_3d_asset", "inProgress", {}),
+      call("waiting", "generate_audio", "preparing", {}),
+      // Still being written by the model, so not yet waiting on anything.
+      call("writing", "generate_video", "preparing"),
+    ]} activeTurnId="turn-1" />);
+    expect(html).toContain("Queued: generate_audio");
+    expect(html).toContain("Preparing generate_video");
+    // The group is named for the call that is running.
+    expect(html).toMatch(/tool-group-summary[^]*?title="animate_3d_asset"/);
+
+    // With nothing running, a call about to start is not waiting in a queue.
+    expect(renderToStaticMarkup(<AgentTimeline items={[user(), call("next", "generate_audio", "preparing", {})]} activeTurnId="turn-1" />))
+      .not.toContain("Queued");
+  });
+
+  it("shows the Godot brand for MCP discovery operations", () => {
+    const html = renderToStaticMarkup(<AgentTimeline items={[
+      user(),
+      {
+        id: "mcp-search",
+        turnId: "turn-1",
+        type: "mcpToolCall",
+        toolCallId: "mcp-search",
+        server: "ohmygame-godot",
+        tool: "search_tools",
+        status: "inProgress",
+        arguments: { search: "scene" },
+      },
+    ]} activeTurnId="turn-1" />);
+
+    expect(html).toContain("Godot: Search tools");
+    expect(html).toContain("tool-brand-godot");
+  });
+
+  it("uses a generic plug for unknown MCP servers", () => {
+    const html = renderToStaticMarkup(<AgentTimeline items={[
+      user(),
+      {
+        id: "mcp",
+        turnId: "turn-1",
+        type: "mcpToolCall",
+        toolCallId: "mcp",
+        server: "custom-tools",
+        tool: "fetch_asset",
+        status: "inProgress",
+      },
+    ]} activeTurnId="turn-1" />);
+
+    expect(html).toContain("Custom tools: Fetch asset");
+    expect(html).toContain("solar-plug-circle-linear");
+  });
+
+  it("uses an indefinite article for a single generic tool", () => {
+    const html = renderToStaticMarkup(<AgentTimeline items={[
+      user(),
+      {
+        id: "image-tool",
+        turnId: "turn-1",
+        type: "dynamicToolCall",
+        toolCallId: "image-tool",
+        tool: "image",
+        status: "completed",
+      },
+      assistant("final", "Done.", "final_answer"),
+    ]} />);
+
+    expect(html).toContain("Used an image tool");
+  });
+
+  it("uses an before an MCP initialism", () => {
+    const html = renderToStaticMarkup(<AgentTimeline items={[
+      user(),
+      {
+        id: "mcp",
+        turnId: "turn-1",
+        type: "mcpToolCall",
+        toolCallId: "mcp",
+        tool: "fetch_asset",
+        status: "completed",
+      },
+      assistant("final", "Done.", "final_answer"),
+    ]} />);
+
+    expect(html).toContain("Used an MCP tool");
+  });
+
+  it("groups consecutive calls by their MCP integration", () => {
+    const mcpTool = (id: string, operation: string): ThreadItem => ({
+      id,
+      turnId: "turn-1",
+      type: "mcpToolCall",
+      toolCallId: id,
+      server: "ohmygame-godot",
+      tool: operation,
+      status: "completed",
+    });
+    const html = renderToStaticMarkup(<AgentTimeline items={[
+      user(),
+      mcpTool("version", "get_godot_version"),
+      mcpTool("run", "run_project"),
+      assistant("final", "Done.", "final_answer"),
+    ]} />);
+
+    expect(html).toContain("Used Godot tools");
+    expect(html).toContain("Godot: Get Godot version");
+    expect(html).toContain("Godot: Run project");
+  });
+
+  it("describes game use operations with player-facing labels", () => {
+    const playtest = (id: string, operation: string, status: "inProgress" | "completed", extra: Record<string, unknown> = {}): ThreadItem => ({
+      id,
+      turnId: "turn-1",
+      type: "dynamicToolCall",
+      toolCallId: id,
+      tool: "game_use",
+      status,
+      arguments: { operation, ...extra },
+    });
+    const html = renderToStaticMarkup(<AgentTimeline items={[
+      user(),
+      playtest("open", "open", "completed"),
+      playtest("single-act", "act", "completed", { actions: [{ type: "press", key: "Enter" }] }),
+      playtest("act", "act", "completed", { actions: [{ type: "press", key: "Space" }, { type: "wait", milliseconds: 100 }] }),
+      playtest("capture", "capture", "inProgress"),
+    ]} activeTurnId="turn-1" />);
+
+    expect(html).toContain("Capturing game screenshot");
+    expect(html).toContain("Opened game preview");
+    expect(html).toContain("Ran a playtest action");
+    expect(html).toContain("Ran playtest actions");
+    expect(html).not.toContain("Ran 2 playtest actions");
+    expect(html).toContain("solar-gamepad-linear");
+    expect(html).not.toContain("Used game_use");
+  });
+
+  it("summarizes completed game checks as a game playtest", () => {
+    const html = renderToStaticMarkup(<AgentTimeline items={[
+      user(),
+      {
+        id: "open",
+        turnId: "turn-1",
+        type: "dynamicToolCall",
+        toolCallId: "open",
+        tool: "game_use",
+        status: "completed",
+        arguments: { operation: "open" },
+      },
+      {
+        id: "close",
+        turnId: "turn-1",
+        type: "dynamicToolCall",
+        toolCallId: "close",
+        tool: "game_use",
+        status: "completed",
+        arguments: { operation: "close", sessionId: "session-1" },
+      },
+      assistant("final", "Verified.", "final_answer"),
+    ]} />);
+
+    expect(html).toContain("Playtested the game");
+    expect(html).toContain("Closed game preview");
+    expect(html).not.toContain("game_use tools");
+  });
+
+  it("shows a captured playtest frame inside the tool details", () => {
+    const html = renderToStaticMarkup(<AgentTimeline items={[
+      user(),
+      {
+        id: "capture",
+        turnId: "turn-1",
+        type: "dynamicToolCall",
+        toolCallId: "capture",
+        tool: "game_use",
+        status: "completed",
+        arguments: { operation: "capture", sessionId: "session-1" },
+        output: "{\"width\":780,\"height\":1688}",
+        images: [{ mediaType: "image/png", data: "aW1hZ2U=" }],
+      },
+      assistant("final", "Verified.", "final_answer"),
+    ]} />);
+
+    expect(html).toContain("Captured game screenshot");
+    expect(html).toContain('class="tool-result-images"');
+    expect(html).toContain('src="data:image/png;base64,aW1hZ2U="');
+    expect(html.indexOf("tool-result-images")).toBeLessThan(html.indexOf("Input"));
+  });
+
+  it("shows the image a read returned inside its details", () => {
+    const read = (id: string, output?: string): ThreadItem => ({
+      id,
+      turnId: "turn-1",
+      type: "dynamicToolCall",
+      toolCallId: id,
+      tool: "read",
+      status: "completed",
+      arguments: { path: ".tmp/example.png" },
+      ...(output ? { output } : {}),
+      images: [{ mediaType: "image/png", data: "aW1hZ2U=" }],
+    });
+    const html = renderToStaticMarkup(<AgentTimeline items={[user(), read("read-1", "Read image file [image/png]"), assistant("final", "Done.", "final_answer")]} />);
+
+    expect(html).toContain('class="tool-result-images"');
+    expect(html).toContain('src="data:image/png;base64,aW1hZ2U="');
+    expect(html).toContain(".tmp/example.png");
+    expect(html).toContain("Read image file [image/png]");
+    // A result with only an image still opens.
+    expect(renderToStaticMarkup(<AgentTimeline items={[user(), read("read-2"), assistant("final", "Done.", "final_answer")]} />)).toContain('class="tool-result-images"');
+  });
+
+  it("opens a chat image larger, closes it, and offers copy and save on right-click", async () => {
+    vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+    const data = (text: string) => Buffer.from(text).toString("base64");
+    const read: ThreadItem = {
+      id: "read-1", turnId: "turn-1", type: "dynamicToolCall", toolCallId: "read-1", tool: "read", status: "completed",
+      arguments: { path: "shots" }, output: "Read 2 images",
+      images: [{ mediaType: "image/png", data: data("first") }, { mediaType: "image/png", data: data("second") }],
+    };
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    const preview = () => document.querySelector<HTMLElement>(".image-preview");
+    const thumbnail = () => container.querySelector<HTMLButtonElement>('button[aria-label="Open Tool result image 2"]')!;
+    try {
+      await act(async () => root.render(<AgentTimeline items={[user(), read, assistant("final", "Done.", "final_answer")]} />));
+      await act(async () => thumbnail().click());
+      expect(preview()?.getAttribute("aria-label")).toBe("Tool result image 2");
+      // Decoded from the image's own data, which the app may not fetch.
+      await vi.waitFor(() => expect(preview()?.querySelector("img")?.getAttribute("src")).toMatch(/^blob:/));
+      // Nothing in the preview takes focus, so Tab and Shift+Tab keep it there.
+      for (const shiftKey of [false, true]) {
+        const tab = new KeyboardEvent("keydown", { key: "Tab", shiftKey, bubbles: true, cancelable: true });
+        act(() => { preview()!.dispatchEvent(tab); });
+        expect(tab.defaultPrevented).toBe(true);
+        expect(document.activeElement).toBe(preview());
+      }
+      await act(async () => { document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })); });
+      expect(preview()).toBeNull();
+
+      await act(async () => thumbnail().click());
+      await act(async () => document.querySelector<HTMLElement>(".image-preview-backdrop")!.click());
+      expect(preview()).toBeNull();
+
+      await act(async () => { thumbnail().dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: 10, clientY: 10 })); });
+      const menu = [...document.querySelectorAll('[role="menuitem"]')].map((item) => item.textContent);
+      expect(menu).toEqual(["Copy image", "Save image"]);
+    } finally {
+      act(() => root.unmount());
+      container.remove();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("keeps the generic MCP icon when unknown integrations are grouped", () => {
+    const mcpTool = (id: string, operation: string): ThreadItem => ({
+      id,
+      turnId: "turn-1",
+      type: "mcpToolCall",
+      toolCallId: id,
+      server: "custom-tools",
+      tool: operation,
+      status: "completed",
+    });
+    const html = renderToStaticMarkup(<AgentTimeline items={[
+      user(),
+      mcpTool("fetch", "fetch_asset"),
+      mcpTool("save", "save_asset"),
+      assistant("final", "Done.", "final_answer"),
+    ]} />);
+
+    expect(html).toContain("Used Custom tools");
+    expect(html).toContain("solar-plug-circle-linear");
+  });
+
+  it("keeps tools on both sides of commentary while waiting", () => {
+    const html = renderToStaticMarkup(<AgentTimeline items={[
+      user(),
+      tool(),
+      assistant("commentary", "Now I will edit it.", "commentary"),
+      {
+        id: "edit",
+        turnId: "turn-1",
+        type: "dynamicToolCall",
+        toolCallId: "edit",
+        tool: "edit",
+        status: "completed",
+        arguments: { path: "src/app.ts" },
+      },
+    ]} activeTurnId="turn-1" />);
+
+    expect(html.match(/<details class="tool-activity-group/g)).toHaveLength(2);
+    expect(html.indexOf("Read package.json")).toBeLessThan(html.indexOf("Now I will edit it."));
+    expect(html).toContain("Edited src/app.ts");
+    expect(html.indexOf("Now I will edit it.")).toBeLessThan(html.indexOf("Thinking"));
+  });
+
+  it("renders images attached to the user message", () => {
+    const html = renderToStaticMarkup(
+      <AgentTimeline items={[{ ...user(), images: [{ mediaType: "image/png", data: "aW1hZ2U=" }] }]} />,
+    );
+
+    expect(html).toContain('src="data:image/png;base64,aW1hZ2U="');
+    expect(html).toContain("Attached image 1");
+    expect(html).toContain('class="user-input"><div class="user-message-images"');
+    expect(html).toContain('</div><div class="user-message">Build</div>');
+  });
+
+  it("shows the plugins a user message mentions as the plugins, in place", () => {
+    const mentions = [
+      { name: "web-game-studio", displayName: "Web Game Studio", marketplaceId: "ohmygame" },
+      { name: "gone", displayName: "Gone", marketplaceId: "personal" },
+    ];
+    const plugins = [{
+      id: "web-game-studio@ohmygame", name: "web-game-studio", displayName: "Web Game Studio", description: "",
+      marketplaceId: "ohmygame", marketplaceDisplayName: "OhMyGame", icon: { type: "asset" as const, path: "./assets/icon.png" },
+    }];
+    const html = renderToStaticMarkup(<AgentTimeline plugins={plugins}
+      items={[{ ...user(), text: "@Web Game Studio hi with @Gone and @Someone", mentions }]} />);
+
+    expect(html).toMatch(/<div class="user-message"><span class="user-message-plugin" title="Plugin: Web Game Studio"><svg[^>]*>.*?<\/svg><span>Web Game Studio<\/span><\/span> hi with <span class="user-message-plugin" title="Plugin: Gone"><svg/);
+    expect(html).toContain("<span>Gone</span></span> and @Someone</div>");
+    expect(html).not.toContain("@Web Game Studio");
+  });
+
+  it("renders non-image attachments without duplicating image attachments", () => {
+    const html = renderToStaticMarkup(<AgentTimeline items={[{
+      ...user(),
+      images: [{ name: "references/hero.png", mediaType: "image/png", data: "aW1hZ2U=" }],
+      attachments: [
+        { name: "hero.png", relativePath: "references/hero.png", size: 5, kind: "image" },
+        { name: "notes.md", relativePath: "references/notes.md", size: 1_024, kind: "text" },
+      ],
+    }]} />);
+
+    expect(html).toContain("references/notes.md");
+    expect(html).toContain("1 KB");
+    expect(html).not.toContain(">references/hero.png</span>");
+  });
+
+  it("keeps Feishu delivery metadata in source details and copies/edits only the visible message", async () => {
+    const text = "[Feishu message om_delivery_1]\n\nBuild [a game]";
+    const item = { ...user(), text, source: { plugin: "ohmygame/feishu" } };
+    const plugins = [{ id: "ohmygame/feishu", name: "feishu", displayName: "Feishu", description: "", marketplaceId: "ohmygame", marketplaceDisplayName: "OhMyGame" }];
+    const writeText = vi.fn(async () => {});
+    const clipboard = Object.getOwnPropertyDescriptor(navigator, "clipboard");
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+    const container = document.createElement("div"); document.body.append(container);
+    const root = createRoot(container);
+    try {
+      await act(async () => root.render(<AgentTimeline items={[item]} plugins={plugins} onRevise={async () => true} />));
+      expect(container.querySelector(".user-message-source")?.textContent).toBe("From Feishu");
+      expect(container.querySelector(".user-message-source svg")).not.toBeNull();
+      expect(container.querySelector(".user-message")?.textContent).toBe("Build [a game]");
+      await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="Message source details"]')!.focus());
+      expect(document.querySelector('[role="tooltip"]')?.textContent).toContain("om_delivery_1");
+      await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="Copy message"]')!.click());
+      expect(writeText).toHaveBeenCalledWith("Build [a game]");
+      await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="Edit message"]')!.click());
+      expect(container.querySelector("textarea")?.value).toBe("Build [a game]");
+      expect(item.text).toBe(text);
+    } finally {
+      await act(async () => root.unmount()); container.remove();
+      if (clipboard) Object.defineProperty(navigator, "clipboard", clipboard);
+      else Reflect.deleteProperty(navigator, "clipboard");
+    }
+    for (const source of [undefined, { plugin: "acme/messenger" }]) {
+      const html = renderToStaticMarkup(<AgentTimeline items={[{ ...item, source }]} />);
+      expect(html).toContain("[Feishu message om_delivery_1]");
+    }
+    const html = renderToStaticMarkup(<AgentTimeline items={[{ ...item, text: "[ordinary brackets]\n\nBuild" }]} />);
+    expect(html).toContain("[ordinary brackets]");
+    expect(html).toContain("From ohmygame/feishu");
+  });
+
+  it("renders image-reading and completed compaction records", () => {
+    const html = renderToStaticMarkup(<AgentTimeline items={[
+      user(),
+      { id: "images", turnId: "turn-1", type: "imageRead", count: 2, status: "completed" },
+      { id: "compaction", turnId: "compaction", type: "contextCompaction", status: "completed" },
+    ]} />);
+
+    expect(html).toContain("Viewed 2 images");
+    expect(html).toContain("Context compacted");
+  });
+
+  it("folds standalone completed compaction into the original work before its final response", () => {
+    const html = renderToStaticMarkup(<AgentTimeline items={[
+      { ...user(), timestamp: 1_000 },
+      { ...tool(), timestamp: 2_000 },
+      { ...assistant("final", "Done.", "final_answer"), timestamp: 6_000 },
+      { id: "compaction", turnId: "compaction", type: "contextCompaction", status: "completed", timestamp: 60_000, summary: "Previous work" },
+    ]} />);
+
+    expect(html.match(/<article class="agent-turn">/g)).toHaveLength(1);
+    expect(html.match(/<details class="work-activity">/g)).toHaveLength(1);
+    expect(html).toContain("Worked for 5s");
+    expect(html).not.toContain("Worked for 0s");
+    expect(html.indexOf("Context compacted")).toBeLessThan(html.indexOf("Done."));
+  });
+
+  it("expands completed compaction records with their summary and token counts", () => {
+    const html = renderToStaticMarkup(<AgentTimeline items={[
+      {
+        id: "compaction",
+        turnId: "compaction",
+        type: "contextCompaction",
+        status: "completed",
+        summary: "## Goal\nKeep building the editor.",
+        tokensBefore: 42_000,
+        estimatedTokensAfter: 12_000,
+      },
+    ]} />);
+
+    expect(html).toContain('class="compaction-details"');
+    expect(html).toContain(`Compacted from ${new Intl.NumberFormat().format(42_000)} to approximately ${new Intl.NumberFormat().format(12_000)} tokens`);
+    expect(html).toContain("Keep building the editor.");
+    expect(html).not.toContain("Worked for");
+  });
+
+  it("renders failed and cancelled compaction states distinctly", () => {
+    const failed = renderToStaticMarkup(<AgentTimeline items={[
+      { id: "failed", turnId: "failed", type: "contextCompaction", status: "failed" },
+    ]} />);
+    const cancelled = renderToStaticMarkup(<AgentTimeline items={[
+      { id: "cancelled", turnId: "cancelled", type: "contextCompaction", status: "cancelled" },
+    ]} />);
+
+    expect(failed).toContain("timeline-event-error");
+    expect(failed).toContain("Context compaction failed");
+    expect(cancelled).toContain("Context compaction stopped");
+    expect(cancelled).not.toContain("timeline-event-error");
+  });
+
+  it("uses the compaction timestamp for an active turn duration", () => {
+    const html = renderToStaticMarkup(<AgentTimeline items={[
+      { id: "compaction", turnId: "compaction", type: "contextCompaction", status: "inProgress", timestamp: 1 },
+    ]} activeTurnId="compaction" />);
+
+    expect(html).toContain("Working for");
+    expect(html).not.toContain("Working for 0s");
+  });
+
+  it("expands image-reading activity to show the viewed images", () => {
+    const html = renderToStaticMarkup(<AgentTimeline items={[
+      { ...user(), images: [{ name: "reference.png", mediaType: "image/png", data: "aW1hZ2U=" }] },
+      { id: "images", turnId: "turn-1", type: "imageRead", count: 1, status: "completed" },
+    ]} />);
+
+    expect(html).toContain("Viewed an image");
+    expect(html).toContain('class="image-read-previews"');
+    expect(html).toContain('alt="reference.png"');
+  });
+
+  it("centers model switches between conversation turns", () => {
+    const html = renderToStaticMarkup(<AgentTimeline items={[
+      user(),
+      assistant("final", "Done.", "final_answer"),
+      {
+        id: "model-change",
+        turnId: "model-change",
+        type: "modelChange",
+        model: { provider: "openai", id: "gpt-next" },
+        name: "GPT Next",
+      },
+    ]} />);
+
+    expect(html).toContain('class="model-change-event"');
+    expect(html).toContain("Switched to GPT Next");
+  });
+
+  it("offers edit only on the latest user message", () => {
+    const html = renderToStaticMarkup(<AgentTimeline
+      items={[
+        user(),
+        { ...user(), id: "user-2", turnId: "turn-2", text: "Second" },
+      ]}
+      onRevise={async () => true}
+    />);
+
+    expect(html.match(/aria-label="Copy message"/g)).toHaveLength(2);
+    expect(html.match(/aria-label="Edit message"/g)).toHaveLength(1);
+  });
+
+  it("shows collapsed file summaries below completed and failed turns", () => {
+    const items = [
+      { ...user(), checkpointId: "checkpoint-1", changes: { files: 1, items: [{ path: "notes.txt", kind: "added" as const, lines: { added: 12, removed: 0 } }] } },
+      assistant("final-1", "Done", "final_answer"),
+      { ...user(), id: "user-2", turnId: "turn-2", text: "Second", checkpointId: "checkpoint-2", changes: { files: 3 } },
+      { ...user(), id: "user-3", turnId: "turn-3", text: "Third", checkpointId: "checkpoint-3", changes: { files: 0 } },
+      { ...user(), id: "user-4", turnId: "turn-4", text: "Fourth", changes: { files: 2 } },
+      { ...user(), id: "user-5", turnId: "turn-5", text: "Fifth", checkpointId: "checkpoint-5", changes: { files: 5 } },
+    ];
+    const html = renderToStaticMarkup(<AgentTimeline items={items} activeTurnId="turn-5" failedTurnId="turn-2" changeControls={changeControls()} />);
+
+    expect(html.match(/class="turn-changes"/g)).toHaveLength(2);
+    expect(html).toMatch(/<button[^>]*aria-expanded="false"[^>]*><span>1 file changed<\/span>/);
+    expect(html).toMatch(/<button[^>]*aria-expanded="false"[^>]*><span>3 files changed<\/span>/);
+    expect(html).toContain("+12");
+    expect(html).toContain("-0");
+    expect(html).not.toMatch(/>Undo<\/button>/);
+    // The footer closes the turn, below the answer.
+    expect(html.indexOf("1 file changed")).toBeGreaterThan(html.indexOf("Done"));
+    expect(html.indexOf("1 file changed")).toBeLessThan(html.indexOf("assistant-response-footer"));
+    expect(html.indexOf("1 file changed")).toBeLessThan(html.indexOf("Second"));
+    expect(html).not.toContain("0 files changed");
+    expect(html).not.toContain("2 files changed");
+    expect(html).not.toContain("5 files changed");
+    // Nothing is listed before the user asks for it.
+    expect(html).not.toContain("turn-changes-list");
+    expect(html).not.toContain("Loading changes");
+    expect(renderToStaticMarkup(<AgentTimeline items={items} />)).not.toContain("turn-changes");
+  });
+
+  it("keeps Undo and Reapply inside the collapsed summaries while the agent is busy", () => {
+    const items = [
+      { ...user(), checkpointId: "checkpoint-1", changes: { files: 2, undone: true } },
+      { ...user(), id: "user-2", turnId: "turn-2", text: "Second", checkpointId: "checkpoint-2", changes: { files: 3 } },
+    ];
+    const html = renderToStaticMarkup(<AgentTimeline items={items} changeControls={changeControls(true)} />);
+
+    expect(html).not.toMatch(/>(Undo|Reapply)<\/button>/);
+    expect(html.match(/aria-expanded="false"[^>]*><span>\d files changed/g)).toHaveLength(2);
+    // The list can still be opened.
+    expect(html).not.toMatch(/<button[^>]*disabled=""[^>]*><span>3 files changed/);
+  });
+
+  it("keeps partial Undo details inside the collapsed summary", () => {
+    const items = [{ ...user(), checkpointId: "checkpoint-1", changes: { files: 3, undone: true, kept: 1 } }];
+    const html = renderToStaticMarkup(<AgentTimeline items={items} changeControls={changeControls()} />);
+
+    expect(html).toContain("3 files changed");
+    expect(html).not.toContain("Partly undone");
+    expect(html).not.toContain("Changes undone");
+    expect(html).not.toMatch(/>Undo the rest<\/button>/);
+  });
+
+  it("offers copy on final responses and keeps only the latest action visible", () => {
+    const html = renderToStaticMarkup(<AgentTimeline items={[
+      user(),
+      assistant("final-1", "First answer", "final_answer"),
+      { ...user(), id: "user-2", turnId: "turn-2", text: "Second" },
+      { ...assistant("final-2", "Second answer", "final_answer"), turnId: "turn-2" },
+    ]} />);
+
+    expect(html.match(/aria-label="Copy response"/g)).toHaveLength(2);
+    expect(html.match(/assistant-response-latest/g)).toHaveLength(1);
+    expect(html).toContain('class="assistant-response assistant-response-latest"');
+  });
+
+  it("does not offer response copy while a final answer is streaming", () => {
+    const html = renderToStaticMarkup(<AgentTimeline items={[
+      user(),
+      { ...assistant("final", "Still writing", "final_answer"), status: "inProgress" },
+    ]} activeTurnId="turn-1" />);
+
+    expect(html).not.toContain('aria-label="Copy response"');
+  });
+
+  it("renders one copy action for multiple final text blocks in one turn", () => {
+    const html = renderToStaticMarkup(<AgentTimeline items={[
+      user(),
+      assistant("final-1", "First block", "final_answer"),
+      assistant("final-2", "Second block", "final_answer"),
+    ]} />);
+
+    expect(html.match(/aria-label="Copy response"/g)).toHaveLength(1);
+  });
+
+  it("shows a result small under the calls that made it, and not again under the response", async () => {
+    vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+    vi.stubGlobal("IntersectionObserver", undefined);
+    const fetchImage = vi.spyOn(globalThis, "fetch").mockImplementation(async () => new Response(new Blob(["image"], { type: "image/png" })));
+    const items: ThreadItem[] = [
+      user(),
+      {
+        ...tool(),
+        arguments: undefined,
+        tool: "generate_image",
+        artifact: { type: "image", path: "generated/image.png", mediaType: "image/png" },
+      },
+      assistant("final", "Here is the image.", "final_answer"),
+    ];
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    const thumbnail = 'button[aria-label="Open Generated image"]';
+    try {
+      await act(async () => root.render(<AgentTimeline projectId="project-1" items={items} activeTurnId="turn-1" />));
+      // Beside the calls, without opening them.
+      await vi.waitFor(() => expect(container.querySelector(`.active-work-items > .tool-artifact-strip ${thumbnail}`)).not.toBeNull());
+      expect(container.querySelector(`.tool-activity-group ${thumbnail}`)).toBeNull();
+      expect(container.querySelectorAll(thumbnail)).toHaveLength(1);
+      await act(async () => container.querySelector<HTMLButtonElement>(thumbnail)!.click());
+      await vi.waitFor(() => expect(document.querySelector('.image-preview img')?.getAttribute("src")).toMatch(/^blob:/));
+
+      await act(async () => root.render(<AgentTimeline projectId="project-1" items={items} />));
+      expect(container.querySelector(".assistant-response .tool-artifact-strip")).toBeNull();
+      expect(container.querySelector(".assistant-response img")).toBeNull();
+      expect(fetchImage).toHaveBeenCalledWith("/api/projects/project-1/files/raw?path=generated%2Fimage.png", expect.anything());
+      expect(container.querySelectorAll('button[aria-label="Copy response"]')).toHaveLength(1);
+    } finally {
+      await act(async () => root.unmount());
+      container.remove();
+      fetchImage.mockRestore();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("holds a place for each result still being made, opens a video in a dialog, and shows a model in its tile", async () => {
+    vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+    // Everything is on screen; happy-dom's own observer never reports.
+    vi.stubGlobal("IntersectionObserver", class {
+      readonly #callback: IntersectionObserverCallback;
+      constructor(callback: IntersectionObserverCallback) { this.#callback = callback; }
+      observe(target: Element) { queueMicrotask(() => this.#callback([{ target, isIntersecting: true } as IntersectionObserverEntry], this as unknown as IntersectionObserver)); }
+      disconnect() {}
+    });
+    const fetchVideo = vi.spyOn(globalThis, "fetch").mockImplementation(async () => new Response(new Blob(["video"], { type: "video/mp4" })));
+    const call = (id: string, name: string, extra: Partial<ThreadItemOf<"dynamicToolCall">>): ThreadItem =>
+      ({ ...tool(), id, toolCallId: id, arguments: undefined, tool: name, ...extra });
+    const items: ThreadItem[] = [
+      user(),
+      call("video", "generate_video", { artifact: { type: "video", path: "generated/clip.mp4", mediaType: "video/mp4" } }),
+      call("made", "generate_3d_asset", { artifact: { type: "model", path: "generated/model.glb", mediaType: "model/gltf-binary" } }),
+      call("model", "generate_3d_asset", { status: "inProgress" }),
+      call("queued", "animate_3d_asset", { status: "preparing" }),
+      // Neither makes a picture, a video or a model.
+      call("audio", "generate_audio", { status: "preparing" }),
+      call("failed", "generate_image", { status: "failed" }),
+    ];
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    try {
+      await act(async () => root.render(<AgentTimeline projectId="project-1" items={items} activeTurnId="turn-1" />));
+      expect(container.querySelectorAll(".tool-artifact-pending")).toHaveLength(2);
+      const open = 'button[aria-label="Open Generated video"]';
+      await vi.waitFor(() => expect(container.querySelector(open)).not.toBeNull());
+      expect(container.querySelector(`${open} video`)?.hasAttribute("controls")).toBe(false);
+      await act(async () => container.querySelector<HTMLButtonElement>(open)!.click());
+      const dialog = document.querySelector('[role="dialog"]')!;
+      expect(dialog.querySelector("h2")?.textContent).toBe("clip.mp4");
+      expect(dialog.querySelector("video")?.hasAttribute("controls")).toBe(true);
+      await act(async () => dialog.querySelector<HTMLButtonElement>('button[aria-label="Close asset preview"]')!.click());
+      expect(document.querySelector('[role="dialog"]')).toBeNull();
+      // A model's tile shows the model, inside the button that opens it.
+      await vi.waitFor(() => expect(container.querySelector('button[aria-label="Open Generated 3D model"] model-viewer')).not.toBeNull());
+    } finally {
+      await act(async () => root.unmount());
+      container.remove();
+      fetchVideo.mockRestore();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("renders one response timestamp in the footer", () => {
+    const html = renderToStaticMarkup(<AgentTimeline items={[
+      user(),
+      { ...assistant("final", "Done", "final_answer"), timestamp: Date.UTC(2026, 7, 23, 8, 5) },
+    ]} />);
+
+    expect(html.match(/<time /g)).toHaveLength(1);
+    expect(html).toContain('dateTime="2026-08-23T08:05:00.000Z"');
+  });
+
+  it("lets users expand a command to inspect its output", () => {
+    const html = renderToStaticMarkup(<AgentTimeline items={[
+      user(),
+      {
+        id: "command",
+        turnId: "turn-1",
+        type: "dynamicToolCall",
+        toolCallId: "command",
+        tool: "bash",
+        status: "completed",
+        arguments: { command: "npm test", cwd: "/workspace" },
+        output: "Tests passed",
+      },
+    ]} />);
+
+    expect(html).toContain('class="tool-activity-details"');
+    expect(html).toContain("Shell");
+    expect(html).toContain("npm test");
+    expect(html).not.toContain("Arguments");
+    expect(html).not.toContain("/workspace");
+    expect(html).not.toContain("Output");
+    expect(html).toContain("Tests passed");
+  });
+
+  it("presents web search as a first-class activity with provider fallback", () => {
+    const html = renderToStaticMarkup(<AgentTimeline items={[user(), {
+      id: "search", turnId: "turn-1", type: "dynamicToolCall", toolCallId: "search", tool: "web_search", status: "completed",
+      arguments: { query: "Godot 4.6 release" }, output: "https://godotengine.org/releases/4.6",
+      webSearch: { provider: "parallel", providerName: "Parallel", fallbackFrom: "exa" },
+    }]} />);
+
+    expect(html).toContain("Searched the web for Godot 4.6 release");
+    expect(html).toContain("Parallel");
+    expect(html).toContain("Fallback used after Exa was unavailable");
+    expect(html).toContain("https://godotengine.org/releases/4.6");
+  });
+
+  it("keeps existing work with its original prompt while a steer waits", () => {
+    const activeTurn: Turn = {
+      id: "turn-1",
+      conversationId: "conversation-1",
+      status: "inProgress",
+      items: [
+        user(),
+        { ...tool(), status: "inProgress" },
+      ],
+    };
+    const steeredTurn: Turn = {
+      id: "turn-2",
+      conversationId: "conversation-1",
+      status: "completed",
+      steering: true,
+      items: [{ id: "steer-user", turnId: "turn-2", type: "userMessage", text: "Change direction" }],
+    };
+
+    const html = renderToStaticMarkup(<ThreadTimeline turns={[activeTurn, steeredTurn]} />);
+
+    expect(html.indexOf("Working for")).toBeLessThan(html.indexOf("Change direction"));
+    expect(html.indexOf("Working for")).toBeLessThan(html.indexOf("Reading package.json"));
+    expect(html.indexOf("Change direction")).toBeLessThan(html.indexOf("Waiting to steer"));
+    expect(html.match(/class="work-activity work-activity-active"/g)).toHaveLength(1);
+  });
+
+  it("shows the pending steer state only after the latest steered message", () => {
+    const activeTurn: Turn = {
+      id: "turn-1",
+      conversationId: "conversation-1",
+      status: "inProgress",
+      items: [user(), { ...tool(), status: "inProgress" }],
+    };
+    const firstSteer: Turn = {
+      id: "turn-2",
+      conversationId: "conversation-1",
+      status: "completed",
+      steering: true,
+      items: [{ id: "steer-user-1", turnId: "turn-2", type: "userMessage", text: "First change" }],
+    };
+    const secondSteer: Turn = {
+      id: "turn-3",
+      conversationId: "conversation-1",
+      status: "completed",
+      steering: true,
+      items: [{ id: "steer-user-2", turnId: "turn-3", type: "userMessage", text: "Final change" }],
+    };
+
+    const html = renderToStaticMarkup(<ThreadTimeline turns={[activeTurn, firstSteer, secondSteer]} />);
+
+    expect(html.indexOf("Working for")).toBeLessThan(html.indexOf("First change"));
+    expect(html.indexOf("Final change")).toBeLessThan(html.indexOf("Waiting to steer"));
+    expect(html.match(/Waiting to steer/g)).toHaveLength(2);
+    expect(html.match(/class="work-activity work-activity-active"/g)).toHaveLength(1);
+  });
+  it("keeps failed tool details collapsed by default", () => {
+    const html = renderToStaticMarkup(<AgentTimeline items={[
+      user(),
+      { ...tool(), status: "failed", output: "Permission denied" },
+    ]} />);
+
+    expect(html).toContain('<details class="tool-activity-details">');
+    expect(html).not.toContain('<details class="tool-activity-details" open');
+    expect(html).toContain("Permission denied");
+  });
+
+  it("keeps tools without inspectable data as plain rows", () => {
+    const html = renderToStaticMarkup(<AgentTimeline items={[
+      user(),
+      { ...tool(), arguments: undefined },
+    ]} />);
+
+    expect(html).not.toContain("tool-activity-details");
+  });
+
+  it("does not expose read arguments as a generic inspector", () => {
+    const html = renderToStaticMarkup(<AgentTimeline items={[user(), tool()]} />);
+
+    expect(html).toContain("Read package.json");
+    expect(html).not.toContain("tool-activity-details");
+    expect(html).not.toContain("Arguments");
+  });
+});
+
+type ThreadItemOf<T extends ThreadItem["type"]> = Extract<ThreadItem, { type: T }>;
+
+function changeControls(disabled = false): NonNullable<ComponentProps<typeof ThreadTimeline>["changeControls"]> {
+  return {
+    disabled,
+    load: async () => [],
+    file: async (_checkpointId, path) => ({ path, before: null, after: null }),
+    reapply: async () => ({ status: "done", changed: [], conflicts: [], undone: false }),
+    undo: async () => ({ status: "done", changed: [], conflicts: [] }),
+  };
+}
+
+function user(): ThreadItemOf<"userMessage"> {
+  return { id: "user", turnId: "turn-1", type: "userMessage", text: "Build", timestamp: Date.now() - 1_000 };
+}
+
+function tool(): ThreadItemOf<"dynamicToolCall"> {
+  return {
+    id: "tool",
+    turnId: "turn-1",
+    type: "dynamicToolCall",
+    toolCallId: "tool",
+    tool: "read",
+    status: "completed",
+    arguments: { path: "package.json" },
+    timestamp: Date.now(),
+  };
+}
+
+function assistant(id: string, text: string, phase?: "commentary" | "final_answer"): ThreadItemOf<"agentMessage"> {
+  return { id, turnId: "turn-1", type: "agentMessage", text, status: "completed", phase, timestamp: Date.now() };
+}

@@ -1,0 +1,708 @@
+// @vitest-environment happy-dom
+import { act, createElement, useEffect } from "react";
+import { createRoot } from "react-dom/client";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { DesktopRuntimeState } from "../src/shared/desktop-runtime.js";
+import type { ProjectState, RuntimeEvent } from "../src/shared/contracts.js";
+import { promptField, promptText, typePrompt } from "./prompt-field.js";
+
+let root: ReturnType<typeof createRoot>;
+let container: HTMLDivElement;
+beforeEach(() => {
+  vi.resetModules();
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  container = document.createElement("div");
+  document.body.appendChild(container);
+  root = createRoot(container);
+});
+afterEach(async () => {
+  await act(async () => root.unmount());
+  container.remove();
+  vi.unstubAllGlobals();
+  vi.restoreAllMocks();
+});
+
+function installDesktop() {
+  const service = {
+    state: vi.fn(),
+    restart: vi.fn(),
+    onState: vi.fn((_listener: (state: DesktopRuntimeState) => void) => () => {}),
+  };
+  Object.defineProperty(window, "ohMyGameDesktop", {
+    configurable: true,
+    value: {
+      platform: "darwin",
+      runtime: { daemonUrl: "http://127.0.0.1:1000", token: "old-token" },
+      runtimeService: service,
+    },
+  });
+  return service;
+}
+
+const ready = (generation: number): DesktopRuntimeState => ({
+  status: "ready",
+  generation,
+  recovered: generation > 1,
+  runtime: {
+    url: `http://127.0.0.1:${1000 + generation}`,
+    token: `token-${generation}`,
+  },
+});
+
+function installProjectRuntime(type: ProjectState["type"] = "general") {
+  const posts: string[] = [];
+  const previews: string[] = [];
+  vi.stubGlobal("fetch", vi.fn(async (url: string, init: RequestInit = {}) => {
+    const route = new URL(url).pathname;
+    const projectId = route.split("/")[2] ?? "project";
+    const project = { id: projectId, name: "Test", type, webPreviewEnabled: false,
+      workspacePath: "/tmp/project", updatedAt: new Date(0).toISOString(), preview: { status: "stopped" } };
+    const conversation = { id: "conversation", projectId, name: "Chat", createdAt: project.updatedAt, updatedAt: project.updatedAt };
+    if (route.endsWith("/events")) return new Response(new ReadableStream({
+      start(controller) {
+        init.signal!.addEventListener("abort", () => controller.error(new DOMException("Aborted", "AbortError")), { once: true });
+      },
+    }), { headers: { "content-type": "text/event-stream" } });
+    if (route.endsWith("/turns") && init.method === "POST") {
+      posts.push(String(init.body));
+      return Response.json({ turnId: "turn" }, { status: 202 });
+    }
+    if (route.includes("/preview/leases/") && init.method === "PUT") {
+      const input = JSON.parse(String(init.body));
+      if (input.automatic && !input.paused) previews.push(projectId);
+      return Response.json({});
+    }
+    if (route.endsWith("/preview") && init.method === "POST") {
+      previews.push(projectId);
+      return Response.json({ url: "http://127.0.0.1:4000" });
+    }
+    return Response.json(route === `/projects/${projectId}` ? project
+      : route.endsWith("/conversations") ? [conversation]
+      : route.endsWith("/conversations/conversation") ? {
+        conversation, cursor: 0, agent: { status: "idle" }, settings: {}, plan: { mode: "normal" }, turns: [], pendingPrompts: [], scheduledMessages: [],
+      }
+      : /\/models(\?|$)/.test(route) || route.endsWith("/catalog") ? { models: [], providers: [] }
+      : route.includes("capabilities") ? { plugins: [], skills: [] } : []);
+  }));
+  return { posts, previews };
+}
+
+describe("renderer service recovery", () => {
+  it.each([1, 2])(
+    "sends initial messages from generation %s only after the appropriate user action",
+    async (promptGeneration) => {
+      installDesktop();
+      const { updateRuntimeConnection } =
+        await import("../src/renderer/runtime-connection.js");
+      const { ProjectShell } = await import("../src/renderer/project-shell.js");
+      const { AuthProvider } = await import("../src/renderer/auth.js");
+      updateRuntimeConnection(ready(2));
+      const { posts } = installProjectRuntime();
+      const handled = vi.fn();
+      await act(async () =>
+        root.render(
+          <AuthProvider>
+            <ProjectShell
+              projectId="project"
+              conversationId="conversation"
+              initialPrompt={{
+                generation: promptGeneration,
+                prompt: "Build my game",
+                mentions: [],
+                images: [],
+                mode: "normal",
+              }}
+              onInitialPromptHandled={handled}
+              onOpenConversation={() => {}}
+              onNavigate={() => {}} onHome={() => {}}
+            />
+          </AuthProvider>,
+        ),
+      );
+      if (promptGeneration === 1) {
+        // A message held while the service restarted goes back to the input box, to send again.
+        expect(posts).toEqual([]);
+        expect(handled).toHaveBeenCalledTimes(1);
+        expect(container.querySelector(".composer-info")?.textContent).toContain("wasn't sent while the service restarted");
+        expect(promptText(container)).toBe("Build my game");
+        const button = container.querySelector<HTMLButtonElement>(".send-button")!;
+        expect(button.disabled).toBe(false);
+        await act(async () => button.click());
+        expect(container.querySelector(".composer-info")).toBeNull();
+      }
+      expect(posts).toHaveLength(1);
+      expect(JSON.parse(posts[0])).toMatchObject({ prompt: "Build my game" });
+      expect(handled).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it("pauses the current preview on recovery while allowing a later project to start normally", async () => {
+    installDesktop();
+    const { updateRuntimeConnection } = await import("../src/renderer/runtime-connection.js");
+    const { ProjectShell } = await import("../src/renderer/project-shell.js");
+    const { AuthProvider } = await import("../src/renderer/auth.js");
+    const { previews } = installProjectRuntime("web-game");
+    const renderProject = (projectId: string) => root.render(<AuthProvider>
+      <ProjectShell key={projectId} projectId={projectId} conversationId="conversation" onOpenConversation={() => {}} onNavigate={() => {}} onHome={() => {}} />
+    </AuthProvider>);
+    updateRuntimeConnection(ready(1));
+    await act(async () => renderProject("old-project"));
+    expect(previews).toEqual(["old-project"]);
+    const input = container.querySelector("textarea");
+    await act(async () => updateRuntimeConnection({ status: "recovering", generation: 2, recovered: true }));
+    await act(async () => updateRuntimeConnection(ready(2)));
+    expect(previews).toEqual(["old-project"]);
+    expect(container.querySelector("textarea")).toBe(input);
+    expect(container.textContent).toContain("Preview is paused after service recovery");
+    await act(async () => renderProject("new-project"));
+    expect(previews).toEqual(["old-project", "new-project"]);
+    expect(container.textContent).not.toContain("Preview is paused after service recovery");
+  });
+
+  it("loads the home project list once after the initial desktop handshake", async () => {
+    const service = installDesktop();
+    service.state.mockResolvedValue(ready(1));
+    const { initializeRuntimeConnection } = await import("../src/renderer/runtime-connection.js");
+    const { Home } = await import("../src/renderer/home.js");
+    const { AuthProvider } = await import("../src/renderer/auth.js");
+    const requests: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => {
+      requests.push(new URL(url).pathname);
+      return Response.json(/\/models(\?|$)/.test(url) || url.endsWith("/catalog") ? { models: [], providers: [] }
+        : url.includes("capabilities") ? { plugins: [], skills: [] } : []);
+    }));
+    await initializeRuntimeConnection();
+    await act(async () => root.render(<AuthProvider><Home onNavigate={() => {}} onCreate={() => {}} onOpen={() => {}} onOpenAssetCanvas={() => {}} /></AuthProvider>));
+    expect(requests.filter((route) => route === "/projects")).toHaveLength(1);
+  });
+
+  it("keeps a newer service event when the initial IPC state reply arrives late", async () => {
+    const service = installDesktop();
+    service.state.mockResolvedValue(ready(1));
+    service.onState.mockImplementation((listener: (state: DesktopRuntimeState) => void) => {
+      listener(ready(2));
+      return () => {};
+    });
+    const { initializeRuntimeConnection, runtimeConnection } = await import("../src/renderer/runtime-connection.js");
+    await initializeRuntimeConnection();
+    expect(runtimeConnection()).toEqual(ready(2));
+  });
+
+  it("lets a thumbnail window connect without asking the desktop app about the service", async () => {
+    const service = installDesktop();
+    const { initializeRuntimeConnection, runtimeConnection } = await import("../src/renderer/runtime-connection.js");
+    await initializeRuntimeConnection({ followService: false });
+    expect(runtimeConnection()).toMatchObject({ status: "ready", runtime: { url: "http://127.0.0.1:1000", token: "old-token" } });
+    expect(service.state).not.toHaveBeenCalled();
+    expect(service.onState).not.toHaveBeenCalled();
+  });
+
+  it("refreshes reads only when a service generation becomes ready and retains editable views", async () => {
+    installDesktop();
+    const { updateRuntimeConnection, useReadyRuntimeGeneration } =
+      await import("../src/renderer/runtime-connection.js");
+    updateRuntimeConnection(ready(1));
+    const read = vi.fn();
+    function View() {
+      const generation = useReadyRuntimeGeneration();
+      useEffect(() => {
+        read(generation);
+      }, [generation]);
+      return <textarea defaultValue="Draft" />;
+    }
+    await act(async () => root.render(<View />));
+    const input = container.querySelector("textarea")!;
+    input.value = "Still editing";
+    await act(async () =>
+      updateRuntimeConnection({
+        status: "recovering",
+        generation: 2,
+        recovered: true,
+      }),
+    );
+    expect(read.mock.calls).toEqual([[1]]);
+    await act(async () => updateRuntimeConnection(ready(2)));
+    expect(read.mock.calls).toEqual([[1], [2]]);
+    expect(container.querySelector("textarea")).toBe(input);
+    expect(input.value).toBe("Still editing");
+  });
+
+  it("keeps the home view mounted across recovery", async () => {
+    installDesktop();
+    const { updateRuntimeConnection } =
+      await import("../src/renderer/runtime-connection.js");
+    updateRuntimeConnection(ready(1));
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string) =>
+        Response.json(
+          /\/models(\?|$)/.test(url) || url.endsWith("/catalog")
+            ? { models: [], providers: [] }
+            : url.includes("capabilities")
+              ? { plugins: [], skills: [] }
+              : [],
+        ),
+      ),
+    );
+    const { App } = await import("../src/renderer/app.js");
+    const { AuthProvider } = await import("../src/renderer/auth.js");
+    window.history.replaceState(null, "", "#/");
+    await act(async () =>
+      root.render(
+        <AuthProvider>
+          <App />
+        </AuthProvider>,
+      ),
+    );
+    const input = promptField(container);
+    await typePrompt("My unsent game idea", container);
+    await act(async () =>
+      updateRuntimeConnection({
+        status: "recovering",
+        generation: 2,
+        recovered: true,
+      }),
+    );
+    await act(async () => updateRuntimeConnection(ready(2)));
+    expect(promptField(container)).toBe(input);
+    expect(promptText(container)).toBe("My unsent game idea");
+  });
+
+  it("uses new credentials and rejects mutations while offline without replaying them", async () => {
+    installDesktop();
+    const { updateRuntimeConnection } =
+      await import("../src/renderer/runtime-connection.js");
+    const { request } = await import("../src/renderer/api.js");
+    const fetchMock = vi.fn(async () => Response.json({ status: "ok" }));
+    vi.stubGlobal("fetch", fetchMock);
+    updateRuntimeConnection(ready(1));
+    await request("/health");
+    expect(fetchMock).toHaveBeenLastCalledWith(
+      "http://127.0.0.1:1001/health",
+      expect.objectContaining({ headers: { authorization: "Bearer token-1" } }),
+    );
+    updateRuntimeConnection({
+      status: "recovering",
+      generation: 2,
+      recovered: true,
+    });
+    await expect(
+      request("/projects/project/conversations/conversation/prompt", {
+        method: "POST",
+        body: "{}",
+      }),
+    ).rejects.toThrow("background service is unavailable");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    updateRuntimeConnection(ready(2));
+    await request("/health");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenLastCalledWith(
+      "http://127.0.0.1:1002/health",
+      expect.objectContaining({ headers: { authorization: "Bearer token-2" } }),
+    );
+    await request("/projects", { method: "POST", body: "{}" });
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(fetchMock).toHaveBeenLastCalledWith(
+      "http://127.0.0.1:1002/projects",
+      expect.objectContaining({ method: "POST" }),
+    );
+  });
+
+  it("refreshes settings after recovery without replacing an unsaved form", async () => {
+    installDesktop();
+    const { updateRuntimeConnection } =
+      await import("../src/renderer/runtime-connection.js");
+    const { NetworkSettingsPanel } =
+      await import("../src/renderer/network-settings.js");
+    updateRuntimeConnection(ready(1));
+    const fetchMock = vi.fn(async () =>
+      Response.json({
+        settings: {
+          mode: "manual",
+          proxyUrl: "http://127.0.0.1:7890",
+          noProxy: "",
+        },
+        active: { source: "direct", noProxy: "" },
+        detected: { source: "direct", noProxy: "" },
+        requiresRestart: false,
+        systemProxyAvailable: false,
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    await act(async () => root.render(<NetworkSettingsPanel />));
+    const input =
+      container.querySelector<HTMLInputElement>('input[type="url"]')!;
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(
+        HTMLInputElement.prototype,
+        "value",
+      )!.set!.call(input, "http://127.0.0.1:9999");
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await act(async () =>
+      updateRuntimeConnection({
+        status: "recovering",
+        generation: 2,
+        recovered: true,
+      }),
+    );
+    await act(async () => updateRuntimeConnection(ready(2)));
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(container.querySelector('input[type="url"]')).toBe(input);
+    expect(input.value).toBe("http://127.0.0.1:9999");
+  });
+
+  it.each([false, true])("loads a plugin's page and preserves its unsaved settings across recovery (loaded: %s)", async (loaded) => {
+    installDesktop();
+    const { updateRuntimeConnection } = await import("../src/renderer/runtime-connection.js");
+    const { PluginsSettings } = await import("../src/renderer/plugins.js");
+    updateRuntimeConnection(ready(1));
+    let catalogReads = 0;
+    const plugin = {
+      id: "acme/test", version: "1.0.0", revision: "a".repeat(64), displayName: "Test plugin", description: "Test",
+      capabilities: [], grants: { enabled: true, allowed: [] }, bundled: false, everyProject: false, examples: [], skills: [],
+      settings: [{ name: "endpoint", type: "text", title: "Endpoint", required: true }],
+      adds: { projectTypes: [], panels: [], commands: [], mcpServers: [], modelProviders: [], agents: [], tools: 0, skills: 0 },
+    };
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => {
+      const route = new URL(url).pathname;
+      if (route === "/plugin-store/plugins") {
+        catalogReads++;
+        if (!loaded && catalogReads === 1) return Response.json({ error: "Catalog failed" }, { status: 500 });
+        return Response.json([plugin]);
+      }
+      if (route === "/plugin-store/acme/test/configuration") return Response.json({ endpoint: { type: "text", value: null } });
+      if (route === "/plugin-store/updates") return Response.json([]);
+      return Response.json({ status: "ok" });
+    }));
+    await act(async () => root.render(<PluginsSettings pluginId="acme/test" onPluginChange={() => {}} onTryPlugin={async () => {}} />));
+    expect(catalogReads).toBe(1);
+    const input = container.querySelector<HTMLInputElement>(".plugin-configuration input");
+    if (loaded) await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input, "Unsaved endpoint");
+      input!.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    else expect(input).toBeNull();
+    await act(async () => updateRuntimeConnection({ status: "recovering", generation: 2, recovered: true }));
+    await act(async () => updateRuntimeConnection(ready(2)));
+    expect(catalogReads).toBe(2);
+    if (loaded) {
+      expect(container.querySelector(".plugin-configuration input")).toBe(input);
+      expect(input!.value).toBe("Unsaved endpoint");
+    } else expect(container.textContent).toContain("Test plugin");
+  });
+
+  it("resets an event cursor across daemon generations and receives low-numbered new events", async () => {
+    installDesktop();
+    const { updateRuntimeConnection } =
+      await import("../src/renderer/runtime-connection.js");
+    const { subscribeToProject } = await import("../src/renderer/api.js");
+    updateRuntimeConnection(ready(1));
+    const requests: string[] = [];
+    const received: number[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init: RequestInit) => {
+        requests.push(url);
+        const event: RuntimeEvent = {
+          id: url.includes(":1001/") ? 51 : 1,
+          projectId: "project",
+          type: "preview.updated",
+          data: { preview: { status: "stopped" } },
+          timestamp: new Date().toISOString(),
+        };
+        return new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.enqueue(
+                new TextEncoder().encode(
+                  `id: ${event.id}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`,
+                ),
+              );
+              init.signal!.addEventListener(
+                "abort",
+                () =>
+                  controller.error(new DOMException("Aborted", "AbortError")),
+                { once: true },
+              );
+            },
+          }),
+          { headers: { "content-type": "text/event-stream" } },
+        );
+      }),
+    );
+    const reset = vi.fn(async () => 0);
+    const unsubscribe = subscribeToProject("project", 50, {
+      onEvent: (event) => received.push(event.id),
+      onOpen: () => {},
+      onError: () => {},
+      onReset: reset,
+    });
+    try {
+      await vi.waitFor(() => expect(received).toEqual([51]));
+      updateRuntimeConnection({
+        status: "recovering",
+        generation: 2,
+        recovered: true,
+      });
+      updateRuntimeConnection(ready(2));
+      await vi.waitFor(() => expect(received).toEqual([51, 1]), {
+        timeout: 2000,
+      });
+      expect(reset).toHaveBeenCalledTimes(1);
+      expect(requests[1]).toBe(
+        "http://127.0.0.1:1002/projects/project/events?cursor=0",
+      );
+    } finally {
+      unsubscribe();
+    }
+  });
+
+  it("shows recovery controls without unmounting the current view or input", async () => {
+    const service = installDesktop();
+    const { updateRuntimeConnection } =
+      await import("../src/renderer/runtime-connection.js");
+    const { RuntimeNotice } = await import("../src/renderer/runtime-notice.js");
+    updateRuntimeConnection(ready(1));
+    await act(async () =>
+      root.render(
+        <>
+          <RuntimeNotice />
+          <textarea defaultValue="Unsent message" />
+        </>,
+      ),
+    );
+    const input = container.querySelector("textarea")!;
+    await act(async () =>
+      updateRuntimeConnection({
+        status: "error",
+        generation: 1,
+        recovered: false,
+        error: "Service exited",
+      }),
+    );
+    expect(container.textContent).toContain("Restart service");
+    expect(container.querySelector("textarea")).toBe(input);
+    service.restart.mockImplementation(async () => {
+      updateRuntimeConnection(ready(2));
+      return ready(2);
+    });
+    await act(async () => container.querySelector("button")!.click());
+    expect(service.restart).toHaveBeenCalledTimes(1);
+    expect(input.value).toBe("Unsent message");
+    expect(container.querySelector(".runtime-notice")).toBeNull();
+  });
+});
+
+describe("pane and preview boundaries", () => {
+  it("tracks internal navigation without replacing the game and reloads or opens its current scene", async () => {
+    installDesktop();
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json([])));
+    const { CodingWorkspace } = await import("../src/renderer/coding-workspace.js");
+    const { updateRuntimeConnection } = await import("../src/renderer/runtime-connection.js");
+    updateRuntimeConnection(ready(1));
+    const open = vi.spyOn(window, "open").mockReturnValue(null);
+    // The desktop app's openExternal takes only sign-in pages; the game goes through a new window.
+    const openExternal = vi.fn(async () => { throw new Error("Invalid OAuth authorization URL"); });
+    Object.assign(window.ohMyGameDesktop!, { openExternal });
+    const project: ProjectState = { id: "routes", name: "Routes", type: "web-game", updatedAt: new Date(0).toISOString(), workspacePath: "/tmp/routes", preview: { status: "ready", url: "http://127.0.0.1:4000" } };
+    const props = { project, publishing: false, workspaceRevision: 0, onPublish: async () => false, onClosePublish: () => {}, onRestart: () => {}, onStop: async () => {} };
+    await act(async () => root.render(createElement(CodingWorkspace, props)));
+    const frame = container.querySelector("iframe")!;
+    const client = new URL(frame.src).searchParams.get("__ohmygame_client")!;
+    const moved = { ...project, preview: { ...project.preview, pages: [{ client, source: "editor" as const, path: "/scene-2?level=2#boss" }] } };
+    await act(async () => root.render(createElement(CodingWorkspace, { ...props, project: moved })));
+    expect(container.querySelector("iframe")).toBe(frame);
+    expect(new URL(frame.src).pathname).toBe("/");
+    expect(container.querySelector(".preview-location-path")?.textContent).toBe("/scene-2?level=2#boss");
+    // The page picker leads the toolbar; reload sits with the actions on the right.
+    const controls = [...container.querySelector(".preview-controls")!.children];
+    expect(controls[0]!.className).toBe("preview-location");
+    expect(controls.findIndex((child) => child.getAttribute("aria-label") === "Reload preview")).toBe(controls.length - 2);
+    // The toolbar's browser page is a client of its own, so the editor keeps its reload stream.
+    await act(async () => (container.querySelector('[aria-label="More"]') as HTMLButtonElement).click());
+    // The game's More menu also opens the preview's logs.
+    expect([...document.querySelectorAll('[role="menuitem"]')].map((item) => item.textContent?.trim())).toEqual(["Open in browser", "Restart preview service", "Preview logs"]);
+    await act(async () => [...document.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')].find((item) => item.textContent?.includes("Open in browser"))!.click());
+    const page = new URL(String(open.mock.calls[0][0]));
+    expect(`${page.pathname}?level=${page.searchParams.get("level")}${page.hash}`).toBe("/scene-2?level=2#boss");
+    expect(page.searchParams.get("__ohmygame_view")).toBe("external");
+    expect(page.searchParams.get("__ohmygame_client")).toMatch(/.+/);
+    expect(page.searchParams.get("__ohmygame_client")).not.toBe(client);
+    expect(openExternal).not.toHaveBeenCalled();
+    await act(async () => (container.querySelector('[aria-label="Reload preview"]') as HTMLButtonElement).click());
+    expect(container.querySelector("iframe")).not.toBe(frame);
+    const reloaded = new URL(container.querySelector("iframe")!.src);
+    expect(reloaded.pathname).toBe("/scene-2");
+    expect(reloaded.searchParams.get("level")).toBe("2");
+    expect(reloaded.hash).toBe("#boss");
+  });
+
+  it("opens preview logs over the Code panel while the game is hidden", async () => {
+    installDesktop();
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json([])));
+    const { CodingWorkspace } = await import("../src/renderer/coding-workspace.js");
+    const { createPanelNodes } = await import("../src/renderer/panel-layout.js");
+    const { updateRuntimeConnection } = await import("../src/renderer/runtime-connection.js");
+    updateRuntimeConnection(ready(1));
+    const project: ProjectState = { id: "logs", name: "Logs", type: "web-game", updatedAt: new Date(0).toISOString(), workspacePath: "/tmp/logs", preview: { status: "stopped", logs: "Preview was stopped." } };
+    const nodes = { preview: createPanelNodes(), design: createPanelNodes(), canvas: createPanelNodes(), code: createPanelNodes(), assets: createPanelNodes() };
+    const panel = document.createElement("div");
+    panel.append(nodes.preview.toolbar, nodes.preview.body, nodes.code.toolbar, nodes.code.body);
+    document.body.append(panel);
+    const props = { project, publishing: false, workspaceRevision: 0, onPublish: async () => false, onClosePublish: () => {}, onRestart: () => {} };
+    await act(async () => root.render(createElement(CodingWorkspace, { ...props, panels: { nodes, visible: new Set(["preview", "code"] as const), onShow: () => {} } })));
+    await act(async () => (document.querySelector('[aria-label="More"]') as HTMLButtonElement).click());
+    await act(async () => [...document.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')].find((item) => item.textContent?.includes("Preview logs"))!.click());
+    // The desktop game steps aside for the logs, and the same menu item closes them.
+    expect(document.querySelector(".preview-logs")?.hasAttribute("data-native-preview-overlay")).toBe(true);
+    await act(async () => (document.querySelector('[aria-label="More"]') as HTMLButtonElement).click());
+    await act(async () => [...document.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')].find((item) => item.textContent?.includes("Close preview logs"))!.click());
+    expect(document.querySelector(".preview-logs")).toBeNull();
+    await act(async () => (document.querySelector('[aria-label="More"]') as HTMLButtonElement).click());
+    await act(async () => [...document.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')].find((item) => item.textContent?.includes("Preview logs"))!.click());
+    // Only the Code panel is on screen now.
+    await act(async () => root.render(createElement(CodingWorkspace, { ...props, panels: { nodes, visible: new Set(["code"] as const), onShow: () => {} } })));
+    expect(nodes.code.body.querySelector(".coding-workspace > .preview-logs")?.textContent).toContain("Preview was stopped.");
+    await act(async () => (document.querySelector('[aria-label="Close preview logs"]') as HTMLButtonElement).click());
+    expect(document.querySelector(".preview-logs")).toBeNull();
+    panel.remove();
+  });
+
+  it("keeps sibling input available when a pane throws and permits a retry", async () => {
+    const { ErrorBoundary } = await import("../src/renderer/error-boundary.js");
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    let broken = true;
+    function Pane() {
+      if (broken) throw new Error("Bad preview component");
+      return <span>Recovered pane</span>;
+    }
+    await act(async () =>
+      root.render(
+        <>
+          <textarea defaultValue="Keep this" />
+          <ErrorBoundary label="Preview">
+            <Pane />
+          </ErrorBoundary>
+        </>,
+      ),
+    );
+    const input = container.querySelector("textarea")!;
+    expect(container.textContent).toContain("Preview could not be displayed");
+    broken = false;
+    await act(async () => container.querySelector("button")!.click());
+    expect(container.textContent).toContain("Recovered pane");
+    expect(container.querySelector("textarea")).toBe(input);
+    expect(input.value).toBe("Keep this");
+  });
+
+  it("shows and clears service diagnostics while retaining the preview frame", async () => {
+    const originalError = console.error;
+    vi.spyOn(console, "error").mockImplementation((...args) => {
+      if (
+        args[0] instanceof DOMException &&
+        args[0].message.includes("Iframe page loading is disabled")
+      )
+        return;
+      originalError(...args);
+    });
+    (
+      window as unknown as {
+        happyDOM: { settings: { disableIframePageLoading: boolean } };
+      }
+    ).happyDOM.settings.disableIframePageLoading = true;
+    Object.defineProperty(window, "ohMyGameDesktop", {
+      configurable: true,
+      value: undefined,
+    });
+    const { PreviewView } = await import("../src/renderer/coding-workspace.js");
+    const project = {
+      id: "project",
+      name: "Game",
+      type: "web-game" as const,
+      updatedAt: new Date(0).toISOString(),
+      workspacePath: "/tmp/project",
+      preview: { status: "ready" as const, url: "http://127.0.0.1:4000" },
+    };
+    const props = {
+      project,
+      url: project.preview.url,
+      reload: 0,
+      revision: 0,
+      viewport: "fit" as const,
+    };
+    await act(async () => root.render(createElement(PreviewView, props)));
+    const frame = container.querySelector("iframe")!;
+    await act(async () => root.render(createElement(PreviewView, { ...props,
+      project: { ...project, preview: { ...project.preview, diagnostic: { kind: "runtime", message: "Broken game script" } } },
+    })));
+    expect(container.textContent).toContain("Broken game script");
+    expect(container.querySelector("iframe")).toBe(frame);
+    vi.spyOn(navigator.clipboard, "writeText").mockRejectedValueOnce(new Error("Document is not focused."));
+    const copyButton = [...container.querySelectorAll("button")].find((button) => button.textContent === "Copy error")!;
+    await act(async () => copyButton.click());
+    expect(container.querySelector('.preview-diagnostic [role="status"]')?.textContent).toBe("Could not copy");
+    await act(async () => root.render(createElement(PreviewView, { ...props,
+      project: { ...project, preview: { ...project.preview, diagnostic: { kind: "runtime", message: "Another game error" } } },
+    })));
+    expect(container.textContent).toContain("Another game error");
+    expect(container.querySelector('.preview-diagnostic [role="status"]')).toBeNull();
+    await act(async () =>
+      root.render(createElement(PreviewView, props)),
+    );
+    expect(container.querySelector(".preview-diagnostic")).toBeNull();
+    expect(container.querySelector("iframe")).toBe(frame);
+  });
+});
+
+describe("game panel without a web build", () => {
+  it("shows a folder without a web project, a long error's first line, and plugins' ways to start the game", async () => {
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    const { PreviewView } = await import("../src/renderer/coding-workspace.js");
+    const { PluginSlotsContext } = await import("../src/renderer/project-plugin-contributions.js");
+    const run = vi.fn(async () => undefined);
+    const command = { id: "acme/engine:run", plugin: "acme/engine", title: "Run in Engine", slots: [{ slot: "game.start" }], run: { native: "run" } };
+    const slots = { commands: [command], when: { values: {}, plugins: new Set(["acme/engine"]) }, run };
+    const project = { id: "project", name: "Game", type: "general" as const, updatedAt: new Date(0).toISOString(), workspacePath: "/tmp/project" };
+    const view = (preview: object, withSlots = true) => {
+      const element = createElement(PreviewView, { project: { ...project, preview } as never, url: undefined, reload: 0, revision: 0, viewport: "fit" as const, onRetry: () => {}, onSettings: () => {} });
+      return withSlots ? createElement(PluginSlotsContext.Provider, { value: slots as never }, element) : element;
+    };
+    await act(async () => root.render(view({ status: "waiting", error: "This folder has no package.json dev script that starts a preview server.", issue: "no-web-project" }, false)));
+    expect(container.textContent).toContain("No web game in this folder");
+    expect(container.textContent).not.toContain("package.json dev script that starts");
+    await act(async () => root.render(view({ status: "waiting", error: "This folder has no package.json dev script that starts a preview server.", issue: "no-web-project" })));
+    expect(container.textContent).toContain("Play it in its engine");
+    await act(async () => [...container.querySelectorAll("button")].find((button) => button.textContent === "Run in Engine")!.click());
+    expect(run).toHaveBeenCalledWith(command);
+    // A Web Game project has no web preview switch to turn off, so it shows the error as it is.
+    await act(async () => root.render(createElement(PreviewView, { project: { ...project, type: "web-game", preview: { status: "waiting", error: "This folder has no package.json dev script that starts a preview server.", issue: "no-web-project" } } as never, url: undefined, reload: 0, revision: 0, viewport: "fit" as const, onRetry: () => {}, onSettings: () => {} })));
+    expect(container.textContent).not.toContain("No web game in this folder");
+    expect(container.textContent).toContain("package.json dev script that starts");
+    await act(async () => root.render(view({ status: "error", error: "Godot's web export templates aren't installed.\nexport: line 1\nexport: line 2" })));
+    expect(container.querySelector('[role="alert"] > span')?.textContent).toBe("Godot's web export templates aren't installed.");
+    expect(container.querySelector('[role="alert"] details')?.textContent).toContain("export: line 2");
+    expect([...container.querySelectorAll(".preview-recovery-actions button")].map((button) => button.textContent)).toContain("Run in Engine");
+    // An engine's plugin the folder turned on, waiting to be allowed, is offered first; allowing it is what adds its commands.
+    const allow = vi.fn(async () => { throw new Error("Wait for the agent to finish first"); });
+    const waiting = { commands: [], when: { values: {}, plugins: new Set<string>() }, run, waiting: [{ id: "acme/unreal", displayName: "Unreal Engine" }], allow };
+    await act(async () => root.render(createElement(PluginSlotsContext.Provider, { value: waiting as never },
+      createElement(PreviewView, { project: { ...project, preview: { status: "waiting", error: "no package.json", issue: "no-web-project" } } as never, url: undefined, reload: 0, revision: 0, viewport: "fit" as const, onRetry: () => {}, onSettings: () => {} }))));
+    expect(container.textContent).toContain("Unreal Engine recognizes this folder as its project");
+    await act(async () => [...container.querySelectorAll("button")].find((button) => button.textContent === "Allow Unreal Engine")!.click());
+    expect(allow).toHaveBeenCalledWith("acme/unreal");
+    expect(container.querySelector(".game-start-error")?.textContent).toBe("Wait for the agent to finish first");
+    await act(async () => root.unmount());
+    container.remove();
+  });
+
+  it("gives `when` the preview's status", async () => {
+    const { projectWhenContext } = await import("../src/renderer/project-plugin-contributions.js");
+    const { matchesWhen } = await import("../src/shared/plugin-when.js");
+    const context = projectWhenContext({ type: "general", preview: { status: "error" } }, []);
+    expect(matchesWhen("preview.status == 'error'", context)).toBe(true);
+    expect(matchesWhen("preview.status == 'error'", projectWhenContext({ type: "general" }, []))).toBe(false);
+  });
+});

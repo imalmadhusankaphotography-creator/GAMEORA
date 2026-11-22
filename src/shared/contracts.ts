@@ -1,0 +1,1653 @@
+import type { ProjectPreviewSettings } from "./preview-settings.js";
+import type { PublishCommunityGame, PublishDeployment } from "./publish-v1.js";
+import type { MultiplayerManifestConfig } from "@ohmygame/game-sdk/protocol";
+import type { WebSearchToolMetadata } from "./web-search.js";
+import type { DiffHunk } from "./line-diff.js";
+import type { GameTuningState } from "./game-tuning.js";
+import type { MediaContentType } from "./media-files.js";
+import type { AccountProfileIds, AgentRuntimeAuthStatus, AgentRuntimeId, ApprovalRequestDetails, StoredApprovalDecision } from "./agent-runtimes.js";
+
+export type PreviewStatus = "waiting" | "stopped" | "starting" | "ready" | "error";
+export type AgentStatus = "idle" | "running" | "cancelling" | "error";
+/** The types a person makes projects of. */
+export const PROJECT_TYPE_IDS = ["general", "web-game", "interactive-story", "asset-canvas", "godot-game"] as const;
+/** `plugin` is an AI plugin workspace's hidden project: it opens from the Plugins page, and no list of projects shows it. */
+export type ProjectType = (typeof PROJECT_TYPE_IDS)[number] | "plugin";
+export const PROJECT_PACKAGE_MANAGERS = ["npm", "pnpm", "yarn", "bun"] as const;
+export type ProjectPackageManager = (typeof PROJECT_PACKAGE_MANAGERS)[number];
+export const PREVIEW_VIEWPORTS = ["fit", "tablet", "mobile", "mobile-landscape"] as const;
+export type BuiltinPreviewViewport = (typeof PREVIEW_VIEWPORTS)[number];
+/** A built-in preset, or a plugin's preview device, `publisher/name:device`. */
+export type PreviewViewport = BuiltinPreviewViewport | `${string}/${string}:${string}`;
+export const PLUGIN_PREVIEW_DEVICE_PATTERN = "^[a-z0-9]+(?:-[a-z0-9]+)*/[a-z0-9]+(?:-[a-z0-9]+)*:[a-z0-9]+(?:-[a-z0-9]+)*$";
+
+export function isBuiltinPreviewViewport(value: unknown): value is BuiltinPreviewViewport {
+  return PREVIEW_VIEWPORTS.some((viewport) => viewport === value);
+}
+
+/** Whether `value` names a preview device; a plugin's may no longer be installed. */
+export function isPreviewViewport(value: unknown): value is PreviewViewport {
+  return isBuiltinPreviewViewport(value) ||
+    (typeof value === "string" && value.length <= 200 && new RegExp(PLUGIN_PREVIEW_DEVICE_PATTERN).test(value));
+}
+export const PROJECT_FILE_OPEN_MODES = ["default", "reveal", "vscode", "zed", "text-editor"] as const;
+export type ProjectFileOpenMode = (typeof PROJECT_FILE_OPEN_MODES)[number];
+
+/** One quota window of a coding agent's account, such as its 5-hour or weekly limit. */
+export interface AgentUsageLimit {
+  id: string;
+  usedPercent: number;
+  windowMinutes?: number;
+  /** Unix seconds. */
+  resetsAt?: number;
+}
+
+/** The conversation's latest model response, as its usage recorded it. */
+export interface AgentResponseStats {
+  outputTokens: number;
+  /** Output tokens over the response's time, when it was long enough to tell. */
+  tokensPerSecond?: number;
+  /** The speed's scope: the whole turn's output over its duration, waits included. */
+  speedScope?: "turn";
+  /** Prompt tokens read from the provider's cache, as a share of all prompt tokens. */
+  cacheHitPercent?: number;
+  /** The share's scope: the whole turn's requests, not only the latest one. */
+  cacheScope?: "turn";
+}
+
+/** A conversation stopped at a usage limit that resets at a known time. */
+export interface LimitResume {
+  /** When it continues (ms). */
+  at: number;
+  /** `off`: the agent's setting is off. `skipped`: the person began writing a message. */
+  state: "armed" | "off" | "skipped";
+}
+
+export interface AgentContextUsage {
+  tokens: number | null;
+  contextWindow: number;
+  percent: number | null;
+  limits?: AgentUsageLimit[];
+  limitResume?: LimitResume;
+  lastResponse?: AgentResponseStats;
+}
+
+export interface ModelRef {
+  provider: string;
+  id: string;
+}
+
+export type AgentModelRef = ModelRef;
+
+export interface AgentModel extends AgentModelRef {
+  name: string;
+  providerName: string;
+  /** Pi's reasoning levels; empty for a coding agent's model, whose provider is the agent's ID. */
+  reasoningLevels: AgentReasoningLevel[];
+  /** A coding agent model's own effort/variant values, kept separate from Pi's reasoning enum. */
+  nativeReasoningLevels?: string[];
+  contextWindow?: number;
+}
+
+export interface AgentModelCatalog {
+  models: AgentModel[];
+  hiddenModels?: AgentModel[];
+  /** Coding agents whose models were still loading; asking again a little later lists them. */
+  loadingRuntimes?: AgentRuntimeId[];
+  /** Pi catalogs refreshing in the background; existing models remain available. */
+  loadingProviders?: string[];
+  defaultModel?: AgentModelRef;
+  defaultReasoningLevel: AgentReasoningLevel;
+  defaultNativeReasoningLevel?: string;
+}
+
+export const AGENT_REASONING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+export type AgentReasoningLevel = (typeof AGENT_REASONING_LEVELS)[number];
+
+export type ModelAuthMethod = "api_key" | "oauth";
+
+export interface ModelProviderSummary {
+  id: string;
+  name: string;
+  configured: boolean;
+  source?: string;
+  credentialType?: ModelAuthMethod;
+  methods: Array<{ type: ModelAuthMethod; label: string }>;
+}
+
+export type ProviderStatus = "connected" | "not_configured" | "connecting" | "error";
+export type ProviderCapability = "language" | "image" | "3d" | "video" | "audio";
+/** What a default model is for: a kind of media, with audio split by what it makes, since most audio models make one kind. */
+export const MEDIA_MODEL_USAGES = ["image", "video", "3d", "speech", "sound-effect", "music"] as const;
+export type MediaModelUsage = (typeof MEDIA_MODEL_USAGES)[number];
+/** Missing entries inherit the global default for that kind of generation. */
+export type MediaModelDefaults = Partial<Record<MediaModelUsage, ModelRef>>;
+
+export interface ProviderSummary extends ModelProviderSummary {
+  /** Saved sign-in status for a local CLI provider. */
+  authStatus?: AgentRuntimeAuthStatus;
+  /** OpenAI can connect chat and images independently. */
+  languageConfigured?: boolean;
+  imageConfigured?: boolean;
+  managed?: "free_cloud";
+  cloud?: import("./cloud-models.js").CloudConnectionState;
+  status: ProviderStatus;
+  capabilities: ProviderCapability[];
+  enabled?: boolean;
+  custom?: boolean;
+  preset?: CustomProviderPreset;
+  /** A provider an installed plugin adds; its key is one of the plugin's settings. */
+  plugin?: PluginProviderInfo;
+  error?: string;
+}
+
+export interface PluginProviderInfo {
+  /** The media adapter declares a read-only provider-level 3D credit query. */
+  model3dBalance?: boolean;
+  /** The plugin's id, `publisher/name`. */
+  id: string;
+  name: string;
+  /** Its chat endpoint; a provider that only makes media has none. */
+  baseUrl?: string;
+  /** The plugin's setting that holds the key, when it needs one. */
+  keySetting?: string;
+  /** That setting's description, such as where to get a key. */
+  keyHint?: string;
+  /** Changes with the package, when the provider has its own icon (`/plugin-providers/:id/icon`). */
+  icon?: string;
+}
+
+export interface CustomProviderSettings {
+  id: string;
+  name: string;
+  baseUrl: string;
+  api: string;
+  authentication: "api_key" | "none";
+  preset?: CustomProviderPreset;
+  modelConfigurationVersion?: 2;
+}
+
+export type CustomProviderPreset = "gateway" | "ollama" | "lmstudio" | "google" | "openrouter" | "seedance" | "meshy" | "tripo" | "hyper3d";
+
+export interface CustomImageModelSettings {
+  protocol: ImageProtocol;
+  baseUrl?: string;
+  resolutions: ImageResolution[];
+  aspectRatios: ImageAspectRatio[];
+  maxReferenceImages: number;
+  maxOutputs: ImageOutputCount;
+  /** OpenAI Images only; saved only when it is `endpoint`. */
+  outputFormat?: ImageOutputFormat;
+}
+/**
+ * What an OpenAI Images request asks for. `webp` sends `output_format` (PNG for a
+ * transparent background); `endpoint` leaves it out for relays that reject it.
+ */
+export type ImageOutputFormat = "webp" | "endpoint";
+export const IMAGE_OUTPUT_FORMATS = ["webp", "endpoint"] as const satisfies readonly ImageOutputFormat[];
+
+export type VideoProtocol = "openrouter-videos" | "seedance";
+export interface CustomVideoModelSettings {
+  protocol: VideoProtocol;
+  baseUrl?: string;
+  resolutions: VideoResolution[];
+  aspectRatios: VideoAspectRatio[];
+  durations: number[];
+  maxReferenceImages: number;
+  referenceModes: Array<"frame" | "reference">;
+}
+
+/** Broad request/store bound; a selected model enforces its own stricter range. */
+export const MODEL_3D_MIN_POLYCOUNT = 48;
+export type Model3DOperation = "image" | "text" | "retexture" | "remesh" | "animate";
+export type Model3DActionId = number | string;
+export interface Model3DOptions {
+  pose?: "a-pose" | "t-pose";
+  textureModel?: string;
+  textureQuality?: "fast" | "standard" | "detailed" | "extreme";
+  rigModel?: "v1.0-20240301" | "v2.5-20260210" | "v3.0-20260909";
+  rigType?: "biped" | "quadruped" | "hexapod" | "octopod" | "serpentine" | "aquatic";
+  animateInPlace?: boolean;
+}
+export interface Model3DMetadata {
+  triangles: number;
+  textured: boolean;
+  rigged: boolean;
+  animations: string[];
+  forwardAxis?: "+X" | "+Z";
+  provider?: string;
+  operation?: Model3DOperation;
+}
+export interface Model3DBalance { balance: number; frozen?: number; }
+
+export interface CustomModel3DSettings {
+  protocol: "meshy" | "tripo" | "hyper3d";
+  baseUrl?: string;
+  operation: "image-to-3d" | "multi-image-to-3d";
+  /** Extra operations explicitly enabled for this compatible API connection. */
+  operations?: Model3DOperation[];
+  modelType: "standard" | "smart-topology";
+  maxReferenceImages: number;
+  polycount: Model3DModel["polycount"];
+  supportsTexture: boolean;
+  supportsPbr: boolean;
+  defaults?: { texture: boolean; pbr: boolean };
+}
+
+export interface Model3DDefinition {
+  id: string;
+  name: string;
+  settings: CustomModel3DSettings;
+}
+
+export interface CustomModelUsages {
+  language?: boolean;
+  image?: CustomImageModelSettings;
+  video?: CustomVideoModelSettings;
+  "3d"?: CustomModel3DSettings;
+}
+
+export interface SaveCustomProviderRequest extends Omit<CustomProviderSettings, "id"> {
+  apiKey?: string;
+  models?: CustomProviderModel[];
+  hiddenModelIds?: string[];
+}
+
+export interface CustomProviderDetails extends CustomProviderSettings {
+  models: CustomProviderModel[];
+  hiddenModelIds: string[];
+}
+
+export type DiscoverProviderModelsRequest = Pick<SaveCustomProviderRequest, "baseUrl" | "api" | "authentication" | "apiKey" | "preset"> & { providerId?: string };
+
+export interface DiscoveredProviderModels {
+  models: CustomProviderModel[];
+  truncated?: boolean;
+  warnings?: string[];
+  source?: "provider" | "presets";
+}
+
+export interface ModelProviderEndpointSettings {
+  baseUrl: string;
+}
+
+export type OpenAIImageConnectionMode = "connection" | "separate" | "disabled";
+export interface OpenAIImageModelConfiguration {
+  id: string;
+  name: string;
+  template: "gpt-image-1" | "gpt-image-2";
+  enabled: boolean;
+}
+export interface OpenAIImageConnectionSettings {
+  mode: OpenAIImageConnectionMode;
+  baseUrl: string;
+  configured: boolean;
+  connectionAvailable: boolean;
+  connectionBaseUrl?: string;
+  models: OpenAIImageModelConfiguration[];
+  outputFormat: ImageOutputFormat;
+}
+export interface SaveOpenAIImageConnectionRequest {
+  mode: OpenAIImageConnectionMode;
+  baseUrl: string;
+  apiKey?: string;
+  models: OpenAIImageModelConfiguration[];
+  /** Omitted keeps `webp`. */
+  outputFormat?: ImageOutputFormat;
+}
+export type DiscoverOpenAIImageModelsRequest = Pick<SaveOpenAIImageConnectionRequest, "mode" | "baseUrl" | "apiKey">;
+export interface DiscoveredOpenAIImageModels {
+  models: OpenAIImageModelConfiguration[];
+  warnings?: string[];
+}
+
+export const RESPONSES_TRANSPORT_MODES = ["auto", "sse", "websocket"] as const;
+export type ResponsesTransportMode = typeof RESPONSES_TRANSPORT_MODES[number];
+export interface ResponsesTransportSettings { mode: ResponsesTransportMode }
+
+export const CUSTOM_MODEL_APIS = ["openai-completions", "openai-responses", "anthropic-messages", "google-generative-ai", "google-vertex"] as const;
+export const CUSTOM_IMAGE_MODEL_APIS = ["openai-completions", "openai-responses"] as const;
+
+export type CustomThinkingLevelMap = Partial<Record<AgentReasoningLevel, string | null>>;
+export interface CustomReasoningCapabilities {
+  source: "provider" | "catalog";
+  thinkingLevelMap: CustomThinkingLevelMap;
+  /** Catalog fallback for the editor when endpoint metadata becomes stale; never persisted. */
+  catalogThinkingLevelMap?: CustomThinkingLevelMap;
+}
+
+export interface CustomProviderModel {
+  id: string;
+  name: string;
+  api: string;
+  baseUrl?: string;
+  contextWindow: number;
+  maxTokens: number;
+  reasoning: boolean;
+  /** Only explicit user overrides are written to the SDK model definition. */
+  thinkingLevelMap?: CustomThinkingLevelMap;
+  reasoningCapabilities?: CustomReasoningCapabilities;
+  supportsImages: boolean;
+  // compat: since beta.4.1, remove from beta.6 and 2026-11-08. Custom providers before modelConfigurationVersion 2.
+  /** Undefined is a legacy language model; an empty object is explicitly unassigned. */
+  usages?: CustomModelUsages;
+}
+
+export interface ProviderModelSettings {
+  canRefreshCatalog?: boolean;
+  refreshingCatalog?: boolean;
+  catalogDocsUrl?: string;
+  models: Array<AgentModel & { visible: boolean; custom: boolean; capabilities?: ProviderCapability[];
+    source?: "preset" | "custom" | "cloud"; model3d?: Model3DDefinition; description?: string }>;
+  defaultApi: string;
+  defaultBaseUrl?: string;
+  canAddCustomModel: boolean;
+  model3DProtocol?: CustomModel3DSettings["protocol"];
+  catalogNotice?: string;
+}
+
+export type ModelAuthPrompt =
+  | { type: "text" | "secret" | "manual_code"; message: string; placeholder?: string; optional?: boolean }
+  | { type: "select"; message: string; options: Array<{ id: string; label: string; description?: string }> };
+
+export type ModelAuthNotification =
+  | { type: "info"; message: string; links?: Array<{ url: string; label?: string }> }
+  | { type: "auth_url"; url: string; instructions?: string }
+  | { type: "device_code"; userCode: string; verificationUri: string; intervalSeconds?: number; expiresInSeconds?: number }
+  | { type: "progress"; message: string };
+
+export type ModelAuthEvent = {
+  id: number;
+  operationId: string;
+} & (
+  | { type: "notification"; notification: ModelAuthNotification }
+  | { type: "prompt"; promptId: string; prompt: ModelAuthPrompt }
+  | { type: "completed" }
+  | { type: "cancelled" }
+  | { type: "error"; error: string }
+);
+
+export type ImageModelRef = ModelRef;
+
+/** Why a connected provider offers no media models, so the canvas can say so instead of hiding it. */
+export interface MediaProviderStatus {
+  cloud?: import("./cloud-models.js").CloudConnectionState;
+  provider: string;
+  providerName: string;
+  state: "ready" | "empty" | "error";
+  message?: string;
+}
+
+export interface MediaModelCatalog<Model> {
+  models: Model[];
+  providers: MediaProviderStatus[];
+  defaultModel?: ModelRef;
+}
+
+export type ImageModelCatalog = MediaModelCatalog<ImageModel> & { backgroundRemovalModels?: BackgroundRemovalModel[] };
+
+export type Model3DModelRef = ModelRef;
+
+export interface Model3DModel extends Model3DModelRef {
+  /** Explicit processing limits; otherwise use the protocol's existing remesh range. */
+  remeshPolycount?: Model3DModel["polycount"];
+  protocol?: CustomModel3DSettings["protocol"];
+  operations?: Model3DOperation[];
+  referenceImageLabels?: readonly string[];
+  name: string;
+  providerName: string;
+  /** Distinct views of one object; the first is treated as the front. */
+  maxReferenceImages: number;
+  polycount: { min: number; max: number; default: number; presets: readonly number[] };
+  supportsTexture?: boolean;
+  supportsPbr?: boolean;
+  defaults?: { texture: boolean; pbr: boolean };
+  generationLabel?: string;
+  estimatedCredits?: number;
+}
+
+/** A preset move from the 3D provider's animation library. */
+export interface Model3DAnimationAction {
+  id: Model3DActionId;
+  name: string;
+  category: string;
+  subCategory: string;
+  previewUrl?: string;
+}
+
+/** Dedicated image processing, excluded from generative model defaults. */
+export interface BackgroundRemovalModel extends ImageModelRef {
+  name: string;
+  providerName: string;
+}
+
+export interface ImageModel extends ImageModelRef {
+  name: string;
+  providerName: string;
+  sizes: readonly ImageSize[];
+  generationOptions: readonly ImageGenerationOption[];
+  supportsReferenceImage: boolean;
+  maxReferenceImages?: number;
+  /** How many reference pictures it needs; a plugin model can require them (API 2.30). */
+  minReferenceImages?: number;
+  /** A reference image can provide the subject when no text prompt is present (API 2.33). */
+  promptOptionalWithReference?: boolean;
+  maxOutputs: ImageOutputCount;
+  /** `plugin`: a plugin's media adapter makes it. */
+  protocol: ImageProtocol | "codex-cli" | "plugin";
+  supportsResolution?: boolean;
+  supportsAspectRatio?: boolean;
+}
+
+export type ImageProtocol = "openai-images" | "gemini-generate-content" | "openrouter-images" | "volcengine-images";
+
+export interface PublicationState {
+  gameId: string;
+  deploymentId: string;
+  playUrl: string;
+  publishedAt: string;
+  title?: string;
+  description?: string;
+  /** The game's page name and address; missing before the Cloud named games. */
+  name?: string;
+  pageUrl?: string;
+}
+
+export type ProjectCoverMode = "auto" | "custom";
+
+export interface ProjectCoverState {
+  /** "custom" also freezes an automatic cover, or disables capture before a cover exists. */
+  mode: ProjectCoverMode;
+}
+
+/** An element the person picked in a web game's preview, to point the agent at it. */
+export interface PreviewPick {
+  tag: string;
+  /** Its accessible name or text, shortened. */
+  text?: string;
+  /** A CSS path from the document. */
+  selector: string;
+  /** In the page's CSS pixels. */
+  box: { x: number; y: number; width: number; height: number };
+  /** The page it was on. */
+  path: string;
+}
+
+export interface PreviewRuntimeState {
+  status: PreviewStatus;
+  url?: string;
+  error?: string;
+  diagnostic?: import("./preview-diagnostics.js").PreviewDiagnostic;
+  diagnostics?: import("./preview-diagnostics.js").PreviewDiagnostic[];
+  phase?: "checking" | "building" | "installing" | "launching" | "connecting";
+  startedAt?: string;
+  logs?: string;
+  command?: string;
+  directory?: string;
+  manager?: ProjectPackageManager;
+  managerSource?: string;
+  revision?: number;
+  pages?: { client: string; source: import("./preview-page.js").PreviewPageSource; path: string }[];
+  stopReason?: "manual" | "idle" | "settings" | "recovery";
+  /** What the waiting or failed preview is about, when the app knows: the folder holds no web project. */
+  issue?: "no-web-project";
+}
+
+export type ProjectNameSource = "default" | "ai" | "manual";
+
+/** How a project shows in the sidebar and on its card, set in project settings. */
+export interface ProjectAppearance {
+  /** A default library icon, replacing the one picked from the project ID. */
+  icon?: import("./project-appearance.js").ProjectIcon;
+  /** The default template's background tone, from 0 to 3. */
+  tone?: number;
+  /** Shows the default template instead of a captured or uploaded cover. */
+  cover?: "template";
+  /** Set while the project has an uploaded logo. */
+  logo?: true;
+}
+
+export interface ProjectState extends ProjectPreviewSettings {
+  id: string;
+  name: string;
+  /** Missing on legacy projects, which are not automatically renamed. */
+  nameSource?: ProjectNameSource;
+  type: ProjectType;
+  updatedAt: string;
+  workspacePath: string;
+  /**
+   * A plugin project type, `publisher/name:type`, and how its game is
+   * previewed, recorded for the app's screens. `ohmygame.json` decides what runs.
+   */
+  pluginType?: { id: string; plugin: string; preview: "web" | "web-build" | "native" };
+  /** General Game's explicit Web preview opt-in; missing means disabled. */
+  webPreviewEnabled?: boolean;
+  /** Directory, relative to the workspace root, in which the Web Game preview starts. */
+  startupDirectory?: string;
+  /** Package script that starts the Web Game preview. Defaults to `dev`. */
+  startupScript?: string;
+  /** Overrides automatic package-manager detection for the Web Game preview and build. */
+  packageManager?: ProjectPackageManager;
+  /** Route shown when a Web Game preview starts. */
+  previewPath?: string;
+  /** Device preset selected when a Web Game preview starts. */
+  previewViewport?: PreviewViewport;
+  mediaModelDefaults?: MediaModelDefaults;
+  /** Internal OhMyGame data kept separately from a user-selected workspace. */
+  storagePath?: string;
+  /** Whether OhMyGame owns the workspace directory or only references it. */
+  workspaceLocation?: "managed" | "external";
+  /** False when a previously selected workspace is no longer available on disk. */
+  workspaceAvailable?: boolean;
+  preview: PreviewRuntimeState;
+  publication?: PublicationState;
+  appearance?: ProjectAppearance;
+}
+
+export interface ProjectRunSettings extends ProjectPreviewSettings {
+  startupDirectory: string;
+  startupScript: string;
+  packageManager?: ProjectPackageManager;
+  previewPath: string;
+  previewViewport: PreviewViewport;
+  webPreviewEnabled?: boolean;
+}
+
+export interface ProjectAgentActivity {
+  projectId: string;
+  status: Extract<AgentStatus, "running" | "cancelling">;
+}
+
+export interface ProjectActivitySnapshot {
+  activity: ProjectAgentActivity[];
+  names: Pick<ProjectState, "id" | "name" | "nameSource">[];
+}
+
+export type AssetCanvasNodeType = "text" | "image" | "video" | "audio" | "model-3d" | "animate-3d" | "asset" | "document" | "table" | "file" | "group" | "plugin";
+
+export interface AssetCanvasPosition {
+  x: number;
+  y: number;
+}
+
+export interface AssetCanvasNodeLayout extends AssetCanvasPosition {
+  width?: number;
+  height?: number;
+}
+
+export interface AssetCanvasEditorLayout {
+  version: 1;
+  nodes: Record<string, AssetCanvasNodeLayout>;
+  viewport: { x: number; y: number; zoom: number };
+  /** Fit a remixed board once its nodes are measured, then save the new viewport. */
+  fitView?: boolean;
+  view: "canvas";
+}
+
+export type AssetCanvasReference =
+  | { type: "library"; assetId: string }
+  | { type: "node"; nodeId: string };
+
+export interface AssetCanvasTextReference {
+  type: "node";
+  nodeId: string;
+}
+
+export interface AssetCanvasTextGenerationRequest {
+  instruction: string;
+  model?: AgentModelRef;
+  reasoningLevel?: AgentReasoningLevel;
+  referenceSource?: AssetCanvasTextGenerationSource;
+}
+
+export interface AssetCanvasTextGenerationSource {
+  boardId: string;
+  nodeId: string;
+}
+
+export interface AssetCanvasTextGenerationResponse {
+  text: string;
+  model: AgentModelRef;
+}
+
+export type AssetCanvasNode = (
+  | { id: string; type: "group"; position: AssetCanvasPosition; data: { name: string; pixelStyle?: import("./canvas-pixel-style.js").PixelArtLevel } }
+  | { id: string; type: "table"; position: AssetCanvasPosition; data: { tableId: string } }
+  /** Any other project file or folder, by project-relative path. */
+  | { id: string; type: "file"; position: AssetCanvasPosition; data: { path: string; directory?: true } }
+  | { id: string; type: "document"; position: AssetCanvasPosition; data: { documentId: string; references?: AssetCanvasTextReference[] } }
+  | { id: string; type: "asset"; position: AssetCanvasPosition; data: {
+    assetId: string;
+    mediaType: "image" | "video" | "audio" | "model";
+    examplePrompt?: string;
+  } }
+  | { id: string; type: "text"; position: AssetCanvasPosition; data: {
+    text: string;
+    instruction: string;
+    model?: AgentModelRef;
+    reasoningLevel?: AgentReasoningLevel;
+    references?: AssetCanvasTextReference[];
+  } }
+  | { id: string; type: "image"; position: AssetCanvasPosition; data: {
+    prompt: string;
+    /** Dedicated processing: use one source and a background-removal model. */
+    backgroundRemoval?: true;
+    presetId?: import("./canvas-image-presets.js").CanvasImagePreset;
+    promptExpanded?: boolean;
+    /** Prompt parts managed by the Effect Library template. */
+    effectBasePrompt?: string;
+    effectColor?: "original" | "ice-blue" | "electric-purple" | "toxic-green" | "gold";
+    effectRhythm?: "sample" | "quick" | "extended";
+    /** Pixel density used when expanding this image's preset prompt. */
+    pixelStyle?: import("./canvas-pixel-style.js").PixelArtLevel;
+    /** User action substituted into an editable continuous-action template. */
+    actionDescription?: string;
+    materialStyle?: import("./canvas-image-presets.js").CanvasMaterialStyle;
+    sourceInput?: boolean;
+    sourceInputLabel?: string;
+    quickReskinMode?: "person-clothing";
+    // compat: since beta.5.3, remove from beta.7 and 2026-12-04. Read only by normalizeLegacyCharacterModes.
+    /** Legacy drafts only; new nodes store the expanded prompt. */
+    generationMode?: "character-asset" | "continuous-actions" | "all-actions";
+    promptSource?: AssetCanvasTextReference;
+    model?: ImageModelRef;
+    resolution: ImageResolution;
+    aspectRatio: ImageAspectRatio;
+    images: AssetCanvasReference[];
+    assetId?: string;
+    /** Bundled example image id shown until the node has an asset. */
+    exampleImage?: string;
+  } }
+  | { id: string; type: "video"; position: AssetCanvasPosition; data: {
+    prompt: string;
+    promptSource?: AssetCanvasTextReference;
+    model?: VideoModelRef;
+    resolution: VideoResolution;
+    aspectRatio: VideoAspectRatio;
+    duration: number;
+    references: AssetCanvasReference[];
+    referenceMode?: VideoReferenceMode;
+    referenceMentions?: Record<string, AssetCanvasReference>;
+    assetId?: string;
+  } }
+  | { id: string; type: "audio"; position: AssetCanvasPosition; data: import("./audio.js").AudioSettings & {
+    /** Optional purpose; absent keeps existing free-form audio nodes unchanged. */
+    kind?: import("./audio.js").AudioKind;
+    /** The words a model that reads text speaks, or a description of the audio; a linked Text or Document node adds to it. */
+    prompt: string;
+    promptSource?: AssetCanvasTextReference;
+    model?: ModelRef;
+    durationSeconds?: number;
+    loop?: boolean;
+    instrumental?: boolean;
+    assetId?: string;
+  } }
+  | { id: string; type: "model-3d"; position: AssetCanvasPosition; data: {
+    operation?: Exclude<Model3DOperation, "animate">;
+    prompt?: string;
+    promptSource?: AssetCanvasTextReference;
+    source?: AssetCanvasReference;
+    options?: Model3DOptions;
+    model?: Model3DModelRef;
+    targetPolycount: number;
+    texture: boolean;
+    pbr: boolean;
+    images: AssetCanvasReference[];
+    assetId?: string;
+  } }
+  | { id: string; type: "animate-3d"; position: AssetCanvasPosition; data: {
+    model?: Model3DModelRef;
+    options?: Model3DOptions;
+    /** The source GLB: a 3D output node, a model Asset node, or a Library model. */
+    source?: AssetCanvasReference;
+    heightMeters: number;
+    /** Library actions in clip order. */
+    actionIds: Model3DActionId[];
+    assetId?: string;
+  } }
+  /** A node a plugin adds: its code makes the output from the inputs and settings. */
+  | { id: string; type: "plugin"; position: AssetCanvasPosition; data: {
+    /** `publisher/name:node`. */
+    node: string;
+    params: Record<string, string | number | boolean>;
+    /** Each input's sources, by the input's id. */
+    inputs: Record<string, AssetCanvasReference[]>;
+    /** The output, when the node makes media. */
+    assetId?: string;
+    /** The output, when the node makes text. */
+    text?: string;
+  } }
+) & { parentId?: string; title?: string; description?: string; width?: number; height?: number };
+
+export interface AssetCanvasEdge {
+  id: string;
+  source: string;
+  target: string;
+  sourceHandle?: string;
+}
+
+export interface AssetCanvasDocument {
+  version: 1;
+  /** Hydrated editor state, persisted separately in canvas/editor/<board-id>.json. */
+  editorLayout: AssetCanvasEditorLayout;
+  viewport: { width: number; height: number };
+  nodes: AssetCanvasNode[];
+  edges: AssetCanvasEdge[];
+}
+
+/** Logical pixel size of a game screen. */
+export interface Viewport {
+  width: number;
+  height: number;
+}
+
+export interface ConversationSummary {
+  id: string;
+  projectId: string;
+  title: string;
+  createdAt: string;
+  updatedAt: string;
+  messageCount: number;
+}
+
+export interface ConversationAgentState {
+  status: AgentStatus;
+  error?: string;
+}
+
+export type ItemStatus = "preparing" | "inProgress" | "completed" | "cancelled" | "interrupted" | "failed";
+export type TurnStatus = Extract<ItemStatus, "inProgress" | "completed" | "cancelled" | "interrupted" | "failed">;
+
+export type ThreadItemErrorCode = "model_not_configured" | "authentication_failed" | "access_denied" |
+  "quota_exceeded" | "rate_limited" | "invalid_request" | "model_unavailable" | "provider_unavailable" |
+  "dns_error" | "connection_refused" | "connection_reset" | "timeout" | "tls_error" |
+  "stream_error" | "network_error" | "runtime_incompatible" | "runtime_probe_failed";
+
+export interface AgentErrorCause {
+  name?: string;
+  message?: string;
+  code?: string;
+}
+
+export interface AgentErrorDiagnostics {
+  provider?: string;
+  model?: string;
+  endpoint?: string;
+  statusCode?: number;
+  transport?: "sse" | "websocket";
+  requestId?: string;
+  errorCode?: string;
+  causes?: AgentErrorCause[];
+  network?: { source: "environment" | "system" | "manual" | "direct"; proxyUrl?: string };
+  retryAttempts?: number;
+}
+
+export interface ThreadItemError {
+  message: string;
+  code?: ThreadItemErrorCode;
+  diagnostics?: AgentErrorDiagnostics;
+}
+
+export interface PromptReference {
+  type: "workspace-file";
+  path: string;
+}
+
+/**
+ * Editor context sent with a prompt, such as the Node open in the Playable
+ * editor, an element picked in its preview, a drawing on it, or media added from it. The agent reads `text`; the
+ * conversation shows only the label.
+ */
+export interface PromptContext {
+  kind: "playable-node" | "playable-element" | "playable-drawing" | "playable-asset" | "playable-moment" | "design-document" | "canvas-board" | "preview-element" | "plugin-panel";
+  label: string;
+  text: string;
+}
+
+export type PromptContextLabel = Pick<PromptContext, "kind" | "label">;
+
+export interface PluginMention {
+  name: string;
+  displayName: string;
+  marketplaceId: string;
+}
+
+export type PromptImageMediaType = "image/png" | "image/jpeg" | "image/webp" | "image/gif";
+
+export interface PromptImage {
+  mediaType: PromptImageMediaType;
+  data: string;
+  name?: string;
+  /** Display-only reference. UI projections leave data empty; model inputs retain it. */
+  url?: string;
+}
+
+export type PromptAttachmentKind = "image" | "text" | "document" | "audio" | "video" | "model" | "archive" | "binary";
+
+/** A locally stored file made available to the agent for the current prompt. */
+export interface PromptAttachment {
+  id: string;
+  batchId: string;
+  name: string;
+  relativePath: string;
+  size: number;
+  kind: PromptAttachmentKind;
+  mediaType?: string;
+}
+
+/** Metadata displayed with a user message; it never exposes the local attachment ID. */
+export type ConversationAttachment = Omit<PromptAttachment, "id" | "batchId">;
+
+export interface PendingPrompt {
+  turnId: string;
+  prompt: string;
+  mentions: PluginMention[];
+  references: PromptReference[];
+  images: PromptImage[];
+  attachments: ConversationAttachment[];
+  steering?: boolean;
+}
+
+/** A message the person asked to send later. `missed` holds it for them to decide on, because it couldn't go at its time. */
+export interface ScheduledMessage {
+  id: string;
+  prompt: string;
+  at: number;
+  missed?: boolean;
+}
+
+export type CommunityGame = PublishCommunityGame;
+
+export interface PublishResult {
+  deployment: PublishDeployment;
+  game: Omit<CommunityGame, "author">;
+}
+
+export interface PublishProjectRequest {
+  accessToken: string;
+  title: string;
+  description?: string;
+  multiplayer?: MultiplayerManifestConfig;
+}
+
+export type AgentMessagePhase = "commentary" | "final_answer";
+
+export type PlanStepStatus = "pending" | "in_progress" | "completed";
+
+export interface PlanStep {
+  step: string;
+  status: PlanStepStatus;
+}
+
+export interface PlanState {
+  explanation?: string;
+  steps: PlanStep[];
+}
+
+/** Trusted daemon metadata, never parsed from message text. */
+export interface PromptSource { plugin: string }
+
+export type ThreadItem = (
+  | { id: string; turnId: string; type: "userMessage"; text: string; source?: PromptSource; mentions?: PluginMention[]; images?: PromptImage[]; attachments?: ConversationAttachment[]; contexts?: PromptContextLabel[]; /** The workspace as it was before this message, when it can be restored. */ checkpointId?: string; /** What the turn of this message changed in the workspace, once the turn has ended. */ changes?: TurnChanges }
+  | { id: string; turnId: string; type: "imageRead"; count: number; status: "completed" }
+  | { id: string; turnId: string; type: "modelChange"; model: AgentModelRef; name?: string }
+  | {
+      id: string;
+      turnId: string;
+      type: "agentMessage";
+      /** Persisted message at which a new independent chat can branch. */
+      branchEntryId?: string;
+      text: string;
+      status: Extract<ItemStatus, "inProgress" | "completed" | "cancelled" | "interrupted" | "failed">;
+      phase?: AgentMessagePhase;
+      error?: ThreadItemError;
+    }
+  | {
+      id: string;
+      turnId: string;
+      type: "reasoning";
+      text: string;
+      status: Extract<ItemStatus, "inProgress" | "completed">;
+    }
+  | {
+      id: string;
+      turnId: string;
+      type: "plan";
+      plan: PlanState;
+    }
+  | {
+      id: string;
+      turnId: string;
+      type: "dynamicToolCall";
+      toolCallId: string;
+      tool: string;
+      status: Extract<ItemStatus, "preparing" | "inProgress" | "completed" | "failed">;
+      arguments?: unknown;
+      output?: string;
+      truncated?: boolean;
+      artifact?: ToolArtifact;
+      images?: PromptImage[];
+      webSearch?: WebSearchToolMetadata;
+      /** Actual text lines changed by this file tool, when available. */
+      lineChanges?: LineChanges;
+      /** Bounded preview of this tool's actual file mutation, independent of turn checkpoints. */
+      fileDiff?: { hunks: DiffHunk[]; truncated?: boolean };
+    }
+  | {
+      id: string;
+      turnId: string;
+      type: "mcpToolCall";
+      toolCallId: string;
+      server?: string;
+      tool: string;
+      status: Extract<ItemStatus, "preparing" | "inProgress" | "completed" | "failed">;
+      arguments?: unknown;
+      output?: string;
+      truncated?: boolean;
+      artifact?: ToolArtifact;
+      images?: PromptImage[];
+    }
+  | {
+      id: string;
+      turnId: string;
+      type: "retry";
+      status: Extract<ItemStatus, "inProgress" | "completed" | "failed">;
+      attempt?: number;
+      maxAttempts?: number;
+      delayMs?: number;
+      error: ThreadItemError;
+    }
+  | {
+      id: string;
+      turnId: string;
+      type: "contextCompaction";
+      status: Extract<ItemStatus, "inProgress" | "completed" | "cancelled" | "failed">;
+      summary?: string;
+      tokensBefore?: number;
+      estimatedTokensAfter?: number;
+      error?: ThreadItemError;
+    }
+  | {
+      id: string;
+      turnId: string;
+      /** A coding agent asks before it runs a command, changes a file or calls a tool. */
+      type: "approvalRequest";
+      requestId: string;
+      request: ApprovalRequestDetails;
+      status: Extract<ItemStatus, "inProgress" | "completed" | "cancelled" | "failed">;
+      decision?: StoredApprovalDecision;
+    }
+  | {
+      id: string;
+      turnId: string;
+      type: "userInputRequest";
+      requestId: string;
+      questions: QuestionnaireQuestion[];
+      blocking?: boolean;
+      autoAnswerAt?: number;
+      autoAnswered?: boolean;
+      status: Extract<ItemStatus, "inProgress" | "completed" | "cancelled" | "failed">;
+      answers?: QuestionnaireAnswer[];
+      error?: ThreadItemError;
+    }
+) & { timestamp?: number };
+
+export interface Turn {
+  id: string;
+  conversationId: string;
+  status: TurnStatus;
+  items: ThreadItem[];
+  steering?: boolean;
+}
+
+export interface ConversationDetail {
+  conversation: ConversationSummary;
+  agent: ConversationAgentState;
+  settings: ConversationAgentSettings;
+  plan: PlanSessionState;
+  turns: Turn[];
+  cursor: number;
+  pendingPrompts: PendingPrompt[];
+  scheduledMessages: ScheduledMessage[];
+}
+
+export type PlanMode = "normal" | "planning" | "awaiting_approval" | "executing";
+export type PromptMode = Extract<PlanMode, "normal" | "planning">;
+
+export interface PlanSessionState {
+  mode: PlanMode;
+  plan?: PlanState;
+}
+
+export interface QuestionnaireOption {
+  value: string;
+  label: string;
+  description?: string;
+  recommended?: boolean;
+}
+
+export interface QuestionnaireQuestion {
+  id: string;
+  prompt: string;
+  options: QuestionnaireOption[];
+  allowOther: boolean;
+  multiSelect?: boolean;
+}
+
+export interface QuestionnaireInput {
+  questions: Array<Omit<QuestionnaireQuestion, "allowOther"> & { allowOther?: boolean }>;
+  blocking?: boolean;
+}
+
+export interface QuestionnaireResponse {
+  questionId: string;
+  value: string;
+  /** Individual selections; the display string must never be split to recover choices. */
+  values?: string[];
+}
+
+export interface QuestionnaireAnswer {
+  questionId: string;
+  value: string;
+  label: string;
+  custom: boolean;
+  values?: string[];
+}
+
+export interface QuestionnaireResult {
+  answers: QuestionnaireAnswer[];
+  cancelled: boolean;
+  autoAnswered?: boolean;
+}
+
+export interface AnswerQuestionnaireRequest {
+  requestId: string;
+  answers?: QuestionnaireResponse[];
+  cancelled?: boolean;
+}
+
+export interface CreateProjectRequest {
+  name?: string;
+  type?: ProjectType;
+  /** Starts the workspace as a copy of a packaged example (see GET /examples). */
+  exampleId?: string;
+  viewport?: Viewport;
+  /** Absolute path returned by the desktop directory picker. */
+  workspacePath?: string;
+  pluginId?: string;
+  /** A plugin project type, `publisher/name:type` (see GET /project-types). */
+  projectType?: string;
+}
+/** `reasoningLevel` is for a Pi model and `nativeReasoningLevel` for a coding agent's. */
+export interface CreateConversationRequest {
+  model?: AgentModelRef;
+  reasoningLevel?: AgentReasoningLevel;
+  nativeReasoningLevel?: string;
+}
+/** `reasoningLevel` is for a Pi model and `nativeReasoningLevel` for a coding agent's. */
+export interface UpdateAgentDefaultsRequest {
+  model: AgentModelRef;
+  reasoningLevel?: AgentReasoningLevel;
+  nativeReasoningLevel?: string;
+}
+export interface RenameConversationRequest { title: string }
+export type SetConversationModelRequest = AgentModelRef;
+/** Validated against the selected model: Pi enum or native effort/variant. */
+export interface SetConversationReasoningRequest { level: string }
+export interface ConversationAgentSettings {
+  accountProfiles?: AccountProfileIds;
+  model?: AgentModelRef;
+  reasoningLevel?: AgentReasoningLevel;
+  nativeReasoningLevel?: string;
+}
+export interface PromptRequest {
+  prompt: string;
+  mentions?: PluginMention[];
+  references?: PromptReference[];
+  images?: PromptImage[];
+  attachments?: Array<Pick<PromptAttachment, "id" | "batchId">>;
+  contexts?: PromptContext[];
+  mode?: PromptMode;
+}
+
+export interface ReviseLastPromptRequest { prompt: string }
+export interface ScheduleMessageRequest { prompt: string; at: number }
+
+export interface PromptResponse {
+  turnId: string;
+  queued: boolean;
+}
+
+export interface ConversationCapabilities {
+  plugins: Array<{
+    id: string;
+    name: string;
+    displayName: string;
+    description: string;
+    marketplaceId: string;
+    marketplaceDisplayName: string;
+    icon?: import("./plugins.js").PluginIcon;
+    iconRevision?: string;
+    projectTypes?: ProjectType[];
+    /** The project types it works in (`appliesTo`); absent means every type. */
+    appliesTo?: string[];
+    /** Off in this project (on Home: not on in every project); mentioning it turns it on. */
+    off?: true;
+    /** What turning it on needs the person to allow first. */
+    asks?: string[];
+  }>;
+  skills: Array<{
+    name: string;
+    description: string;
+    pluginDisplayName?: string;
+    marketplaceDisplayName?: string;
+  }>;
+}
+
+export interface WorkspaceFile {
+  path: string;
+  size: number;
+  directory?: true;
+  mediaType?: "image" | "video" | "audio" | "model";
+  /** When a media file last changed; set in the complete listing, not a single directory's. */
+  modifiedAt?: string;
+  prompt?: string;
+  previewPath?: string;
+  libraryAssetId?: string;
+  origin?: LibraryAssetOrigin;
+  purpose?: LibraryAssetPurpose;
+}
+
+export type LibraryAssetOrigin = "generated" | "uploaded" | "workspace" | "builtin" | "unknown";
+export type LibraryAssetPurpose = "asset" | "reference";
+
+export interface LibraryAsset {
+  audio?: import("./audio.js").AudioAssetData;
+  model3d?: Model3DMetadata;
+  id: string;
+  name: string;
+  size: number;
+  mediaType: NonNullable<WorkspaceFile["mediaType"]>;
+  contentType: string;
+  createdAt: string;
+  duration?: number;
+  /** Pixel dimensions of image and video content, read from the file header. */
+  width?: number;
+  height?: number;
+  prompt?: string;
+  /** The prompt as it was asked for, when plugins changed it before the image was generated. */
+  requestedPrompt?: string;
+  /** Plugins that changed the request before the image was generated, in order. */
+  pluginChanges?: import("./plugin-hooks.js").ImageHookRecord[];
+  origin?: LibraryAssetOrigin;
+  purpose?: LibraryAssetPurpose;
+  /** Project copies remain available by ID without appearing in the saved collection. */
+  saved?: boolean;
+  /** The Library video this one was cut from, and the part of it kept, in seconds. */
+  derivedFrom?: LibraryAssetDerivation;
+  /** The plugin source it was added from, and what that source said about it. */
+  sourcedFrom?: LibraryAssetSourcing;
+  /** The plugin whose page added it (`library.add`, API 2.35.0), as `publisher/name`. */
+  addedBy?: string;
+}
+
+export interface LibraryAssetSourcing {
+  /** `publisher/name:source`. */
+  source: string;
+  /** The source's own id for it. */
+  item: string;
+  author?: string;
+  license?: string;
+  /** Its page at the source, `https:` only. */
+  url?: string;
+}
+
+/** A place the Library browses beside Local, contributed by a plugin. */
+export interface LibrarySource {
+  /** `publisher/name:source`. */
+  id: string;
+  plugin: string;
+  pluginName: string;
+  title: string;
+  description?: string;
+  media: LibraryAsset["mediaType"][];
+  /** How long a browse of it (no search words) is shown again without asking it; ten minutes when absent. */
+  cacheSeconds?: number;
+  /** Its own ways to browse it, in place of the media kinds; the first is chosen at first. */
+  collections?: { id: string; title: string }[];
+  /** The sites its results' `embed` pages may come from: the hosts its plugin asks to connect to (API 2.35.0). */
+  embedHosts?: string[];
+}
+
+export interface LibrarySourceSearchRequest {
+  source: string;
+  query: string;
+  media?: LibraryAsset["mediaType"];
+  /** The `next` of the page before. */
+  cursor?: string;
+  /** One of the source's `collections`. */
+  collection?: string;
+}
+
+/** One result of a source's search; nothing is downloaded until it is added. */
+export interface LibrarySourceItem {
+  id: string;
+  name: string;
+  mediaType: LibraryAsset["mediaType"];
+  /** An `https:` or `data:image/…` picture of it. */
+  thumbnail?: string;
+  /** For audio, an `https:` or `data:audio/…` URL to listen to before adding it (API 2.35.0). */
+  preview?: string;
+  /**
+   * An `https:` page that shows it, such as a 3D viewer, which its details
+   * load on request; only from one of its source's `embedHosts` (API 2.35.0).
+   */
+  embed?: string;
+  width?: number;
+  height?: number;
+  duration?: number;
+  author?: string;
+  license?: string;
+  url?: string;
+}
+
+export interface LibrarySourceResults {
+  items: LibrarySourceItem[];
+  /** Pass back as `cursor` for the next page; absent on the last. */
+  next?: string;
+}
+
+export interface LibraryAssetDerivation {
+  assetId: string;
+  trim: { start: number; end: number };
+}
+
+export interface LibraryAssetProject {
+  id: string;
+  name: string;
+  type: ProjectType;
+}
+
+export interface LibraryAssetSummary extends LibraryAsset {
+  projects: LibraryAssetProject[];
+  referenceOnly: boolean;
+}
+
+export type LibraryUploadMediaType = MediaContentType;
+
+export interface CreateLibraryImageRequest {
+  name: string;
+  purpose?: LibraryAssetPurpose;
+  image: PromptImage & { mediaType: "image/png" | "image/jpeg" | "image/webp" };
+}
+
+export interface LineChanges {
+  added: number;
+  removed: number;
+}
+
+/** The file changes of one Agent turn. */
+export interface TurnChanges {
+  /** How many files the turn added, modified or removed. */
+  files: number;
+  /** Immutable file summary saved when the turn ended. Absent in older sessions. */
+  items?: CheckpointChangeItem[];
+  /** The changes were taken back with Undo. */
+  undone?: boolean;
+  /** How many of the files that undo left as they are, because they were changed again after the turn. */
+  kept?: number;
+}
+
+export interface CheckpointChangeItem {
+  /** Workspace path with forward slashes. */
+  path: string;
+  kind: "added" | "modified" | "removed";
+  /** Omitted for binary files or text beyond the preview limit. */
+  lines?: LineChanges;
+  /**
+   * How the file stands now: as the turn left it, as it was before the turn,
+   * or changed again afterwards. Left out while the Agent is working.
+   */
+  state?: "applied" | "undone" | "changed";
+}
+
+/** A file as one checkpoint holds it. */
+export interface CheckpointFile {
+  binary: boolean;
+  content?: string;
+  truncated?: boolean;
+}
+
+/** A changed file before and after a turn. A side is null when the file was not there. */
+export interface CheckpointFileView {
+  path: string;
+  before: CheckpointFile | null;
+  after: CheckpointFile | null;
+}
+
+export interface CheckpointUndoRequest {
+  /** What to do with files that were changed again after the turn. Without it an undo with such files is refused. */
+  conflicts?: "keep" | "overwrite";
+  /**
+   * The files the player was shown before choosing to overwrite. Required
+   * with "overwrite": when other files are in the way by now, the undo is
+   * refused again with the new list instead of overwriting what was not shown.
+   */
+  expected?: string[];
+}
+
+export interface CheckpointUndoResponse {
+  /** Remaining reversible Undo state, also returned by Reapply. */
+  undone?: boolean;
+  kept?: number;
+  /** Workspace paths that were put back. */
+  changed: string[];
+  /** Workspace paths that were left as they are. */
+  conflicts: string[];
+}
+
+export interface WorkspaceFileContent {
+  path: string;
+  size: number;
+  binary: boolean;
+  content?: string;
+  truncated?: boolean;
+}
+
+export const IMAGE_SIZES = ["1024x1024", "1536x1024", "1024x1536"] as const;
+export type ImageSize = (typeof IMAGE_SIZES)[number];
+export const IMAGE_MAX_REFERENCE_IMAGES = 16;
+export const IMAGE_RESOLUTIONS = ["512", "1K", "2K", "4K"] as const;
+export type ImageResolution = (typeof IMAGE_RESOLUTIONS)[number];
+export const IMAGE_ASPECT_RATIOS = ["1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"] as const;
+export type ImageAspectRatio = (typeof IMAGE_ASPECT_RATIOS)[number];
+export const IMAGE_OUTPUT_COUNTS = [1, 2, 3, 4] as const;
+export type ImageOutputCount = (typeof IMAGE_OUTPUT_COUNTS)[number];
+
+export interface ImageGenerationOption {
+  resolution: ImageResolution;
+  aspectRatio: ImageAspectRatio;
+}
+
+export const VIDEO_ASPECT_RATIOS = ["adaptive", "21:9", "16:9", "4:3", "3:2", "1:1", "2:3", "3:4", "9:16", "9:21"] as const;
+export type VideoAspectRatio = (typeof VIDEO_ASPECT_RATIOS)[number];
+export type VideoModelRef = ModelRef;
+export const VIDEO_REFERENCE_MODES = ["frame", "reference"] as const;
+export type VideoReferenceMode = (typeof VIDEO_REFERENCE_MODES)[number];
+export interface VideoModel extends VideoModelRef {
+  name: string;
+  provider: string;
+  providerName: string;
+  resolutions: readonly VideoResolution[];
+  aspectRatios: readonly VideoAspectRatio[];
+  durations: readonly number[];
+  maxImageReferences: number;
+  imageReferenceMode?: "frame" | "reference";
+  referenceModes?: readonly VideoReferenceMode[];
+  /** A narrower ratio set used when image references are present. */
+  imageAspectRatios?: readonly VideoAspectRatio[];
+  frameAspectRatios?: readonly VideoAspectRatio[];
+}
+export const VIDEO_RESOLUTIONS = ["480p", "720p", "768p", "1080p", "1K", "2K", "4K"] as const;
+export type VideoResolution = (typeof VIDEO_RESOLUTIONS)[number];
+
+export interface Model3DGenerationConfig {
+  model?: Model3DModelRef;
+  targetPolycount: number;
+  texture: boolean;
+  pbr: boolean;
+}
+
+export const TOOL_IDS = ["generate-image", "remove-image-background", "image-to-3d", "generate-video", "animate-3d", "generate-audio"] as const;
+export type ToolId = (typeof TOOL_IDS)[number];
+
+interface RunSizedImageToolRequest {
+  prompt: string;
+  imageModel?: ImageModelRef;
+  transparentBackground?: boolean;
+  size?: ImageSize;
+  resolution?: never;
+  aspectRatio?: never;
+  outputs?: never;
+  image?: never;
+  /** Set by the app once plugins changed the request: the prompt asked for, and who changed what. */
+  requestedPrompt?: string;
+  pluginChanges?: import("./plugin-hooks.js").ImageHookRecord[];
+}
+
+interface RunConfiguredImageToolRequest {
+  prompt: string;
+  imageModel?: ImageModelRef;
+  transparentBackground?: boolean;
+  size?: never;
+  resolution: ImageResolution;
+  aspectRatio: ImageAspectRatio;
+  outputs?: ImageOutputCount;
+  images?: PromptImage[];
+  /** Set by the app once plugins changed the request: the prompt asked for, and who changed what. */
+  requestedPrompt?: string;
+  pluginChanges?: import("./plugin-hooks.js").ImageHookRecord[];
+}
+
+export type RunImageToolRequest = RunSizedImageToolRequest | RunConfiguredImageToolRequest;
+
+export interface Run3DToolRequest {
+  operation?: Exclude<Model3DOperation, "animate">;
+  prompt?: string;
+  sourceAssetId?: string;
+  options?: Model3DOptions;
+  images: PromptImage[];
+  model?: Model3DModelRef;
+  targetPolycount?: number;
+  texture?: boolean;
+  pbr?: boolean;
+}
+
+export interface RunVideoToolRequest {
+  prompt: string;
+  referenceMode?: VideoReferenceMode;
+  model?: VideoModelRef;
+  references?: VideoGenerationReference[];
+  duration?: number;
+  aspectRatio?: VideoAspectRatio;
+  resolution?: VideoResolution;
+}
+
+export interface VideoGenerationReference {
+  type: "image" | "video" | "audio";
+  assetId: string;
+}
+
+/** Rigs a Library model and bakes the selected provider's preset actions into it. */
+export interface RunAnimate3DToolRequest {
+  model?: Model3DModelRef;
+  options?: Model3DOptions;
+  assetId: string;
+  actionIds: Model3DActionId[];
+  heightMeters?: number;
+}
+
+export interface RunBackgroundRemovalRequest {
+  image: PromptImage;
+  model: ImageModelRef;
+}
+
+export type RunToolRequest = RunBackgroundRemovalRequest | RunImageToolRequest | Run3DToolRequest | RunVideoToolRequest | RunAnimate3DToolRequest
+  | import("./audio.js").AudioGenerationRequest;
+
+export interface ToolRunFile {
+  role?: "audio" | "subtitles" | "metadata";
+  name: string;
+  mediaType: string;
+  assetId?: string;
+}
+
+export interface ToolRun {
+  model?: ModelRef;
+  id: string;
+  toolId: ToolId;
+  createdAt: string;
+  files: ToolRunFile[];
+  /** An image's prompt as it was generated, after plugins changed it. */
+  prompt?: string;
+  requestedPrompt?: string;
+  pluginChanges?: import("./plugin-hooks.js").ImageHookRecord[];
+}
+
+export type ToolJobStatus = "running" | "succeeded" | "failed" | "cancelled";
+
+export interface ToolJobContext {
+  projectId: string;
+  nodeId: string;
+  boardId?: string;
+}
+
+export interface ToolJob {
+  model?: ModelRef;
+  id: string;
+  /** The tool that ran, or `plugin-node` for a plugin's canvas node. */
+  toolId: ToolId | "plugin-node";
+  createdAt: string;
+  status: ToolJobStatus;
+  title: string;
+  context?: ToolJobContext;
+  run?: ToolRun;
+  error?: string;
+  /** A canvas run: what each source node gave when it started, by node id (see `canvas-chains.ts`). */
+  upstream?: Record<string, string>;
+}
+
+export type ToolArtifact =
+  | { type: "image"; path: string; mediaType: "image/png" | "image/jpeg" | "image/webp" }
+  | { type: "model"; path: string; mediaType: "model/gltf-binary" }
+  | { type: "video"; path: string; mediaType: "video/mp4" | "video/webm" };
+
+export interface RuntimeEventData {
+  "conversation.renamed": { conversation: ConversationSummary };
+  "conversation.settings.changed": { settings: ConversationAgentSettings };
+  "conversation.model.changed": { item: Extract<ThreadItem, { type: "modelChange" }> };
+  "project.renamed": { project: ProjectState };
+  "project.updated": { project: ProjectState };
+  /** What the project's plugins offer may have changed: read their panels and commands again. */
+  "project.plugins.changed": Record<string, never>;
+  /** A plugin command the app runs needs the person to open an https link, such as a sign-in page. */
+  "plugin.command.progress": { command: string; message: string; url?: string };
+  /** A plugin's hook has something to tell the person. */
+  "plugin.notice": { plugin: string; message: string; tone: "default" | "danger" };
+  /**
+   * A Plugin Builder workspace's agent wants to see its draft's panel; the
+   * workspace open in the desktop app answers with a capture. `revision` is
+   * the draft its preview must show, and a request is stale after `expires`
+   * (epoch milliseconds), as one replayed later is.
+   */
+  "plugin.draft.capture": { setupId: string; request: string; panel?: string; revision: string; expires: number };
+  /**
+   * An agent wants to see a plugin panel of the project: a desktop window
+   * claims it, shows the panel, captures it and answers at
+   * `/projects/:id/plugin-panel-captures/:request`. Stale after `expires`
+   * (epoch milliseconds), as one replayed later is.
+   */
+  "plugin.panel.capture": { request: string; plugin: string; panel: string; expires: number };
+  /** The agent stopped waiting for a panel's screenshot; the window that took it stops. */
+  "plugin.panel.capture.cancel": { request: string };
+  /**
+   * A tool a plugin's panel page answers: the window shows the panel, hands
+   * its page the call and answers at `/projects/:id/plugin-page-tools/:request`.
+   * Stale after `expires` (epoch milliseconds), as one replayed later is.
+   */
+  "plugin.page.tool": { request: string; plugin: string; version: string; panel: string; tool: string; input: unknown; expires: number };
+  /** The caller gave up on a page tool call; the page hears so. */
+  "plugin.page.tool.cancel": { request: string };
+  /** A plugin's native code shows one of its panels (`context.panels.open`), with the state its page hears. */
+  "plugin.panel.open": { plugin: string; panel: string; state?: unknown; expires: number };
+  /** Files in the project changed, from OhMyGame or outside it; watched only while a plugin in it wants to know. */
+  "project.files.changed": { paths: string[]; truncated?: boolean };
+  "preview.updated": { preview: PreviewRuntimeState };
+  /** Without a pick, the person cancelled. */
+  "preview.picked": { client: string; pick?: PreviewPick };
+  /** The project's tuned values, or who listens for them, changed. */
+  "preview.tuning": GameTuningState;
+  "agent.started": { prompt: string; source?: PromptSource; mentions?: PluginMention[]; images?: PromptImage[]; attachments?: ConversationAttachment[]; contexts?: PromptContextLabel[]; revision?: "last-turn" };
+  "checkpoint.created": { checkpointId: string };
+  "checkpoint.completed": { checkpointId: string } & Pick<TurnChanges, "files" | "items">;
+  "workspace.restored": { version: string; changed: string[]; recovery?: boolean; checkpointId?: string };
+  "workspace.undone": { checkpointId: string; kept: number; undone?: boolean };
+  "workspace.reapplied": { checkpointId: string; undone: boolean; kept: number };
+  "plan.mode.changed": PlanSessionState;
+  "item.started": { item: ThreadItem };
+  "item.updated": { item: ThreadItem };
+  "item.completed": { item: ThreadItem };
+  "item.agentMessage.delta": { itemId: string; delta: string };
+  "item.reasoning.textDelta": { itemId: string; delta: string };
+  "agent.completed": Record<string, never>;
+  "agent.cancelled": Record<string, never>;
+  "agent.error": { error: string; code?: ThreadItemErrorCode; diagnostics?: AgentErrorDiagnostics };
+  "prompt.queued": { prompt: string; mentions?: PluginMention[]; references: PromptReference[]; images?: PromptImage[]; attachments?: ConversationAttachment[] };
+  "prompt.steered": { prompt: string; mentions?: PluginMention[]; references: PromptReference[]; images?: PromptImage[]; attachments?: ConversationAttachment[] };
+  "prompt.removed": Record<string, never>;
+  "scheduled.changed": { messages: ScheduledMessage[] };
+  "publish.started": Record<string, never>;
+  "publish.completed": { game: PublishResult["game"] };
+  "publish.error": { error: string };
+}
+
+export type RuntimeEventType = keyof RuntimeEventData;
+
+export const RUNTIME_EVENT_TYPES = [
+  "conversation.renamed",
+  "conversation.model.changed",
+  "conversation.settings.changed",
+  "project.renamed",
+  "project.updated",
+  "project.plugins.changed",
+  "plugin.command.progress",
+  "plugin.notice",
+  "plugin.draft.capture",
+  "plugin.panel.capture",
+  "plugin.panel.capture.cancel",
+  "plugin.page.tool",
+  "plugin.page.tool.cancel",
+  "plugin.panel.open",
+  "project.files.changed",
+  "preview.updated",
+  "preview.picked",
+  "preview.tuning",
+  "agent.started",
+  "checkpoint.created",
+  "checkpoint.completed",
+  "workspace.restored",
+  "workspace.undone",
+  "workspace.reapplied",
+  "item.started",
+  "item.updated",
+  "item.completed",
+  "item.agentMessage.delta",
+  "item.reasoning.textDelta",
+  "plan.mode.changed",
+  "agent.completed",
+  "agent.cancelled",
+  "agent.error",
+  "prompt.queued",
+  "prompt.steered",
+  "prompt.removed",
+  "scheduled.changed",
+  "publish.started",
+  "publish.completed",
+  "publish.error",
+] as const satisfies readonly RuntimeEventType[];
+// Every event the daemon sends is one the app reads: one missing from the list is dropped (see parseRuntimeEvent).
+type UnlistedRuntimeEvent = Exclude<RuntimeEventType, (typeof RUNTIME_EVENT_TYPES)[number]>;
+const everyRuntimeEventListed: [UnlistedRuntimeEvent] extends [never] ? true : UnlistedRuntimeEvent = true;
+void everyRuntimeEventListed;
+
+export type RuntimeEvent<T extends RuntimeEventType = RuntimeEventType> = T extends RuntimeEventType
+  ? {
+      id: number;
+      projectId: string;
+      conversationId?: string;
+      turnId?: string;
+      type: T;
+      timestamp: string;
+      data: RuntimeEventData[T];
+    }
+  : never;

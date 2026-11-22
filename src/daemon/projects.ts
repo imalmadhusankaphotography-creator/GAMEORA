@@ -1,0 +1,1913 @@
+import { migratedMediaModel, type MediaMigrationState } from "./media-model-migration.js";
+import { mapConcurrent } from "./map-concurrent.js";
+import { PREVIEW_SETTING_KEYS, previewSettings, validPreviewSettings, validatePreviewSettings, type ProjectPreviewSettings } from "../shared/preview-settings.js";
+import { createHash, randomUUID } from "node:crypto";
+import { createReadStream } from "node:fs";
+import { access, cp, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, writeFile } from "node:fs/promises";
+import path from "node:path";
+import { isPreviewViewport, MEDIA_MODEL_USAGES } from "../shared/contracts.js";
+import { hasGamePage, withRename, type GameRename } from "../shared/publish-v1.js";
+import { parseProjectAppearance } from "../shared/project-appearance.js";
+import type { LibraryAssetProject, MediaModelDefaults, ProjectAppearance, PreviewViewport, ProjectCoverMode, ProjectCoverState, ProjectPackageManager, ProjectRunSettings, ProjectState, ProjectType, PublicationState, ToolJob } from "../shared/contracts.js";
+import { defaultProjectName } from "../shared/project-names.js";
+import { buildsWebPreview, isProjectType, isWebRuntimeProjectType, PLUGIN_PROJECT_KINDS, supportsWebPreview } from "../shared/project-runtime.js";
+import { deleteAssetMetadata, readAssetMetadata, renameAssetMetadata, writeAssetMetadata } from "./asset-metadata.js";
+import { getWorkspaceMedia, workspaceMediaInfo, resolveWorkspaceDirectory, resolveWorkspaceEntry, WorkspaceError } from "./workspace.js";
+import { copyMediaFile, type AssetLibrary } from "./asset-library.js";
+import { isProjectPackageManager } from "./package-manager.js";
+import { validateNodeGraph } from "../shared/playable-graph-validation.js";
+import type { NodeGraph } from "../shared/playable-nodes.js";
+import { canvasLibraryAssetUsage, canvasReferencesAsset, removeCanvasAssetReferences, renameCanvasAssetPaths } from "./canvas-workspace.js";
+import { readCanvasAssets } from "./canvas-assets.js";
+import { readCanvasFile, writeCanvasJson } from "./canvas-files.js";
+import { writeAudioCompanions } from "./audio-files.js";
+import { ProjectCovers } from "./project-covers.js";
+import { PROJECT_SETTING_KEYS, PROJECT_SETTING_KINDS, projectSettingKind, projectSettings, projectSettingsFileText, type ProjectArchiveSettings, type ProjectSettingKind, type ProjectSettings } from "../shared/project-archive.js";
+import { projectTypePlugin } from "../shared/project-file.js";
+import { readProjectFile, writeProjectFile } from "./project-plugins.js";
+import { AGENT_ATTACHMENTS_DIRECTORY, ASSET_PREVIEWS_DIRECTORY, PROJECT_DATA_DIRECTORY, PROJECT_LOCAL_DIRECTORY, PROJECT_PANELS_DIRECTORY, PROJECT_SETTINGS_FILE, PROJECT_SETTINGS_VERSION } from "../shared/project-layout.js";
+import { migrateProjectLayout, realFolders } from "./project-layout.js";
+
+const PROJECT_LOAD_CONCURRENCY = 8;
+// Imports assemble a project here, next to the projects, and then move it into place.
+const IMPORT_STAGING_PREFIX = ".import-";
+
+interface ProjectMetadata extends ProjectPreviewSettings {
+  version: 1;
+  id: string;
+  name: string;
+  nameSource?: ProjectState["nameSource"];
+  type: ProjectType;
+  pluginType?: ProjectState["pluginType"];
+  updatedAt: string;
+  webPreviewEnabled?: boolean;
+  /** Present only when a Web Game starts from a directory below its workspace root. */
+  startupDirectory?: string;
+  /** Present only when a Web Game starts with a script other than `dev`. */
+  startupScript?: string;
+  /** Present only when automatic package-manager detection is overridden. */
+  packageManager?: ProjectPackageManager;
+  /** Present only when a Web Game preview starts below the root route. */
+  previewPath?: string;
+  /** Present only when a Web Game preview defaults to a device preset other than fit. */
+  previewViewport?: PreviewViewport;
+  /** Present only when the user chose a workspace outside OhMyGame storage. */
+  workspacePath?: string;
+  publication?: PublicationState;
+  mediaModelDefaults?: MediaModelDefaults;
+  appearance?: ProjectAppearance;
+}
+
+type MetadataChanges = Partial<Pick<ProjectMetadata, "pluginType" | "name" | "nameSource" | "updatedAt" | "webPreviewEnabled" | "startupDirectory" | "startupScript" | "packageManager" | "previewPath" | "previewViewport" | "publication" | "mediaModelDefaults" | "appearance" | keyof ProjectPreviewSettings>>;
+
+export class ProjectLibraryReferenceError extends Error {}
+
+export class ProjectWorkspaceError extends Error {
+  constructor(message?: string, readonly issue?: PreviewWorkspaceStatus["issue"]) {
+    super(message);
+  }
+}
+
+/** A change or copy of settings that can't be read now; routes without their own handling answer 409. */
+export class ProjectSettingsUnknownError extends ProjectWorkspaceError {
+  readonly statusCode = 409;
+}
+
+function settingsUnknown(): ProjectSettingsUnknownError {
+  return new ProjectSettingsUnknownError(`The project's ${PROJECT_SETTINGS_FILE} is missing from its folder or can't be read. Restore the file, or remove the project and open its folder again.`);
+}
+
+export class ProjectAssetError extends Error {
+  constructor(message: string, readonly statusCode: number) {
+    super(message);
+  }
+}
+
+interface LoadedMetadata {
+  metadata: ProjectMetadata;
+  missing: boolean;
+}
+
+const PLAYABLE_GRAPH_FILE = "graph.json";
+
+export function workspaceEntryName(value: string): string {
+  const name = value.trim();
+  if (!name || name === "." || name === ".." || /[\\/<>:"|?*\x00-\x1f]/.test(name) || name.endsWith(".")) throw new ProjectAssetError("Invalid file or folder name", 400);
+  return name;
+}
+
+function assertEditableWorkspacePath(value: string): void {
+  const normalized = value.replaceAll("\\", "/");
+  // The project's panels are the one part of OhMyGame's folder the file browser shows.
+  const panel = normalized.startsWith(`${PROJECT_PANELS_DIRECTORY}/`);
+  const parts = (panel ? normalized.slice(PROJECT_PANELS_DIRECTORY.length + 1) : normalized).split("/");
+  if (parts.some((part) => [".git", ".data", PROJECT_DATA_DIRECTORY].includes(part))) throw new ProjectAssetError("Internal project files cannot be changed here", 400);
+  if (!panel && parts[0] === "canvas") throw new ProjectAssetError("Manage Canvas documents and boards in Design", 409);
+}
+
+async function assetDigest(file: string): Promise<string> {
+  const hash = createHash("sha256");
+  for await (const chunk of createReadStream(file)) hash.update(chunk);
+  return hash.digest("hex");
+}
+
+export class ProjectManager {
+  readonly #projects = new Map<string, ProjectState>();
+  readonly #metadataWrites = new Map<string, Promise<unknown>>();
+  /** Where each project's settings are now; see `writeProject`. */
+  readonly #settings = new Map<string, SettingsSource>();
+  readonly #covers = new ProjectCovers();
+  readonly #assetMetadataWrites = new Map<string, Promise<unknown>>();
+  readonly #workspaceWrites = new Map<string, Promise<unknown>>();
+  readonly #projectsDirectory: string;
+  readonly #locationFile: string;
+  readonly #removedDirectory: string;
+  #location?: string;
+
+  /** Whether an installed plugin recognizes a folder as its engine's project; a General project there starts with the web preview off. */
+  recognizesEngine?: (folder: string) => Promise<boolean>;
+
+  /** Told when a generated asset is saved in a project, or one from the Library is added to it. */
+  onAssetAdded?: (project: ProjectState, asset: { path: string; origin: "generated" | "imported"; prompt?: string }) => void;
+
+  constructor(dataDirectory: string, private readonly assetLibrary?: AssetLibrary, private readonly onListChange?: () => void, private readonly mediaMigrations: MediaMigrationState = {}) {
+    this.#projectsDirectory = path.join(dataDirectory, "projects");
+    this.#locationFile = path.join(dataDirectory, "project-location.json");
+    this.#removedDirectory = path.join(dataDirectory, "removed-projects");
+  }
+
+  /**
+   * Settings → General → Project location: the folder that new projects
+   * without a chosen folder are made in, each in its own subfolder. Unset,
+   * they live in OhMyGame's own storage.
+   */
+  get location(): string | undefined {
+    return this.#location;
+  }
+
+  /** Where new projects go while no location is set. */
+  get storage(): string {
+    return this.#projectsDirectory;
+  }
+
+  async setLocation(location: string | undefined): Promise<void> {
+    const next = location === undefined ? undefined : await this.#validateLocation(location);
+    await writeFile(this.#locationFile, `${JSON.stringify({ version: 1, ...(next ? { location: next } : {}) }, null, 2)}\n`);
+    this.#location = next;
+  }
+
+  async #loadLocation(): Promise<void> {
+    try {
+      const stored = JSON.parse(await readFile(this.#locationFile, "utf8")) as { version?: unknown; location?: unknown };
+      this.#location = stored.version === 1 && typeof stored.location === "string" && path.isAbsolute(stored.location) ? stored.location : undefined;
+    } catch (cause) {
+      if ((cause as NodeJS.ErrnoException).code !== "ENOENT") throw cause;
+    }
+  }
+
+  async #validateLocation(location: string): Promise<string> {
+    if (!path.isAbsolute(location)) throw new ProjectWorkspaceError("The project location must be an absolute path");
+    let resolved: string;
+    try {
+      const entry = await lstat(location);
+      if (!entry.isDirectory()) throw new Error("not a directory");
+      resolved = await realpath(location);
+    } catch {
+      throw new ProjectWorkspaceError("The project location is not an available folder");
+    }
+    if (path.parse(resolved).root === resolved) throw new ProjectWorkspaceError("The filesystem root cannot be the project location");
+    // Compared as real paths, so a link (such as macOS's /var) can't hide the overlap.
+    const storage = await realpath(this.#projectsDirectory).catch(() => this.#projectsDirectory);
+    if (pathsOverlap(resolved, storage) || pathsOverlap(resolved, this.#projectsDirectory)) throw new ProjectWorkspaceError("OhMyGame's project storage cannot be the project location");
+    return resolved;
+  }
+
+  /** A new, empty folder named after the project in the project location. */
+  async #newFolderIn(location: string, name: string): Promise<string> {
+    const base = folderName(name);
+    for (let attempt = 1; attempt <= 100; attempt += 1) {
+      const folder = path.join(location, attempt === 1 ? base : `${base} ${attempt}`);
+      try {
+        await mkdir(folder);
+        return folder;
+      } catch (cause) {
+        const code = (cause as NodeJS.ErrnoException).code;
+        if (code === "EEXIST") continue;
+        if (code === "ENOENT") throw new ProjectWorkspaceError(`The project location ${location} is not available; choose another in Settings → General`);
+        throw cause;
+      }
+    }
+    throw new ProjectWorkspaceError(`Could not find a free folder name for “${name}” in ${location}`);
+  }
+
+  async load(onError?: (projectDirectory: string, cause: unknown) => void): Promise<void> {
+    await mkdir(this.#projectsDirectory, { recursive: true });
+    await this.#loadLocation();
+    const entries = await readdir(this.#projectsDirectory, { withFileTypes: true });
+    // An import interrupted by a crash leaves its staging folder behind. It can
+    // hold gigabytes, so remove it without delaying startup; new imports use
+    // other folder names.
+    for (const entry of entries.filter((item) => item.name.startsWith(IMPORT_STAGING_PREFIX))) {
+      void rm(path.join(this.#projectsDirectory, entry.name), { recursive: true, force: true }).catch(() => {});
+    }
+    const projects = await mapConcurrent(
+      entries.filter((entry) => entry.isDirectory() && isProjectId(entry.name)),
+      PROJECT_LOAD_CONCURRENCY,
+      async (entry) => {
+        const projectDirectory = path.join(this.#projectsDirectory, entry.name);
+        try {
+          const read = await readProject(projectDirectory, entry.name, (await lstat(projectDirectory)).mtime.toISOString());
+          const { metadata } = read;
+          const migrated = this.#migrateMediaDefaults(metadata);
+          const workspacePath = metadata.workspacePath ?? path.join(projectDirectory, "workspace");
+          const workspaceAvailable = await isDirectory(workspacePath);
+          if (workspaceAvailable) {
+            await this.#covers.migrate(projectDirectory, path.join(workspacePath, PROJECT_DATA_DIRECTORY)).catch((cause: unknown) => onError?.(projectDirectory, cause));
+            await migrateProjectLayout(workspacePath).catch((cause: unknown) => onError?.(projectDirectory, cause));
+          }
+          // Settings waiting for the folder go to it now, if it can take them.
+          const source = read.rewrite || read.settings === "pending" || migrated
+            ? await this.#writeProject(projectDirectory, workspacePath, metadata, read.settings)
+            : read.settings;
+          if (migrated && source === "unknown") throw settingsUnknown();
+          this.#settings.set(entry.name, source);
+          const project = projectState(
+            workspacePath,
+            metadata,
+            await isRunnableStartupWorkspace({ ...metadata, workspacePath }),
+            projectDirectory,
+            workspaceAvailable,
+          );
+          return project;
+        } catch (cause) {
+          onError?.(projectDirectory, cause);
+          return undefined;
+        }
+      },
+    );
+    for (const project of projects) {
+      if (project) this.#projects.set(project.id, project);
+    }
+  }
+
+  async create(name?: string, type: ProjectType = "web-game", selectedWorkspacePath?: string, pluginType?: ProjectState["pluginType"]): Promise<ProjectState> {
+    const id = randomUUID();
+    const projectDirectory = path.join(this.#projectsDirectory, id);
+    if (selectedWorkspacePath === undefined && this.#location) {
+      selectedWorkspacePath = await this.#newFolderIn(this.#location, name?.trim() || defaultProjectName(type));
+    }
+    const hasExternalWorkspace = selectedWorkspacePath !== undefined;
+    const workspacePath = selectedWorkspacePath !== undefined
+      ? await this.#validateExternalWorkspace(selectedWorkspacePath)
+      : path.join(projectDirectory, "workspace");
+    const updatedAt = new Date().toISOString();
+    // A folder is the type its `ohmygame.json` names, and a folder that was a project before brings back its name and settings.
+    const named = hasExternalWorkspace ? await readFolderType(workspacePath) : "missing";
+    const asked = fileTypeOf({ type, pluginType });
+    if (typeof named === "object" && asked && named.type !== asked) throw new ProjectWorkspaceError(`The folder's ohmygame.json says it is ${named.type}`);
+    const found = hasExternalWorkspace ? await readFolderSettings(workspacePath) : undefined;
+    const kept = typeof found === "object" ? found : undefined;
+    const metadata: ProjectMetadata = {
+      ...(kept ? parseMetadata({ ...kept, version: 1, id, updatedAt }, id, updatedAt).metadata : {}),
+      version: 1,
+      id,
+      name: name?.trim() || kept?.name || defaultProjectName(type),
+      nameSource: name?.trim() || kept ? "manual" : "default",
+      type,
+      ...(pluginType ? { pluginType } : {}),
+      ...(type === "general" ? { webPreviewEnabled: kept?.webPreviewEnabled ?? (pluginType ? pluginType.preview === "web" : !hasExternalWorkspace || await mayPreviewOnWeb(workspacePath, this.recognizesEngine)) } : {}),
+      updatedAt,
+      ...(hasExternalWorkspace ? { workspacePath } : {}),
+    };
+    await mkdir(projectDirectory, { recursive: true });
+    if (!hasExternalWorkspace) {
+      await mkdir(workspacePath, { recursive: true });
+    }
+    await migrateProjectLayout(workspacePath);
+    // A folder that is empty stays so until its type or example fills it; then `storeSettings`, or the next change, writes them.
+    const empty = !(await readdir(workspacePath)).some((item) => item !== ".DS_Store");
+    this.#settings.set(id, await this.#writeProject(projectDirectory, workspacePath, metadata, found === "unreadable" ? "unknown" : "pending", !empty));
+    // The app's own types are named from the start, so the first turn's snapshot already holds the file.
+    // A plugin's type is named by its plugin, which pins its version there.
+    if (!metadata.pluginType) await nameFolderType(workspacePath, metadata);
+    const project = projectState(workspacePath, metadata, await isRunnableStartupWorkspace({ ...metadata, workspacePath }), projectDirectory, true);
+    this.#projects.set(id, project);
+    this.onListChange?.();
+    return project;
+  }
+
+  list(): ProjectState[] {
+    return [...this.#projects.values()]
+      .map((project, index) => ({ project, index }))
+      .sort((left, right) => right.project.updatedAt.localeCompare(left.project.updatedAt) || right.index - left.index)
+      .map(({ project }) => project);
+  }
+
+  get(id: string): ProjectState | undefined { return this.#projects.get(id); }
+
+  async ensureLibraryAsset(id: string, assetPath: string): Promise<string> {
+    const project = this.#projects.get(id);
+    if (!project) throw new Error(`Project not found: ${id}`);
+    if (!this.assetLibrary) throw new ProjectAssetError("Asset Library is not configured", 503);
+    const metadata = await readAssetMetadata(project.workspacePath);
+    const media = await getWorkspaceMedia(project.workspacePath, assetPath);
+    const digest = await assetDigest(media.absolutePath);
+    const existing = metadata.libraryAssets[media.relativePath];
+    if (existing && this.assetLibrary.get(existing)) {
+      const original = await this.assetLibrary.content(existing);
+      if (await assetDigest(original.absolutePath) === digest) return existing;
+    }
+    const asset = await this.assetLibrary.addFile(path.basename(assetPath), media.absolutePath, {
+      origin: metadata.origins[media.relativePath] ?? "workspace",
+      purpose: metadata.purposes[media.relativePath],
+      ...(metadata.prompts[assetPath] ? { prompt: metadata.prompts[assetPath] } : {}),
+      sourceKey: `project:${id}:${media.relativePath}:${digest}`,
+    });
+    await this.#writeAssetMetadata(id, () => writeAssetMetadata(project.workspacePath, media.relativePath, { libraryAssetId: asset.id }));
+    return asset.id;
+  }
+
+  async rename(id: string, name: string): Promise<ProjectState> {
+    const project = this.#projects.get(id);
+    if (!project) throw new Error(`Project not found: ${id}`);
+    const normalized = name.trim();
+    if (!normalized) throw new Error("Project name must not be empty");
+    await this.#save(project, { name: normalized, nameSource: "manual", updatedAt: new Date().toISOString() });
+    return project;
+  }
+
+  async nameAutomatically(id: string, name: string): Promise<ProjectState | undefined> {
+    const project = this.#projects.get(id);
+    const normalized = name.trim();
+    if (!project || !normalized) return undefined;
+    const saved = await this.#save(project, { name: normalized, nameSource: "ai" });
+    return saved ? project : undefined;
+  }
+
+  async setStartupDirectory(id: string, startupDirectory: string): Promise<ProjectState> {
+    const project = this.#projects.get(id);
+    if (!project) throw new Error(`Project not found: ${id}`);
+    // The rest of the run settings stay as the folder has them now.
+    await this.readySettings(id);
+    // Naming where its dev server is asks for the web preview, which a General
+    // project made in an existing folder may have started without.
+    const preview = project.type === "general" && project.pluginType?.preview !== "native" ? { webPreviewEnabled: true } : {};
+    return this.setRunSettings(id, { ...projectRunSettings(project), ...preview, startupDirectory });
+  }
+
+  async setRunSettings(id: string, input: ProjectRunSettings): Promise<ProjectState> {
+    const project = this.#projects.get(id);
+    if (!project) throw new Error(`Project not found: ${id}`);
+    if (!isWebRuntimeProjectType(project.type) && !buildsWebPreview(project)) throw new ProjectWorkspaceError("Run settings require a Web Game or General Game project");
+
+    if (project.type !== "general" && input.webPreviewEnabled !== undefined) throw new ProjectWorkspaceError("Only General Game projects have a Web preview switch");
+    if (input.webPreviewEnabled !== undefined && typeof input.webPreviewEnabled !== "boolean") throw new ProjectWorkspaceError("Web preview enabled must be a boolean");
+    try { validatePreviewSettings(input); } catch (cause) { throw new ProjectWorkspaceError((cause as Error).message); }
+    const webPreviewEnabled = project.type === "general" ? input.webPreviewEnabled ?? project.webPreviewEnabled ?? false : true;
+    if (webPreviewEnabled && project.pluginType?.preview === "native") throw new ProjectWorkspaceError("This project uses its plugin preview");
+    if (!isValidStartupDirectory(input.startupDirectory)) throw new ProjectWorkspaceError("Startup directory must be a relative path inside the project workspace");
+    const startupDirectory = normalizeStartupDirectory(input.startupDirectory) ?? ".";
+    const startupScript = normalizeStartupScript(input.startupScript);
+    if (!startupScript) throw new ProjectWorkspaceError("Startup script must be a package.json script name");
+    const previewPath = normalizePreviewPath(input.previewPath);
+    if (previewPath === undefined) throw new ProjectWorkspaceError("Preview route must be a local path");
+    const previewViewport = input.previewViewport;
+    if (!isPreviewViewport(previewViewport)) throw new ProjectWorkspaceError("Preview device preset is not supported");
+    const packageManager = input.packageManager;
+    if (packageManager !== undefined && !isProjectPackageManager(packageManager)) {
+      throw new ProjectWorkspaceError("Package manager is not supported");
+    }
+    const status = webPreviewEnabled
+      ? await resolvePreviewWorkspace({ workspacePath: project.workspacePath, startupDirectory, startupScript, ...previewSettings(input) })
+      : undefined;
+
+    const configuredDirectory = status?.relativePath ?? startupDirectory;
+
+    await this.#save(project, {
+      ...Object.fromEntries(PREVIEW_SETTING_KEYS.map((key) => [key, input[key]])),
+      startupDirectory: configuredDirectory === "." ? undefined : configuredDirectory,
+      startupScript: startupScript === "dev" ? undefined : startupScript,
+      packageManager,
+      previewPath: previewPath === "/" ? undefined : previewPath,
+      previewViewport: previewViewport === "fit" ? undefined : previewViewport,
+      ...(project.type === "general" ? { webPreviewEnabled } : {}),
+      updatedAt: new Date().toISOString(),
+    });
+    if (project.type === "general" && (!webPreviewEnabled || ["waiting", "stopped"].includes(project.preview.status))) {
+      // What kept it from starting before may not be the reason now.
+      project.preview = { ...project.preview, status: status?.runnable ? "stopped" : "waiting", issue: status?.issue };
+    }
+    return project;
+  }
+
+  async setMediaModelDefaults(id: string, defaults: MediaModelDefaults): Promise<ProjectState> {
+    const project = this.#projects.get(id);
+    if (!project) throw new Error(`Project not found: ${id}`);
+    if (!validMediaModelDefaults(defaults)) throw new Error("Invalid generation model defaults");
+    await this.#save(project, {
+      mediaModelDefaults: Object.keys(defaults).length ? structuredClone(defaults) : undefined,
+      updatedAt: new Date().toISOString(),
+    });
+    return project;
+  }
+
+  /**
+   * The plugin type recorded for the project, after its project file moved to
+   * another version of the plugin. A General Game's Web preview follows the type.
+   */
+  async setPluginType(id: string, pluginType: NonNullable<ProjectState["pluginType"]>): Promise<ProjectState> {
+    const project = this.#projects.get(id);
+    if (!project) throw new ProjectWorkspaceError("Project not found");
+    const current = project.pluginType;
+    if (current?.id === pluginType.id && current.plugin === pluginType.plugin && current.preview === pluginType.preview) return project;
+    await this.#save(project, { pluginType, ...(project.type === "general" ? { webPreviewEnabled: pluginType.preview === "web" } : {}) });
+    return project;
+  }
+
+  async duplicate(id: string): Promise<ProjectState> {
+    const source = this.#projects.get(id);
+    if (!source) throw new Error(`Project not found: ${id}`);
+    await this.readySettings(id);
+    const duplicateId = randomUUID();
+    const duplicateDirectory = path.join(this.#projectsDirectory, duplicateId);
+    const updatedAt = new Date().toISOString();
+    const metadata: ProjectMetadata = {
+      version: 1,
+      id: duplicateId,
+      name: `${source.name} copy`,
+      nameSource: "manual",
+      type: source.type,
+      ...(source.pluginType ? { pluginType: source.pluginType } : {}),
+      ...(source.type === "general" ? { webPreviewEnabled: source.webPreviewEnabled ?? false } : {}),
+      updatedAt,
+      ...previewSettings(source),
+      ...(source.startupDirectory ? { startupDirectory: source.startupDirectory } : {}),
+      ...(source.startupScript ? { startupScript: source.startupScript } : {}),
+      ...(source.packageManager ? { packageManager: source.packageManager } : {}),
+      ...(source.previewPath ? { previewPath: source.previewPath } : {}),
+      ...(source.previewViewport ? { previewViewport: source.previewViewport } : {}),
+      ...(source.mediaModelDefaults ? { mediaModelDefaults: structuredClone(source.mediaModelDefaults) } : {}),
+      ...(source.appearance ? { appearance: structuredClone(source.appearance) } : {}),
+    };
+    try {
+      await cp(source.workspacePath, path.join(duplicateDirectory, "workspace"), {
+        recursive: true,
+        errorOnExist: true,
+        filter: (sourcePath) => {
+          const relative = path.relative(source.workspacePath, sourcePath).replaceAll(path.sep, "/");
+          return path.basename(sourcePath) !== "node_modules" && relative !== AGENT_ATTACHMENTS_DIRECTORY;
+        },
+      });
+      await bindCanvasHistory(path.join(duplicateDirectory, "workspace"), duplicateId);
+      this.#settings.set(duplicateId, await this.#writeProject(duplicateDirectory, path.join(duplicateDirectory, "workspace"), metadata, "pending"));
+    } catch (error) {
+      await rm(duplicateDirectory, { recursive: true, force: true });
+      throw error;
+    }
+    const workspacePath = path.join(duplicateDirectory, "workspace");
+    const project = projectState(workspacePath, metadata, await isRunnableStartupWorkspace({ ...metadata, workspacePath }), duplicateDirectory, true);
+    this.#projects.set(project.id, project);
+    this.onListChange?.();
+    return project;
+  }
+
+  /** A folder in which an import stages its files, on the same volume as the projects. */
+  async createImportStaging(): Promise<string> {
+    await mkdir(this.#projectsDirectory, { recursive: true });
+    return mkdtemp(path.join(this.#projectsDirectory, IMPORT_STAGING_PREFIX));
+  }
+
+  /**
+   * Creates a managed project around a workspace staged in a folder from
+   * createImportStaging, moving the workspace into it. Like a duplicate, the
+   * project gets a new id and no publication, and copied Canvas generation
+   * history is bound to it. Its type is the one its `ohmygame.json` names;
+   * a first-version archive's manifest names one for a folder without it.
+   */
+  async import(workspacePath: string, settings: ProjectSettings | ProjectArchiveSettings): Promise<ProjectState> {
+    const manifest = "type" in settings ? { type: settings.type, ...(settings.pluginType ? { pluginType: settings.pluginType } : {}) } : undefined;
+    if (manifest && !isProjectType(manifest.type)) throw new ProjectWorkspaceError("The project type is not supported");
+    const named = await readFolderType(workspacePath);
+    if (named === "unreadable") throw new ProjectWorkspaceError("The project's ohmygame.json is invalid");
+    const typed = typeof named === "object"
+      ? typeFromFile(named.type, "kind" in settings ? settings.kind : manifest && projectSettingKind(manifest), manifest)
+      : manifest ?? { type: ("kind" in settings ? settings.kind : undefined) ?? "web-game" };
+    const id = randomUUID();
+    const updatedAt = new Date().toISOString();
+    const staging = await this.createImportStaging();
+    let metadata: ProjectMetadata;
+    try {
+      const candidate = {
+        ...Object.fromEntries(PROJECT_SETTING_KEYS.filter((key) => settings[key] !== undefined).map((key) => [key, settings[key]])),
+        ...typed,
+        version: 1, id, nameSource: "manual", updatedAt,
+      };
+      try {
+        // Imported settings pass the same checks as saved ones, before writing.
+        ({ metadata } = parseMetadata(candidate, id, updatedAt));
+      } catch {
+        throw new ProjectWorkspaceError("The project settings are invalid");
+      }
+      await rename(workspacePath, path.join(staging, "workspace"));
+      await migrateProjectLayout(path.join(staging, "workspace"));
+      this.#settings.set(id, await this.#writeProject(staging, path.join(staging, "workspace"), metadata, "pending"));
+      await bindCanvasHistory(path.join(staging, "workspace"), id);
+      await rename(staging, this.#projectDirectory(id));
+    } catch (error) {
+      await rm(staging, { recursive: true, force: true });
+      throw error;
+    }
+    const workspace = path.join(this.#projectDirectory(id), "workspace");
+    const project = projectState(workspace, metadata, await isRunnableStartupWorkspace({ ...metadata, workspacePath: workspace }), this.#projectDirectory(id), true);
+    this.#projects.set(project.id, project);
+    this.onListChange?.();
+    return project;
+  }
+
+  /**
+   * Takes a project out of OhMyGame without deleting what the person made. A
+   * folder they chose stays where it is. A project kept in OhMyGame's storage
+   * has its files moved aside into a folder named after it, which is returned
+   * so the desktop app can put it in the Trash.
+   */
+  async remove(id: string): Promise<string | undefined> {
+    const project = this.#projects.get(id);
+    if (!project) throw new Error(`Project not found: ${id}`);
+    let movedTo: string | undefined;
+    const operation = (this.#metadataWrites.get(id) ?? Promise.resolve()).catch(() => {}).then(async () => {
+      if (project.workspaceLocation === "external") {
+        await removeLocalFiles(project.workspacePath);
+      } else {
+        const target = path.join(this.#removedDirectory, id, folderName(project.name));
+        await mkdir(path.dirname(target), { recursive: true });
+        try {
+          await rename(project.workspacePath, target);
+          movedTo = target;
+        } catch (error) {
+          // A workspace already gone from disk leaves nothing to move to the Trash.
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+          await rm(path.dirname(target), { recursive: true, force: true });
+        }
+      }
+      await rm(this.#projectDirectory(id), { recursive: true, force: false });
+      this.#projects.delete(id);
+      this.#settings.delete(id);
+      this.onListChange?.();
+    });
+    this.#metadataWrites.set(id, operation);
+    try { await operation; }
+    finally { if (this.#metadataWrites.get(id) === operation) this.#metadataWrites.delete(id); }
+    return movedTo;
+  }
+
+  /**
+   * `registrationOnly` takes back a project whose creation failed: its own
+   * storage goes, and a folder the person chose is left exactly as it is.
+   */
+  async delete(id: string, { registrationOnly = false } = {}): Promise<ProjectState> {
+    const project = this.#projects.get(id);
+    if (!project) throw new Error(`Project not found: ${id}`);
+    const operation = (this.#metadataWrites.get(id) ?? Promise.resolve()).catch(() => {}).then(async () => {
+      if (project.workspaceLocation === "external" && !registrationOnly) {
+        await removeLocalFiles(project.workspacePath);
+      }
+      await rm(this.#projectDirectory(id), { recursive: true, force: false });
+      this.#projects.delete(id);
+      this.#settings.delete(id);
+      this.onListChange?.();
+    });
+    this.#metadataWrites.set(id, operation);
+    try { await operation; }
+    finally { if (this.#metadataWrites.get(id) === operation) this.#metadataWrites.delete(id); }
+    return project;
+  }
+
+  /** Re-checks whether the workspace can start a preview, e.g. after files were added to it. */
+  async refreshPreviewReadiness(id: string): Promise<ProjectState> {
+    const project = this.#projects.get(id);
+    if (!project) throw new Error(`Project not found: ${id}`);
+    if (project.preview.status !== "waiting" && project.preview.status !== "stopped") return project;
+    const runnable = await isRunnableStartupWorkspace(project);
+    // A folder that now starts no longer lacks a web project; the next start says what else is missing.
+    project.preview = { ...project.preview, status: runnable ? "stopped" : "waiting", ...(runnable ? { issue: undefined } : {}) };
+    return project;
+  }
+
+  async touch(id: string): Promise<void> {
+    const project = this.#projects.get(id);
+    if (!project) throw new Error(`Project not found: ${id}`);
+    await this.#save(project, { updatedAt: new Date().toISOString() });
+  }
+
+  /** The cover to show; none while the project shows the default template. */
+  async cover(id: string): Promise<Buffer | undefined> {
+    const project = this.#projects.get(id);
+    if (!project || project.appearance?.cover === "template") return undefined;
+    return this.#covers.read(coversDirectory(project));
+  }
+
+  /** Replaces the icon, tone and template choice; the logo follows its own upload. */
+  async setAppearance(id: string, appearance: Omit<ProjectAppearance, "logo">): Promise<ProjectState> {
+    const project = this.#projects.get(id);
+    if (!project) throw new Error(`Project not found: ${id}`);
+    if (!parseProjectAppearance(appearance)) throw new Error("Invalid project appearance");
+    // The logo flag is read in the write queue, so an upload saved meanwhile is kept.
+    await this.#save(project, (current) => withAppearance({ ...parseProjectAppearance(appearance), ...(current.appearance?.logo ? { logo: true } : {}) }));
+    return project;
+  }
+
+  async logo(id: string): Promise<Buffer | undefined> {
+    const project = this.#projects.get(id);
+    if (!project?.appearance?.logo) return undefined;
+    return this.#covers.readLogo(coversDirectory(project));
+  }
+
+  async setLogo(id: string, contents: Uint8Array | undefined): Promise<ProjectState> {
+    const project = this.#projects.get(id);
+    if (!project) throw new Error(`Project not found: ${id}`);
+    await this.readySettings(id);
+    await this.#covers.setLogo(coversDirectory(project), contents);
+    await this.#save(project, (current) => {
+      const { logo: _logo, ...rest } = current.appearance ?? {};
+      return withAppearance(contents ? { ...rest, logo: true } : rest);
+    });
+    return project;
+  }
+
+  async coverState(id: string): Promise<ProjectCoverState> {
+    const project = this.#projects.get(id);
+    if (!project) throw new Error(`Project not found: ${id}`);
+    return this.#covers.state(coversDirectory(project));
+  }
+
+  async setCover(id: string, contents: Uint8Array, source: ProjectCoverMode = "custom"): Promise<void> {
+    const project = this.#projects.get(id);
+    if (!project) throw new Error(`Project not found: ${id}`);
+    return this.#covers.set(coversDirectory(project), contents, source);
+  }
+
+  async setCoverMode(id: string, mode: ProjectCoverMode, fallback?: Uint8Array): Promise<void> {
+    const project = this.#projects.get(id);
+    if (!project) throw new Error(`Project not found: ${id}`);
+    await this.#covers.setMode(coversDirectory(project), mode, fallback);
+  }
+
+  async addGeneratedAsset(
+    id: string,
+    fileName: string,
+    contents: Uint8Array,
+    metadata: {
+      prompt?: string;
+      preview?: { bytes: Uint8Array; extension: "png" | "jpg" };
+      libraryAssetId?: string;
+      registerInLibrary?: boolean;
+    } = {},
+  ): Promise<string> {
+    const project = this.#projects.get(id);
+    if (!project) throw new Error(`Project not found: ${id}`);
+    if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(fileName)) throw new Error(`Invalid asset name: ${fileName}`);
+    const assetsDirectory = path.join(project.workspacePath, "assets");
+    const generatedDirectory = path.join(assetsDirectory, "generated");
+    await ensureDirectory(project.workspacePath);
+    await ensureDirectory(assetsDirectory, true);
+    await ensureDirectory(generatedDirectory, true);
+
+    const relativePath = path.join("assets", "generated", fileName);
+    const destination = path.join(generatedDirectory, fileName);
+    const temporary = path.join(generatedDirectory, `.${fileName}.${randomUUID()}.tmp`);
+    // The same asset saved again, as when an image is imported twice, is nothing new to hear about.
+    const unchanged = await readFile(destination).then((existing) => Buffer.from(contents).equals(existing), () => false);
+    const linkedAssetId = metadata.registerInLibrary === false || !metadata.libraryAssetId || !this.assetLibrary?.get(metadata.libraryAssetId)
+      ? undefined
+      : metadata.libraryAssetId;
+    try {
+      // Bytes the Library already stores are cloned from there, so the disk holds them once where it can.
+      if (linkedAssetId) await copyMediaFile((await this.assetLibrary!.content(linkedAssetId)).absolutePath, temporary);
+      else await writeFile(temporary, contents, { flag: "wx" });
+      await rename(temporary, destination);
+    } finally {
+      await rm(temporary, { force: true });
+    }
+    const assetPath = relativePath.split(path.sep).join("/");
+    const normalizedPrompt = metadata.prompt?.trim();
+    let previewPath: string | undefined;
+    if (metadata.preview) {
+      await ensureDirectory(path.join(project.workspacePath, PROJECT_DATA_DIRECTORY), true);
+      await ensureDirectory(path.join(project.workspacePath, ...ASSET_PREVIEWS_DIRECTORY.split("/")), true);
+      previewPath = `${ASSET_PREVIEWS_DIRECTORY}/${path.parse(fileName).name}.${metadata.preview.extension}`;
+      const previewDestination = path.join(project.workspacePath, ...previewPath.split("/"));
+      const previewTemporary = `${previewDestination}.${randomUUID()}.tmp`;
+      try {
+        await writeFile(previewTemporary, metadata.preview.bytes, { flag: "wx" });
+        await rename(previewTemporary, previewDestination);
+      } finally {
+        await rm(previewTemporary, { force: true });
+      }
+    }
+    const libraryAssetId = metadata.registerInLibrary === false
+      ? undefined
+      : linkedAssetId ?? (await (workspaceMediaInfo(fileName) ? this.assetLibrary?.addFile(fileName, destination, {
+        origin: "generated",
+        ...(normalizedPrompt ? { prompt: normalizedPrompt } : {}),
+        sourceKey: `project:${id}:${assetPath}`,
+      }) : undefined))?.id;
+    await this.#writeAssetMetadata(id, () => writeAssetMetadata(project.workspacePath, assetPath, {
+      origin: "generated",
+      purpose: "asset",
+      ...(normalizedPrompt ? { prompt: normalizedPrompt } : {}),
+      ...(previewPath ? { previewPath } : {}),
+      ...(libraryAssetId ? { libraryAssetId } : {}),
+    }));
+    await this.touch(id);
+    if (!unchanged) this.#assetAdded(project, { path: assetPath, origin: "generated", ...(normalizedPrompt ? { prompt: normalizedPrompt } : {}) });
+    return assetPath;
+  }
+
+  #assetAdded(project: ProjectState, asset: Parameters<NonNullable<ProjectManager["onAssetAdded"]>>[1]): void {
+    try {
+      this.onAssetAdded?.(project, asset);
+    } catch {
+      // Listeners only hear about it; the asset is saved either way.
+    }
+  }
+
+  async generatedAssetPrompt(id: string, assetPath: string): Promise<string | undefined> {
+    const project = this.#projects.get(id);
+    if (!project) throw new Error(`Project not found: ${id}`);
+    return (await readAssetMetadata(project.workspacePath)).prompts[assetPath];
+  }
+
+  /** `origin`: what plugins hear the asset's copy came from; Canvas generations pass "generated". */
+  async materializeLibraryAsset(id: string, assetId: string, origin: "generated" | "imported" = "imported"): Promise<{ path: string; assetId: string }> {
+    const project = this.#projects.get(id);
+    if (!project) throw new Error(`Project not found: ${id}`);
+    if (!this.assetLibrary) throw new ProjectAssetError("Asset Library is not configured", 503);
+    const { asset, absolutePath } = await this.assetLibrary.content(assetId);
+    const added = await this.#writeAssetMetadata(id, async () => {
+      const metadata = await readAssetMetadata(project.workspacePath);
+      const stalePaths: string[] = [];
+      for (const [assetPath, linkedId] of Object.entries(metadata.libraryAssets)) {
+        if (linkedId !== assetId) continue;
+        try {
+          await getWorkspaceMedia(project.workspacePath, assetPath);
+          return { path: assetPath, assetId, existed: true };
+        } catch (error) {
+          if (!(error instanceof WorkspaceError)) throw error;
+          stalePaths.push(assetPath);
+        }
+      }
+      const assetPath = await this.#storeImportedAsset(id, asset.name, (temporary) => copyMediaFile(absolutePath, temporary));
+      if (asset.audio) await writeAudioCompanions(path.join(project.workspacePath, assetPath), asset.audio);
+      for (const stalePath of stalePaths) await deleteAssetMetadata(project.workspacePath, stalePath);
+      await writeAssetMetadata(project.workspacePath, assetPath, { libraryAssetId: assetId, origin: asset.origin, purpose: asset.purpose });
+      return { path: assetPath, assetId, existed: false };
+    });
+    if (!added.existed) this.#assetAdded(project, { path: added.path, origin, ...(asset.prompt ? { prompt: asset.prompt } : {}) });
+    return { path: added.path, assetId: added.assetId };
+  }
+
+  /**
+   * Stores a file the canvas imported that is not a document, table or media asset, under `assets/files/`.
+   * A file from an imported folder names that folder's `assets/files/...` directory.
+   */
+  async importWorkspaceFile(id: string, fileName: string, contents: Uint8Array, directory = "assets/files"): Promise<string> {
+    if (!this.#projects.has(id)) throw new ProjectAssetError("Project not found", 404);
+    const [assets, files, ...folder] = directory.split("/");
+    if (assets !== "assets" || files !== "files") throw new ProjectAssetError("Imported files belong under assets/files", 400);
+    return this.#mutateWorkspace(id, () => this.#storeImportedAsset(id, fileName, (temporary) => writeFile(temporary, contents, { flag: "wx" }), ["files", ...folder]));
+  }
+
+  /** Creates the `assets/files/` folder a folder imported on the canvas fills; a repeated name gets a suffix. */
+  async createImportFolder(id: string, name: string): Promise<string> {
+    const project = this.#projects.get(id);
+    if (!project) throw new ProjectAssetError("Project not found", 404);
+    if (!validAssetName(name)) throw new ProjectAssetError("Invalid folder name", 400);
+    return this.#mutateWorkspace(id, async () => {
+      const parent = await importDirectory(project.workspacePath, ["files"]);
+      for (let suffix = 1; ; suffix += 1) {
+        const candidate = suffix === 1 ? name : `${name}-${suffix}`;
+        try {
+          await mkdir(path.join(parent, candidate));
+        } catch (cause) {
+          if ((cause as NodeJS.ErrnoException).code === "EEXIST") continue;
+          throw cause;
+        }
+        await this.touch(id);
+        return path.posix.join("assets", "files", candidate);
+      }
+    });
+  }
+
+  async #storeImportedAsset(id: string, fileName: string, writeTemporary: (temporary: string) => Promise<unknown>, folder: readonly string[] = ["imported"]): Promise<string> {
+    const project = this.#projects.get(id);
+    if (!project) throw new Error(`Project not found: ${id}`);
+    if (!validAssetName(fileName)) throw new ProjectAssetError("Invalid asset name", 400);
+    const importedDirectory = await importDirectory(project.workspacePath, folder);
+    const parsed = path.parse(fileName);
+    let candidate = fileName;
+    for (let suffix = 2; await exists(path.join(importedDirectory, candidate)); suffix += 1) {
+      candidate = `${parsed.name}-${suffix}${parsed.ext}`;
+    }
+    const destination = path.join(importedDirectory, candidate);
+    const temporary = path.join(importedDirectory, `.${candidate}.${randomUUID()}.tmp`);
+    try {
+      await writeTemporary(temporary);
+      await rename(temporary, destination);
+    } finally {
+      await rm(temporary, { force: true });
+    }
+    await this.touch(id);
+    return path.posix.join("assets", ...folder, candidate);
+  }
+
+  async renameAsset(id: string, assetPath: string, name: string): Promise<string> {
+    const project = this.#projects.get(id);
+    if (!project) throw new Error(`Project not found: ${id}`);
+    if (!validAssetName(name.trim())) throw new ProjectAssetError("Invalid asset name", 400);
+    const source = await getWorkspaceMedia(project.workspacePath, assetPath);
+    return this.renameWorkspaceEntry(id, assetPath, `${name.trim()}${path.extname(source.absolutePath)}`);
+  }
+
+  async deleteAsset(id: string, assetPath: string): Promise<void> {
+    const project = this.#projects.get(id);
+    if (!project) throw new Error(`Project not found: ${id}`);
+    await getWorkspaceMedia(project.workspacePath, assetPath);
+    await this.deleteWorkspaceEntry(id, assetPath);
+  }
+
+  async createWorkspaceEntry(id: string, parent: string, name: string, kind: "file" | "folder"): Promise<string> {
+    const project = this.#projects.get(id);
+    if (!project) throw new ProjectAssetError("Project not found", 404);
+    const normalizedName = workspaceEntryName(name);
+    const entryPath = path.posix.join(parent, normalizedName);
+    assertEditableWorkspacePath(entryPath);
+    return this.#mutateWorkspace(id, async () => {
+      const directory = await resolveWorkspaceDirectory(project.workspacePath, parent);
+      const destination = path.join(directory, normalizedName);
+      try {
+        if (kind === "folder") await mkdir(destination);
+        else await writeFile(destination, "", { flag: "wx" });
+      } catch (cause) {
+        if ((cause as NodeJS.ErrnoException).code === "EEXIST") throw new ProjectAssetError("A file or folder with that name already exists", 409);
+        throw cause;
+      }
+      await this.touch(id);
+      return entryPath;
+    });
+  }
+
+  async renameWorkspaceEntry(id: string, entryPath: string, name: string): Promise<string> {
+    const project = this.#projects.get(id);
+    if (!project) throw new ProjectAssetError("Project not found", 404);
+    const normalizedName = workspaceEntryName(name);
+    assertEditableWorkspacePath(entryPath);
+    return this.#mutateWorkspace(id, async () => {
+      const source = await resolveWorkspaceEntry(project.workspacePath, entryPath);
+      assertEditableWorkspacePath(source.relativePath);
+      const renamedPath = path.posix.join(path.posix.dirname(source.relativePath), normalizedName);
+      assertEditableWorkspacePath(renamedPath);
+      const destination = path.join(path.dirname(source.absolutePath), normalizedName);
+      if (source.absolutePath === destination) return source.relativePath;
+      try {
+        const existing = await lstat(destination);
+        // realpath may alias hard links on some runtimes. Only a case change
+        // without a separate directory entry may resolve to the source itself.
+        const entries = await readdir(path.dirname(source.absolutePath));
+        const caseOnly = normalizedName.toLowerCase() === path.basename(source.absolutePath).toLowerCase()
+          && !entries.includes(normalizedName);
+        if (!caseOnly || existing.isSymbolicLink() || await realpath(destination) !== source.absolutePath) throw new ProjectAssetError("A file or folder with that name already exists", 409);
+      } catch (cause) { if ((cause as NodeJS.ErrnoException).code !== "ENOENT") throw cause; }
+      await rename(source.absolutePath, destination);
+      try {
+        await renameCanvasAssetPaths(project.workspacePath, source.relativePath, renamedPath);
+        await this.#writeAssetMetadata(id, () => renameAssetMetadata(project.workspacePath, source.relativePath, renamedPath));
+      } catch (cause) {
+        await rename(destination, source.absolutePath);
+        await renameCanvasAssetPaths(project.workspacePath, renamedPath, source.relativePath);
+        throw cause;
+      }
+      await this.touch(id);
+      return renamedPath;
+    });
+  }
+
+  async deleteWorkspaceEntry(id: string, entryPath: string): Promise<void> {
+    const project = this.#projects.get(id);
+    if (!project) throw new ProjectAssetError("Project not found", 404);
+    assertEditableWorkspacePath(entryPath);
+    await this.#mutateWorkspace(id, async () => {
+      const source = await resolveWorkspaceEntry(project.workspacePath, entryPath);
+      assertEditableWorkspacePath(source.relativePath);
+      const manifest = await readCanvasAssets(project.workspacePath);
+      const canvasIds = Object.entries(manifest.assets).filter(([, asset]) => asset.path === source.relativePath || asset.path.startsWith(`${source.relativePath}/`)).map(([assetId]) => assetId);
+      const removed = `${source.absolutePath}.${randomUUID()}.removed`;
+      await rename(source.absolutePath, removed);
+      let previewPaths: string[];
+      try {
+        await removeCanvasAssetReferences(project.workspacePath, canvasIds);
+        previewPaths = await this.#writeAssetMetadata(id, () => deleteAssetMetadata(project.workspacePath, source.relativePath));
+      } catch (cause) {
+        await rename(removed, source.absolutePath);
+        throw cause;
+      }
+      await rm(removed, { recursive: true, force: true });
+      if (previewPaths.length) {
+        await ensureDirectory(path.join(project.workspacePath, PROJECT_DATA_DIRECTORY));
+        await ensureDirectory(path.join(project.workspacePath, ...ASSET_PREVIEWS_DIRECTORY.split("/")));
+        for (const preview of previewPaths) await rm(path.join(project.workspacePath, ...preview.split("/")), { force: true });
+      }
+      await this.touch(id);
+    });
+  }
+
+  async #writeAssetMetadata<T>(id: string, operation: () => Promise<T>): Promise<T> {
+    return this.#serialize(id, this.#assetMetadataWrites, operation);
+  }
+
+  async #mutateWorkspace<T>(id: string, operation: () => Promise<T>): Promise<T> {
+    return this.#serialize(id, this.#workspaceWrites, operation);
+  }
+
+  async #serialize<T>(id: string, writes: Map<string, Promise<unknown>>, operation: () => Promise<T>): Promise<T> {
+    const write = (writes.get(id)?.catch(() => {}) ?? Promise.resolve()).then(operation);
+    writes.set(id, write);
+    try {
+      return await write;
+    } finally {
+      if (writes.get(id) === write) writes.delete(id);
+    }
+  }
+
+  async libraryAssetAssociations(onError: (project: ProjectState, cause: unknown) => void): Promise<Map<string, { projects: LibraryAssetProject[]; hasAssetUsage: boolean }>> {
+    const associations = new Map<string, { projects: LibraryAssetProject[]; hasAssetUsage: boolean }>();
+    for (const project of this.#projects.values()) {
+      if (project.workspaceAvailable === false) continue;
+      const metadata = await readAssetMetadata(project.workspacePath);
+      const usage = new Map<string, boolean>(Object.values(metadata.libraryAssets).map((id) => [id, false]));
+      try {
+        for (const [id, asAsset] of await canvasLibraryAssetUsage(project.workspacePath)) usage.set(id, asAsset);
+      } catch (cause) { onError(project, cause); }
+      if (project.type === "interactive-story" && await exists(path.join(project.workspacePath, PLAYABLE_GRAPH_FILE))) {
+        try {
+          const graph = await readNodeGraphForReferences(project.workspacePath);
+          for (const asset of Object.values(graph.assets)) {
+            if (asset.source.kind === "library") usage.set(asset.source.assetId, true);
+          }
+        } catch (cause) { onError(project, cause); }
+      }
+      for (const [id, asAsset] of usage) {
+        const association = associations.get(id) ?? { projects: [], hasAssetUsage: false };
+        association.projects.push({ id: project.id, name: project.name, type: project.type });
+        association.hasAssetUsage ||= asAsset;
+        associations.set(id, association);
+      }
+    }
+    return associations;
+  }
+
+  async referencesLibraryAsset(assetId: string): Promise<ProjectState[]> {
+    const references: ProjectState[] = [];
+    for (const project of this.#projects.values()) {
+      // A folder that is gone reads as using nothing, so its usage can't be known.
+      if (!(await exists(project.workspacePath))) throw new ProjectLibraryReferenceError(`Cannot verify Library references in ${project.name}: its folder is unavailable`);
+      const metadata = await readAssetMetadata(project.workspacePath);
+      let referenced = Object.values(metadata.libraryAssets).includes(assetId);
+      try {
+        referenced ||= await canvasReferencesAsset(project.workspacePath, assetId);
+      } catch (cause) {
+        throw new ProjectLibraryReferenceError(`Cannot verify canvas references in ${project.name}: ${cause instanceof Error ? cause.message : String(cause)}`);
+      }
+      if (project.type === "interactive-story" && await exists(path.join(project.workspacePath, PLAYABLE_GRAPH_FILE))) {
+        try {
+          const graph = await readNodeGraphForReferences(project.workspacePath);
+          referenced ||= Object.values(graph.assets).some((asset) => (
+            asset.source.kind === "library" && asset.source.assetId === assetId
+          ));
+        } catch (cause) {
+          throw new ProjectLibraryReferenceError(`Cannot verify Library references in ${project.name}: ${cause instanceof Error ? cause.message : String(cause)}`);
+        }
+      }
+      if (referenced) {
+        references.push(project);
+        continue;
+      }
+    }
+    return references;
+  }
+
+  async setPublication(id: string, publication: PublicationState | undefined): Promise<void> {
+    const project = this.#projects.get(id);
+    if (!project) throw new Error(`Project not found: ${id}`);
+    await this.#save(project, { publication, updatedAt: new Date().toISOString() });
+  }
+
+  /** Gives the published game's page its new name, if the project still has that game when it saves. */
+  async renamePublication(id: string, renamed: GameRename): Promise<void> {
+    const project = this.#projects.get(id);
+    if (!project) throw new Error(`Project not found: ${id}`);
+    await this.#save(project, (current) => current.publication ? { publication: withRename(current.publication, renamed) } : {});
+  }
+
+  /**
+   * Gives a publication saved before the Cloud gave games a page its page. Checked as it
+   * saves, so a rename saved meanwhile keeps its name.
+   */
+  async fillPublicationPage(id: string, page: GameRename): Promise<void> {
+    const project = this.#projects.get(id);
+    if (!project) throw new Error(`Project not found: ${id}`);
+    await this.#save(project, (current) => current.publication && !hasGamePage(current.publication) ? { publication: withRename(current.publication, page) } : {});
+  }
+
+  async #save(
+    project: ProjectState,
+    // A function computes the changes once earlier writes finish, for changes that merge with saved fields.
+    update: MetadataChanges | ((project: ProjectState) => MetadataChanges),
+  ): Promise<boolean> {
+    return this.#withMetadata(project.id, async () => {
+      if (this.#projects.get(project.id) !== project) return false;
+      await this.#refreshSettings(project);
+      const changes = typeof update === "function" ? update(project) : update;
+      // A name the folder's file got elsewhere, as through Git, is no longer the default one to replace.
+      if (changes.nameSource === "ai" && (project.nameSource !== "default" || project.name !== defaultProjectName(project.type))) return false;
+      const settings = this.#settings.get(project.id) ?? "pending";
+      const portable = Object.keys(changes).some((key) => (PROJECT_SETTING_KEYS as readonly string[]).includes(key));
+      // Settings that can't be read are never written over, so they can't change until they can be read.
+      if (settings === "unknown" && portable) {
+        if (changes.nameSource === "ai") return false;
+        throw settingsUnknown();
+      }
+      const metadata = { ...metadataFor(project), ...changes };
+      // What only this computer keeps leaves the folder's file alone.
+      this.#settings.set(project.id, await this.#writeProject(this.#projectDirectory(project.id), project.workspacePath, metadata, settings, portable || settings === "pending"));
+      this.#apply(project, metadata);
+      return true;
+    });
+  }
+
+  async #withMetadata<T>(id: string, operation: () => Promise<T>): Promise<T> {
+    const next = (this.#metadataWrites.get(id) ?? Promise.resolve()).catch(() => {}).then(operation);
+    this.#metadataWrites.set(id, next);
+    try { return await next; }
+    finally { if (this.#metadataWrites.get(id) === next) this.#metadataWrites.delete(id); }
+  }
+
+  // compat: since beta.5.8, remove from beta.7 and 2026-12-14. Project defaults
+  // follow committed settings migration; task inputs and recovery IDs do not.
+  #migrateMediaDefaults(metadata: ProjectMetadata): boolean {
+    let changed = false;
+    for (const kind of ["image", "video", "3d", "speech", "sound-effect", "music"] as const) {
+      const current = metadata.mediaModelDefaults?.[kind];
+      if (!current) continue;
+      const model = migratedMediaModel(current, kind, this.mediaMigrations);
+      if (model === current) continue;
+      metadata.mediaModelDefaults = { ...metadata.mediaModelDefaults, [kind]: model };
+      changed = true;
+    }
+    return changed;
+  }
+
+  #writeProject(...args: Parameters<typeof writeProject>) {
+    this.#migrateMediaDefaults(args[2]);
+    return writeProject(...args);
+  }
+
+  /** Puts saved or reread metadata on the project as the app shows it. */
+  #apply(project: ProjectState, metadata: ProjectMetadata): void {
+    for (const key of PREVIEW_SETTING_KEYS) { delete project[key]; }
+    Object.assign(project, previewSettings(metadata));
+    project.type = metadata.type;
+    if (metadata.pluginType) project.pluginType = metadata.pluginType;
+    else delete project.pluginType;
+    const listChanged = project.name !== metadata.name || project.nameSource !== metadata.nameSource || project.updatedAt !== metadata.updatedAt;
+    project.name = metadata.name;
+    if (metadata.nameSource) project.nameSource = metadata.nameSource;
+    project.updatedAt = metadata.updatedAt;
+    if (project.type === "general") project.webPreviewEnabled = metadata.webPreviewEnabled ?? false;
+    else delete project.webPreviewEnabled;
+    if (metadata.startupDirectory) project.startupDirectory = metadata.startupDirectory;
+    else delete project.startupDirectory;
+    if (metadata.startupScript) project.startupScript = metadata.startupScript;
+    else delete project.startupScript;
+    if (metadata.packageManager) project.packageManager = metadata.packageManager;
+    else delete project.packageManager;
+    if (metadata.previewPath) project.previewPath = metadata.previewPath;
+    else delete project.previewPath;
+    if (metadata.previewViewport) project.previewViewport = metadata.previewViewport;
+    else delete project.previewViewport;
+    if (metadata.mediaModelDefaults) project.mediaModelDefaults = metadata.mediaModelDefaults;
+    else delete project.mediaModelDefaults;
+    if (metadata.publication) project.publication = metadata.publication;
+    else delete project.publication;
+    if (metadata.appearance) project.appearance = metadata.appearance;
+    else delete project.appearance;
+    if (listChanged) this.onListChange?.();
+  }
+
+  /**
+   * Reads the folder's settings again, since they may have changed there, as
+   * through Git: a file that can't be read now makes them unknown, and one
+   * that can again makes them known.
+   */
+  async #refreshSettings(project: ProjectState): Promise<void> {
+    if (this.#settings.get(project.id) === "pending") return;
+    const found = await readFolderSettings(project.workspacePath);
+    if (typeof found !== "object") {
+      if (found === "unreadable") this.#settings.set(project.id, "unknown");
+      return;
+    }
+    // The type is read when the project loads; the settings' kind only says what it was then.
+    const { kind: _kind, ...settings } = found;
+    const metadata = metadataFor(project);
+    for (const key of PROJECT_SETTING_KEYS) delete metadata[key as keyof ProjectMetadata];
+    const refreshed = { ...metadata, ...settings };
+    const migrated = this.#migrateMediaDefaults(refreshed);
+    const source = migrated
+      ? await this.#writeProject(this.#projectDirectory(project.id), project.workspacePath, refreshed, "folder")
+      : "folder";
+    if (migrated && source !== "folder") throw settingsUnknown();
+    this.#apply(project, refreshed);
+    this.#settings.set(project.id, source);
+  }
+
+  /**
+   * The project's settings as its folder has them now, for what uses or
+   * changes them outside a save, such as exporting, duplicating or a logo;
+   * refused while they can't be read.
+   */
+  async readySettings(id: string): Promise<void> {
+    const project = this.#projects.get(id);
+    if (!project) throw new Error(`Project not found: ${id}`);
+    await this.#withMetadata(id, async () => {
+      if (this.#projects.get(id) !== project) throw new Error(`Project not found: ${id}`);
+      await this.#refreshSettings(project);
+      if (this.#settings.get(id) === "unknown") throw settingsUnknown();
+    });
+  }
+
+  /** Writes settings waiting for the project's folder, as after its type or example filled a new one. */
+  async storeSettings(id: string): Promise<void> {
+    const project = this.#projects.get(id);
+    if (project && this.#settings.get(id) === "pending") await this.#save(project, {});
+  }
+
+  /**
+   * The project whose workspace is the selected folder. Choosing that folder
+   * again opens the project rather than creating a second one on its files.
+   */
+  async findByWorkspace(selectedWorkspacePath: string): Promise<ProjectState | undefined> {
+    try {
+      return this.#workspaceOwner(await realpath(selectedWorkspacePath));
+    } catch {
+      return undefined;
+    }
+  }
+
+  #workspaceOwner(workspacePath: string): ProjectState | undefined {
+    return [...this.#projects.values()].find((project) => path.resolve(project.workspacePath) === workspacePath);
+  }
+
+  async #validateExternalWorkspace(selectedWorkspacePath: string): Promise<string> {
+    if (!path.isAbsolute(selectedWorkspacePath)) throw new ProjectWorkspaceError("Workspace path must be absolute");
+    let entry: Awaited<ReturnType<typeof lstat>>;
+    let workspacePath: string;
+    try {
+      entry = await lstat(selectedWorkspacePath);
+      workspacePath = await realpath(selectedWorkspacePath);
+    } catch {
+      throw new ProjectWorkspaceError("Selected workspace folder is not available");
+    }
+    if (entry.isSymbolicLink() || !entry.isDirectory()) {
+      throw new ProjectWorkspaceError("Selected workspace must be a directory, not a symbolic link");
+    }
+    if (path.parse(workspacePath).root === workspacePath) {
+      throw new ProjectWorkspaceError("The filesystem root cannot be used as a workspace");
+    }
+    if (pathsOverlap(workspacePath, this.#projectsDirectory)) {
+      throw new ProjectWorkspaceError("OhMyGame's project storage cannot be used as a workspace");
+    }
+    const owner = this.#workspaceOwner(workspacePath);
+    if (owner) throw new ProjectWorkspaceError(`This folder is already the workspace of “${owner.name}”`);
+    return workspacePath;
+  }
+
+  #projectDirectory(id: string): string {
+    return path.join(this.#projectsDirectory, id);
+  }
+
+}
+
+function projectState(
+  workspacePath: string,
+  metadata: ProjectMetadata,
+  runnable: boolean,
+  storagePath: string,
+  workspaceAvailable: boolean,
+): ProjectState {
+  return {
+    id: metadata.id,
+    name: metadata.name,
+    ...(metadata.nameSource ? { nameSource: metadata.nameSource } : {}),
+    type: metadata.type,
+    ...(metadata.pluginType ? { pluginType: metadata.pluginType } : {}),
+    ...(metadata.type === "general" ? { webPreviewEnabled: metadata.webPreviewEnabled ?? false } : {}),
+    updatedAt: metadata.updatedAt,
+    workspacePath,
+    ...previewSettings(metadata),
+    ...(metadata.startupDirectory ? { startupDirectory: metadata.startupDirectory } : {}),
+    ...(metadata.startupScript ? { startupScript: metadata.startupScript } : {}),
+    ...(metadata.packageManager ? { packageManager: metadata.packageManager } : {}),
+    ...(metadata.previewPath ? { previewPath: metadata.previewPath } : {}),
+    ...(metadata.previewViewport ? { previewViewport: metadata.previewViewport } : {}),
+    ...(metadata.mediaModelDefaults ? { mediaModelDefaults: metadata.mediaModelDefaults } : {}),
+    storagePath,
+    workspaceLocation: metadata.workspacePath ? "external" : "managed",
+    workspaceAvailable,
+    preview: { status: runnable ? "stopped" : "waiting" },
+    ...(metadata.publication ? { publication: metadata.publication } : {}),
+    ...(metadata.appearance ? { appearance: metadata.appearance } : {}),
+  };
+}
+
+async function isRunnableStartupWorkspace(project: Pick<ProjectState, "type" | "pluginType" | "webPreviewEnabled" | "workspacePath" | "startupDirectory" | "startupScript" | keyof ProjectPreviewSettings>): Promise<boolean> {
+  if (project.type === "general" && !supportsWebPreview(project)) return false;
+  // Its plugin builds what the preview serves.
+  if (buildsWebPreview(project)) return true;
+  try {
+    return (await resolvePreviewWorkspace(project)).runnable;
+  } catch {
+    return false;
+  }
+}
+
+export interface PreviewWorkspaceStatus {
+  mode?: "script" | "static" | "command";
+  runnable: boolean;
+  error?: string;
+  /** `no-web-project`: the folder has no package.json, as an engine's project doesn't. */
+  issue?: NonNullable<ProjectState["preview"]["issue"]>;
+}
+
+/** Resolve the configured directory and inspect its preview script in one place. */
+export async function resolvePreviewWorkspace(project: Pick<ProjectState, "workspacePath" | "startupDirectory" | "startupScript" | keyof ProjectPreviewSettings>): Promise<PreviewWorkspaceStatus & { absolutePath: string; relativePath: string }> {
+  const directory = await resolveStartupDirectory(project.workspacePath, project.startupDirectory ?? ".");
+  if (project.previewMode === "command") return { ...directory, runnable: !!project.previewCommand?.trim(), mode: "command" as const };
+  const script = await previewWorkspaceStatus(directory.absolutePath, project.startupScript ?? "dev");
+  if (project.previewMode === "static" || ((project.previewMode ?? "auto") === "auto" && !script.runnable && await exists(path.join(directory.absolutePath, "index.html")))) {
+    const runnable = await exists(path.join(directory.absolutePath, "index.html"));
+    return { ...directory, runnable, mode: "static" as const, ...(!runnable ? { error: "This folder has no index.html to preview." } : {}) };
+  }
+  return { ...directory, ...script, mode: "script" as const };
+}
+
+export async function previewWorkspaceStatus(workspacePath: string, startupScript = "dev"): Promise<PreviewWorkspaceStatus> {
+  const script = normalizeStartupScript(startupScript) ?? "dev";
+  const label = script === "dev" ? "dev script" : `${script} script`;
+  let text: string;
+  try {
+    text = await readFile(path.join(workspacePath, "package.json"), "utf8");
+  } catch (cause) {
+    // Only a folder without one lacks a web project; one that can't be read says why.
+    if ((cause as NodeJS.ErrnoException).code === "ENOENT")
+      return { runnable: false, error: `This folder has no package.json ${label} that starts a preview server.`, issue: "no-web-project" };
+    return { runnable: false, error: `This folder's package.json can't be read: ${cause instanceof Error ? cause.message : String(cause)}` };
+  }
+  let packageJson: unknown;
+  try {
+    packageJson = JSON.parse(text);
+  } catch (cause) {
+    return { runnable: false, error: `This folder's package.json isn't valid JSON: ${cause instanceof Error ? cause.message : String(cause)}` };
+  }
+  const scripts = (packageJson as { scripts?: unknown } | null)?.scripts;
+  const command = scripts && typeof scripts === "object" ? (scripts as Record<string, unknown>)[script] : undefined;
+  if (typeof command !== "string" || !command.trim()) {
+    return { runnable: false, error: `This folder has no ${label} that starts a preview server.` };
+  }
+  if (isNonServerDevCommand(command)) {
+    return {
+      runnable: false,
+      error: `This folder's ${label} runs a non-server task: ${command.trim()}`,
+    };
+  }
+  return { runnable: true };
+}
+
+function isNonServerDevCommand(command: string): boolean {
+  // Inspect launchers and task names, not words inside server options or paths.
+  const tokens = command.match(/&&|\|\||[;|]|(?:[^\s;&|"']+|"(?:\\.|[^"\\])*"|'[^']*')+/g) ?? [];
+  let start = 0;
+  for (let end = 0; end <= tokens.length; end++) {
+    if (end < tokens.length && !/^(?:&&|\|\||[;|])$/.test(tokens[end]!)) continue;
+    const words = tokens.slice(start, end).map((word) => word.replace(/^(["'])(.*)\1$/, "$2").toLowerCase());
+    start = end + 1;
+    if (/^(?:env|cross-env|cross-env-shell)$/.test(words[0] ?? "")) words.shift();
+    while (/^[a-z_]\w*=/.test(words[0] ?? "")) words.shift();
+    if (/^(?:npm|pnpm|yarn|bun|npx|bunx)$/.test(words[0] ?? "")) {
+      words.shift();
+      while (/^(?:--yes|-y|--no-install|--silent|-s)$/.test(words[0] ?? "")) words.shift();
+      if (/^(?:run|exec|x)$/.test(words[0] ?? "")) words.shift();
+    }
+    const launcher = path.posix.basename(words[0] ?? "");
+    if (/^(?:build|check|eslint|fmt|format|lint|prettier|test|typecheck|electron(?:-forge|-vite|-builder)?|tauri|godot4?)$/.test(launcher)) return true;
+    if (/^(?:vite|next|nuxt|astro|svelte-kit|react-scripts)$/.test(launcher) && /^(?:build|check|lint|test|typecheck)$/.test(words[1] ?? "")) return true;
+  }
+  return false;
+}
+
+export async function resolveStartupDirectory(workspacePath: string, input: string): Promise<{ absolutePath: string; relativePath: string }> {
+  if (!isValidStartupDirectory(input)) {
+    throw new ProjectWorkspaceError("Startup directory must be a relative path inside the project workspace");
+  }
+  let workspaceRoot: string;
+  try {
+    workspaceRoot = await realpath(workspacePath);
+  } catch {
+    throw new ProjectWorkspaceError("The project workspace is not available");
+  }
+  const configured = normalizeStartupDirectory(input) ?? ".";
+  const candidate = path.resolve(workspaceRoot, configured);
+  if (!pathContains(workspaceRoot, candidate)) {
+    throw new ProjectWorkspaceError("Startup directory must be inside the project workspace");
+  }
+  let absolutePath: string;
+  try {
+    absolutePath = await realpath(candidate);
+  } catch {
+    throw new ProjectWorkspaceError("Startup directory does not exist");
+  }
+  if (!pathContains(workspaceRoot, absolutePath)) {
+    throw new ProjectWorkspaceError("Startup directory must be inside the project workspace");
+  }
+  if (!(await lstat(absolutePath)).isDirectory()) {
+    throw new ProjectWorkspaceError("Startup directory must be a folder");
+  }
+  const relativePath = path.relative(workspaceRoot, absolutePath).replaceAll(path.sep, "/");
+  return { absolutePath, relativePath: relativePath || "." };
+}
+
+function isValidStartupDirectory(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  const trimmed = value.trim();
+  return trimmed === "" || trimmed === "." || normalizeStartupDirectory(trimmed) !== undefined;
+}
+
+function normalizeStartupDirectory(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const normalized = value.trim().replaceAll("\\", "/");
+  if (!normalized || normalized === ".") return undefined;
+  if (normalized.startsWith("/") || /^[a-zA-Z]:\//.test(normalized)) return undefined;
+  const parts = normalized.split("/");
+  if (parts.some((part) => !part || part === "." || part === "..")) return undefined;
+  return parts.join("/");
+}
+
+function normalizeStartupScript(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const normalized = value.trim();
+  return /^[a-zA-Z0-9][a-zA-Z0-9:._-]*$/.test(normalized) ? normalized : undefined;
+}
+
+function normalizePreviewPath(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const normalized = value.trim().replaceAll("\\", "/");
+  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(normalized)) return undefined;
+  return `/${normalized.replace(/^\/+/, "")}`;
+}
+
+function projectRunSettings(project: ProjectState): ProjectRunSettings {
+  return {
+    ...previewSettings(project),
+    ...(project.type === "general" ? { webPreviewEnabled: project.webPreviewEnabled ?? false } : {}),
+    startupDirectory: project.startupDirectory ?? ".",
+    startupScript: project.startupScript ?? "dev",
+    ...(project.packageManager ? { packageManager: project.packageManager } : {}),
+    previewPath: project.previewPath ?? "/",
+    previewViewport: project.previewViewport ?? "fit",
+  };
+}
+
+/**
+ * Where a project's settings are: in its folder's `.ohmygame/settings.json`,
+ * waiting in `project.json` for a folder that can't take them yet, or unknown,
+ * when the folder isn't there or its file can't be read. Unknown settings are
+ * never written, so a folder that comes back, or a file that is fixed, keeps them.
+ */
+type SettingsSource = "folder" | "pending" | "unknown";
+
+/** `project.json`: what this computer keeps about a project. What travels with it is in its folder. */
+interface ProjectRecord {
+  version: 2;
+  id: string;
+  nameSource?: ProjectState["nameSource"];
+  updatedAt: string;
+  workspacePath?: string;
+  publication?: PublicationState;
+  /**
+   * The type as the app last knew it, with how its plugin previews it. The
+   * folder's `ohmygame.json` and settings decide; this is for a folder
+   * without them, or one that isn't there.
+   */
+  type?: ProjectType;
+  pluginType?: ProjectState["pluginType"];
+  /** The settings, only while the folder can't take them. */
+  settings?: ProjectSettings;
+}
+
+async function readProject(projectDirectory: string, id: string, fallbackUpdatedAt: string): Promise<{ metadata: ProjectMetadata; settings: SettingsSource; rewrite: boolean }> {
+  let parsed: { version?: unknown; [key: string]: unknown };
+  try {
+    parsed = JSON.parse(await readFile(path.join(projectDirectory, "project.json"), "utf8")) as { version?: unknown; [key: string]: unknown };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    parsed = { version: 2, id, updatedAt: fallbackUpdatedAt };
+  }
+  // compat: since beta.5.5, remove from beta.7 and 2026-12-06. project.json held the type, name and settings too.
+  if (parsed?.version === 1) {
+    const { metadata } = parseMetadata(parsed, id, fallbackUpdatedAt);
+    const named = await readFolderType(metadata.workspacePath ?? path.join(projectDirectory, "workspace"));
+    const typed = typeof named === "object" ? typeFromFile(named.type, projectSettingKind(metadata), metadata) : metadata;
+    return { metadata: withType(metadata, typed), settings: "pending", rewrite: true };
+  }
+  const record = parsed as Partial<ProjectRecord>;
+  if (record?.version !== 2 || record.id !== id || (record.workspacePath !== undefined && (typeof record.workspacePath !== "string" || !path.isAbsolute(record.workspacePath))) ||
+    (record.type !== undefined && !isProjectType(record.type)) || (record.pluginType !== undefined && !validPluginType(record.pluginType)))
+    throw new Error("Invalid project metadata");
+  const workspacePath = record.workspacePath ?? path.join(projectDirectory, "workspace");
+  const found = record.settings ?? await readFolderSettings(workspacePath);
+  // A folder without settings starts over with the defaults; it is the folder's name that the person knows it by.
+  const settings: SettingsSource = record.settings ? "pending" : typeof found === "object" ? "folder" : found === "missing" ? "pending" : "unknown";
+  const defaults = { name: record.workspacePath ? path.basename(record.workspacePath) : "Untitled project" };
+  // A record that doesn't say goes by the settings' kind.
+  const known = { type: record.type ?? (typeof found === "object" ? found.kind : undefined) ?? "web-game", ...(record.pluginType ? { pluginType: record.pluginType } : {}) };
+  // Settings that can't be read keep the kind the app last knew.
+  const { kind = typeof found === "object" ? undefined : projectSettingKind(known), ...carried } = typeof found === "object" ? found : defaults as ProjectSettings;
+  const named = await readFolderType(workspacePath);
+  const typed = typeof named === "object" ? typeFromFile(named.type, kind, known) : known;
+  const { metadata, missing } = parseMetadata({
+    ...carried,
+    ...typed,
+    version: 1,
+    id,
+    ...(record.nameSource ? { nameSource: record.nameSource } : {}),
+    updatedAt: record.updatedAt,
+    ...(record.workspacePath ? { workspacePath: record.workspacePath } : {}),
+    ...(record.publication ? { publication: record.publication } : {}),
+  }, id, fallbackUpdatedAt);
+  // The record learns the type the folder names, and a folder that names none gets it.
+  const retyped = record.type !== metadata.type || record.pluginType?.id !== metadata.pluginType?.id;
+  const unnamed = named === "missing" && settings === "folder" && fileTypeOf(metadata) !== undefined;
+  return { metadata, settings, rewrite: (missing && settings !== "unknown") || retyped || unnamed };
+}
+
+function validPluginType(value: unknown): value is NonNullable<ProjectState["pluginType"]> {
+  const type = value as Partial<NonNullable<ProjectState["pluginType"]>> | undefined;
+  return typeof type?.id === "string" && typeof type.plugin === "string" && type.id.startsWith(`${type.plugin}:`) && ["web", "web-build", "native"].includes(type.preview as string);
+}
+
+/** The metadata with the type the folder names. */
+function withType(metadata: ProjectMetadata, typed: Pick<ProjectMetadata, "type" | "pluginType">): ProjectMetadata {
+  const { pluginType: _pluginType, ...rest } = metadata;
+  return { ...rest, ...typed };
+}
+
+function withAppearance(appearance: ProjectAppearance): MetadataChanges {
+  return { appearance: Object.keys(appearance).length ? appearance : undefined, updatedAt: new Date().toISOString() };
+}
+
+/** Validates and normalizes persisted or imported metadata without disk I/O. */
+function parseMetadata(value: unknown, id: string, fallbackUpdatedAt: string): LoadedMetadata {
+  const parsed = value as Partial<ProjectMetadata>;
+  if (
+    validPreviewSettings(parsed) && parsed.version === 1 && parsed.id === id && typeof parsed.name === "string" && parsed.name.trim() &&
+    (parsed.nameSource === undefined || ["default", "ai", "manual"].includes(parsed.nameSource)) &&
+    (parsed.type === undefined || isProjectType(parsed.type)) &&
+    (parsed.pluginType === undefined || validPluginType(parsed.pluginType)) &&
+    (parsed.webPreviewEnabled === undefined || typeof parsed.webPreviewEnabled === "boolean") &&
+    (parsed.startupDirectory === undefined || isValidStartupDirectory(parsed.startupDirectory)) &&
+    (parsed.startupScript === undefined || normalizeStartupScript(parsed.startupScript) !== undefined) &&
+    (parsed.packageManager === undefined || isProjectPackageManager(parsed.packageManager)) &&
+    (parsed.previewPath === undefined || normalizePreviewPath(parsed.previewPath) !== undefined) &&
+    (parsed.previewViewport === undefined || isPreviewViewport(parsed.previewViewport)) &&
+    (parsed.workspacePath === undefined || (typeof parsed.workspacePath === "string" && path.isAbsolute(parsed.workspacePath))) &&
+    (parsed.mediaModelDefaults === undefined || validMediaModelDefaults(parsed.mediaModelDefaults)) &&
+    (parsed.publication === undefined || validPublication(parsed.publication)) &&
+    (parsed.appearance === undefined || parseProjectAppearance(parsed.appearance) !== undefined)
+  ) {
+    const updatedAt = typeof parsed.updatedAt === "string" && Number.isFinite(Date.parse(parsed.updatedAt))
+      ? parsed.updatedAt
+      : fallbackUpdatedAt;
+    const type = parsed.type ?? "web-game";
+    const startupDirectory = normalizeStartupDirectory(parsed.startupDirectory);
+    const startupScript = normalizeStartupScript(parsed.startupScript);
+    const packageManager = parsed.packageManager;
+    const previewPath = normalizePreviewPath(parsed.previewPath);
+    const previewViewport = parsed.previewViewport;
+    const workspacePath = parsed.workspacePath;
+    const appearance = parseProjectAppearance(parsed.appearance);
+    return {
+      metadata: {
+        ...previewSettings(parsed),
+        version: 1,
+        id,
+        name: parsed.name.trim(),
+        ...(parsed.nameSource ? { nameSource: parsed.nameSource } : {}),
+        type,
+        ...(parsed.pluginType ? { pluginType: { id: parsed.pluginType.id, plugin: parsed.pluginType.plugin, preview: parsed.pluginType.preview } } : {}),
+        ...(type === "general" ? { webPreviewEnabled: parsed.webPreviewEnabled ?? false } : {}),
+        updatedAt,
+        ...(startupDirectory ? { startupDirectory } : {}),
+        ...(startupScript && startupScript !== "dev" ? { startupScript } : {}),
+        ...(packageManager ? { packageManager } : {}),
+        ...(previewPath && previewPath !== "/" ? { previewPath } : {}),
+        ...(previewViewport && previewViewport !== "fit" ? { previewViewport } : {}),
+        ...(workspacePath ? { workspacePath } : {}),
+        ...(parsed.publication ? { publication: parsed.publication } : {}),
+        ...(parsed.mediaModelDefaults ? { mediaModelDefaults: parsed.mediaModelDefaults } : {}),
+        ...(appearance && Object.keys(appearance).length ? { appearance } : {}),
+      },
+      missing: parsed.updatedAt !== updatedAt || parsed.type !== type || parsed.startupDirectory !== startupDirectory ||
+        parsed.startupScript !== startupScript || parsed.packageManager !== packageManager ||
+        parsed.previewPath !== previewPath || parsed.previewViewport !== previewViewport || parsed.workspacePath !== workspacePath,
+    };
+  }
+  throw new Error("Invalid project metadata");
+}
+
+function metadataFor(project: ProjectState): ProjectMetadata {
+  return {
+    ...previewSettings(project),
+    version: 1,
+    id: project.id,
+    name: project.name,
+    ...(project.nameSource ? { nameSource: project.nameSource } : {}),
+    type: project.type,
+    ...(project.pluginType ? { pluginType: project.pluginType } : {}),
+    ...(project.type === "general" ? { webPreviewEnabled: project.webPreviewEnabled ?? false } : {}),
+    updatedAt: project.updatedAt,
+    ...(project.startupDirectory ? { startupDirectory: project.startupDirectory } : {}),
+    ...(project.startupScript ? { startupScript: project.startupScript } : {}),
+    ...(project.packageManager ? { packageManager: project.packageManager } : {}),
+    ...(project.previewPath ? { previewPath: project.previewPath } : {}),
+    ...(project.previewViewport ? { previewViewport: project.previewViewport } : {}),
+    ...(project.mediaModelDefaults ? { mediaModelDefaults: project.mediaModelDefaults } : {}),
+    ...(project.workspaceLocation === "external" ? { workspacePath: project.workspacePath } : {}),
+    ...(project.publication ? { publication: project.publication } : {}),
+    ...(project.appearance ? { appearance: project.appearance } : {}),
+  };
+}
+
+/**
+ * Saves a project: its settings to its folder, unless they are unknown or
+ * `folder` is false, and what this computer keeps to `project.json`, with the
+ * settings when the folder didn't take them. Says where the settings are now.
+ */
+async function writeProject(projectDirectory: string, workspacePath: string, metadata: ProjectMetadata, settings: SettingsSource, folder = true): Promise<SettingsSource> {
+  const original = await writableProjectRecord(projectDirectory, metadata.id);
+  const pending = settings === "pending" && original.value.version === 2 ? original.value.settings : undefined;
+  const portable = { ...unknownSettings(pending), ...projectSettings(metadata) };
+  let next: SettingsSource = settings;
+  if (settings !== "unknown" && folder) {
+    const written = await writeFolderSettings(workspacePath, portable);
+    // A file that can't be read is the record still: the settings are unknown, unless a copy is waiting for it.
+    next = written === "written" ? "folder" : written === "unreadable" && settings === "folder" ? "unknown" : "pending";
+  }
+  // A folder that lost the file, as to an older snapshot, gets it back.
+  if (next === "folder") await nameFolderType(workspacePath, metadata);
+  await writeRecord(projectDirectory, {
+    version: 2,
+    id: metadata.id,
+    ...(metadata.nameSource ? { nameSource: metadata.nameSource } : {}),
+    updatedAt: metadata.updatedAt,
+    ...(metadata.workspacePath ? { workspacePath: metadata.workspacePath } : {}),
+    ...(metadata.publication ? { publication: metadata.publication } : {}),
+    type: metadata.type,
+    ...(metadata.pluginType ? { pluginType: metadata.pluginType } : {}),
+    ...(next === "pending" ? { settings: portable } : {}),
+  }, original);
+  return next;
+}
+
+/**
+ * The type `ohmygame.json` names for a project: `general` for the app's
+ * types that are General projects, whose kind the settings keep. Undefined
+ * for the kinds it can't name, a plugin's workspace and an older Godot project.
+ */
+function fileTypeOf(project: Pick<ProjectMetadata, "type" | "pluginType">): string | undefined {
+  if (project.pluginType) return project.pluginType.id;
+  if (project.type === "interactive-story") return project.type;
+  return project.type === "general" || project.type === "web-game" || project.type === "asset-canvas" ? "general" : undefined;
+}
+
+/**
+ * The app's type for a folder whose `ohmygame.json` names `fileType`. A
+ * plugin's type keeps how `known` says its plugin previews it, until the app
+ * reads the plugin's own (`syncPluginType` in app.ts); without that, it runs
+ * outside OhMyGame meanwhile.
+ */
+function typeFromFile(fileType: string, kind: ProjectSettingKind | undefined, known?: Pick<ProjectMetadata, "type" | "pluginType">): Pick<ProjectMetadata, "type" | "pluginType"> {
+  if (fileType === "interactive-story") return { type: fileType };
+  const plugin = projectTypePlugin(fileType);
+  if (!plugin) return { type: kind ?? "general" };
+  const alias = Object.entries(PLUGIN_PROJECT_KINDS).find(([, id]) => id === fileType)?.[0] as ProjectType | undefined;
+  return {
+    type: alias ?? "general",
+    pluginType: known?.pluginType?.id === fileType ? known.pluginType : { id: fileType, plugin, preview: "native" },
+  };
+}
+
+/**
+ * Whether a General project in this folder should start with the web
+ * preview on. It does, unless an engine's plugin recognizes the folder as its
+ * project (Unity, Unreal, Cocos) and it has no web project at its root, so the
+ * Game panel doesn't report a missing dev script.
+ */
+async function mayPreviewOnWeb(workspacePath: string, recognizesEngine?: (folder: string) => Promise<boolean>): Promise<boolean> {
+  const names = await readdir(workspacePath).catch(() => [] as string[]);
+  if (names.includes("package.json") || names.includes("index.html")) return true;
+  return !(await recognizesEngine?.(workspacePath).catch(() => false));
+}
+
+/** The type a folder's `ohmygame.json` names, or why there is none. */
+async function readFolderType(workspacePath: string): Promise<{ type: string } | "missing" | "unreadable"> {
+  try {
+    const read = await readProjectFile(workspacePath);
+    if (!read) return "missing";
+    return read.ok ? { type: read.file.type } : "unreadable";
+  } catch {
+    return "unreadable";
+  }
+}
+
+/**
+ * The project's type for a folder chosen to open, as the new-project dialog
+ * names types: undefined when the folder doesn't say, as one without
+ * `ohmygame.json`, or a General project from before settings named its kind.
+ */
+export async function projectFolderType(workspacePath: string): Promise<string | undefined> {
+  const named = await readFolderType(workspacePath);
+  if (typeof named !== "object") return undefined;
+  // The dialog offers a plugin's type that the app had as its own by the app's name.
+  const alias = Object.entries(PLUGIN_PROJECT_KINDS).find(([, id]) => id === named.type)?.[0];
+  if (alias) return alias;
+  if (named.type !== "general") return named.type;
+  const found = await readFolderSettings(workspacePath);
+  if (typeof found !== "object") return undefined;
+  return found.kind === undefined ? "general" : found.kind === "web-game" || found.kind === "asset-canvas" ? found.kind : undefined;
+}
+
+/**
+ * Writes `ohmygame.json` with the project's type when the folder has none.
+ * One that exists is the folder's own, so it is never rewritten here.
+ */
+async function nameFolderType(workspacePath: string, metadata: ProjectMetadata): Promise<void> {
+  const type = fileTypeOf(metadata);
+  if (!type || (await readFolderType(workspacePath)) !== "missing") return;
+  // Another writer may make it meanwhile; the update keeps what it wrote.
+  await writeProjectFile(workspacePath, (file) => file, { type }).catch(() => {});
+}
+
+function unknownSettings(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  return Object.fromEntries(Object.entries(value).filter(([key]) => key !== "version" && key !== "kind" && !(PROJECT_SETTING_KEYS as readonly string[]).includes(key)));
+}
+
+async function writableProjectRecord(directory: string, id: string): Promise<{ text?: string; value: Record<string, unknown> }> {
+  const file = path.join(directory, "project.json");
+  try {
+    const info = await lstat(file);
+    if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1) throw settingsUnknown();
+    const text = await readFile(file, "utf8"), value = JSON.parse(text);
+    if (!value || typeof value !== "object" || Array.isArray(value) || ![1, 2].includes(value.version) || value.id !== id) throw settingsUnknown();
+    if (value.settings !== undefined && (value.version !== 2 || !value.settings || typeof value.settings !== "object" || Array.isArray(value.settings) || value.settings.version !== undefined || parseFolderSettings(JSON.stringify({ ...value.settings, version: PROJECT_SETTINGS_VERSION })) === "unreadable")) throw settingsUnknown();
+    return { text, value };
+  } catch (cause) {
+    if ((cause as NodeJS.ErrnoException).code === "ENOENT") return { value: {} };
+    throw settingsUnknown();
+  }
+}
+
+async function writeRecord(projectDirectory: string, record: ProjectRecord, original: { text?: string; value: Record<string, unknown> }): Promise<void> {
+  const destination = path.join(projectDirectory, "project.json");
+  const known = ["version", "id", "nameSource", "updatedAt", "workspacePath", "publication", "type", "pluginType", "settings", ...PROJECT_SETTING_KEYS];
+  const retained = Object.fromEntries(Object.entries(original.value).filter(([key]) => !known.includes(key)));
+  const current = await readFile(destination, "utf8").catch((cause: NodeJS.ErrnoException) => { if (cause.code === "ENOENT") return undefined; throw cause; });
+  if (current !== original.text) throw settingsUnknown();
+  const temporary = `${destination}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    await writeFile(temporary, `${JSON.stringify({ ...retained, ...record }, null, 2)}\n`, "utf8");
+    await rename(temporary, destination);
+  } finally {
+    await rm(temporary, { force: true });
+  }
+}
+
+/**
+ * Writes `.ohmygame/settings.json`, the record of a project's name and
+ * settings, which go wherever its folder goes. It isn't written when the
+ * folder isn't there or can't be written ("failed"), or holds a file that
+ * can't be read ("unreadable"), which is left for the person to fix.
+ */
+async function writeFolderSettings(workspacePath: string, settings: ProjectSettings): Promise<"written" | "unreadable" | "failed"> {
+  const destination = path.join(workspacePath, ...PROJECT_SETTINGS_FILE.split("/"));
+  try {
+    if (!(await isDirectory(workspacePath))) return "failed";
+    const before = await readFolderSettingsFile(workspacePath);
+    if (before !== undefined && typeof parseFolderSettings(before) !== "object") return "unreadable";
+    const text = projectSettingsFileText({ ...unknownSettings(before === undefined ? undefined : JSON.parse(before)), ...settings });
+    if (before === text) return "written";
+    await ensureDirectory(path.dirname(destination), true);
+    const temporary = `${destination}.${process.pid}.${randomUUID()}.tmp`;
+    try {
+      await writeFile(temporary, text, { encoding: "utf8", flag: "wx" });
+      if (await readFolderSettingsFile(workspacePath) !== before) return "unreadable";
+      await rename(temporary, destination);
+    } finally {
+      await rm(temporary, { force: true });
+    }
+    return "written";
+  } catch {
+    return "failed";
+  }
+}
+
+/** The name and settings a folder carries, checked like saved ones, or why there are none. */
+async function readFolderSettings(workspacePath: string): Promise<ProjectSettings | "missing" | "unreadable"> {
+  if (!(await isDirectory(workspacePath))) return "unreadable";
+  try {
+    const text = await readFolderSettingsFile(workspacePath);
+    return text === undefined ? "missing" : parseFolderSettings(text);
+  } catch (cause) {
+    return (cause as NodeJS.ErrnoException).code === "ENOENT" ? "missing" : "unreadable";
+  }
+}
+
+async function readFolderSettingsFile(workspacePath: string): Promise<string | undefined> {
+  const file = path.join(workspacePath, ...PROJECT_SETTINGS_FILE.split("/"));
+  try {
+    const parent = await lstat(path.dirname(file));
+    if (!parent.isDirectory() || parent.isSymbolicLink()) throw settingsUnknown();
+    const info = await lstat(file);
+    if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1) throw settingsUnknown();
+    return await readFile(file, "utf8");
+  } catch (cause) {
+    if ((cause as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw cause;
+  }
+}
+
+function parseFolderSettings(text: string): ProjectSettings | "unreadable" {
+  try {
+    const value = JSON.parse(text) as Record<string, unknown>;
+    if (value?.version !== PROJECT_SETTINGS_VERSION) return "unreadable";
+    if (value.kind !== undefined && !(PROJECT_SETTING_KINDS as readonly unknown[]).includes(value.kind)) return "unreadable";
+    const candidate = Object.fromEntries(PROJECT_SETTING_KEYS.filter((key) => value[key] !== undefined).map((key) => [key, value[key]]));
+    const updatedAt = new Date(0).toISOString();
+    // Checked as a General project's, the type whose settings have them all.
+    const { webPreviewEnabled, ...settings } = projectSettings(parseMetadata({ ...candidate, type: "general", version: 1, id: "folder", updatedAt }, "folder", updatedAt).metadata);
+    return {
+      ...settings,
+      ...(value.webPreviewEnabled !== undefined ? { webPreviewEnabled } : {}),
+      ...(value.kind ? { kind: value.kind as ProjectSettingKind } : {}),
+    };
+  } catch {
+    return "unreadable";
+  }
+}
+
+/**
+ * Binds copied Canvas generation history to the project that now owns it.
+ * Canvas rejects history recorded for another project; node IDs, status,
+ * settings and outputs stay intact.
+ */
+async function bindCanvasHistory(workspacePath: string, projectId: string): Promise<void> {
+  let jobs: unknown;
+  try {
+    // Retry inputs can contain inline images, exceeding the board-file limit.
+    const history = await readCanvasFile(workspacePath, "jobs.json", Infinity);
+    if (history === undefined) return;
+    jobs = JSON.parse(history) as unknown;
+  } catch {
+    // History that cannot be read stays as copied; Canvas reports it when opened.
+    return;
+  }
+  if (!Array.isArray(jobs)) return;
+  await writeCanvasJson(workspacePath, "jobs.json", (jobs as (ToolJob | null)[]).map((job) => {
+    if (!job?.context || typeof job.context !== "object") return job;
+    // A retry trusts its input's record of what plugins changed; a copied one can't bring its own.
+    const input = (job as { input?: unknown }).input;
+    const { requestedPrompt: _, pluginChanges: __, ...asked } = input && typeof input === "object" ? input as Record<string, unknown> : {};
+    return { ...job, context: { ...job.context, projectId }, ...(input && typeof input === "object" ? { input: asked } : {}) };
+  }));
+}
+
+async function exists(target: string): Promise<boolean> {
+  try {
+    await access(target);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function readNodeGraphForReferences(workspacePath: string): Promise<NodeGraph> {
+  const file = path.join(workspacePath, PLAYABLE_GRAPH_FILE);
+  let value: unknown;
+  try {
+    value = JSON.parse(await readFile(file, "utf8")) as unknown;
+  } catch (cause) {
+    if (cause instanceof SyntaxError) throw new Error("graph.json is not valid JSON.");
+    throw cause;
+  }
+  const validation = validateNodeGraph(value, { mode: "draft" });
+  if (!validation.ok) {
+    const issue = validation.issues[0]!;
+    throw new Error(`${issue.path}: ${issue.message}`);
+  }
+  return value as NodeGraph;
+}
+
+async function isDirectory(target: string): Promise<boolean> {
+  try {
+    return (await lstat(target)).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+function pathsOverlap(left: string, right: string): boolean {
+  return pathContains(left, right) || pathContains(right, left);
+}
+
+function pathContains(parent: string, child: string): boolean {
+  const relative = path.relative(path.resolve(parent), path.resolve(child));
+  return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
+}
+
+/** Creates `assets/<folder...>` one level at a time, refusing a symbolic link at any level. */
+async function importDirectory(workspacePath: string, folder: readonly string[]): Promise<string> {
+  if (!folder.every(validAssetName)) throw new ProjectAssetError("Invalid folder name", 400);
+  let directory = path.join(workspacePath, "assets");
+  await ensureDirectory(workspacePath);
+  await ensureDirectory(directory, true);
+  for (const part of folder) {
+    directory = path.join(directory, part);
+    await ensureDirectory(directory, true);
+  }
+  return directory;
+}
+
+/** Removes what a folder kept for this computer, when the project leaves OhMyGame but the folder stays. */
+async function removeLocalFiles(workspacePath: string): Promise<void> {
+  if (!(await realFolders(workspacePath, PROJECT_LOCAL_DIRECTORY))) return;
+  await rm(path.join(workspacePath, ...PROJECT_LOCAL_DIRECTORY.split("/")), { recursive: true, force: true });
+}
+
+/** Where a project's cover and logo are: its `.ohmygame/` folder, so they go wherever the folder goes. */
+function coversDirectory(project: ProjectState): string {
+  return path.join(project.workspacePath, PROJECT_DATA_DIRECTORY);
+}
+
+async function ensureDirectory(target: string, create = false): Promise<void> {
+  if (create) {
+    try {
+      await mkdir(target);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    }
+  }
+  const stats = await lstat(target);
+  if (stats.isSymbolicLink() || !stats.isDirectory()) throw new Error(`Unsafe generated asset path: ${target}`);
+}
+
+function isProjectId(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
+
+function validAssetName(value: string): boolean {
+  return value.length > 0 && value.length <= 200 && value !== "." && value !== ".." &&
+    !value.includes("/") && !value.includes("\\") && !/[\u0000-\u001f]/.test(value);
+}
+
+function validPublication(value: unknown): value is PublicationState {
+  if (!value || typeof value !== "object") return false;
+  const publication = value as Partial<PublicationState>;
+  return typeof publication.gameId === "string" && typeof publication.deploymentId === "string" &&
+    typeof publication.playUrl === "string" && typeof publication.publishedAt === "string" &&
+    (publication.title === undefined || typeof publication.title === "string") &&
+    (publication.description === undefined || typeof publication.description === "string") &&
+    (publication.name === undefined || typeof publication.name === "string") &&
+    (publication.pageUrl === undefined || typeof publication.pageUrl === "string");
+}
+
+function validMediaModelDefaults(value: unknown): value is MediaModelDefaults {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  return Object.entries(value).every(([usage, ref]) => (MEDIA_MODEL_USAGES as readonly string[]).includes(usage)
+    && ref && typeof ref === "object" && !Array.isArray(ref)
+    && Object.keys(ref).every((key) => key === "provider" || key === "id")
+    && typeof ref.provider === "string" && ref.provider.trim().length > 0 && ref.provider.length <= 100
+    && typeof ref.id === "string" && ref.id.trim().length > 0 && ref.id.length <= 200);
+}
+
+/** A project's name as a folder name on any system. */
+function folderName(name: string): string {
+  return name.replace(/[\\/:*?"<>|\u0000-\u001f]/g, "-").replace(/^[\s.]+|[\s.]+$/g, "").slice(0, 80) || "Untitled";
+}

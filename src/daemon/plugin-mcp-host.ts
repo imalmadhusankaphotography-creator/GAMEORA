@@ -1,0 +1,422 @@
+import { notifyToolResult, toolHookResult, type HostedToolHooks } from "./tool-hooks.js";
+import { createRequire } from "node:module";
+import { shutDownExtensions } from "./session-shutdown.js";
+import { createHash, randomUUID } from "node:crypto";
+import { createJiti } from "jiti";
+import {
+  createAgentSession,
+  DefaultResourceLoader,
+  SessionManager,
+  SettingsManager,
+  type AgentSession,
+  type ExtensionFactory,
+  type ToolDefinition,
+} from "@earendil-works/pi-coding-agent";
+import type {
+  McpServerDefinition,
+  PluginMcpResult,
+} from "../shared/plugins.js";
+
+export interface McpStatus {
+  name: string;
+  status:
+    | "connected"
+    | "cached"
+    | "failed"
+    | "needs-auth"
+    | "not-connected"
+    | "disabled";
+  toolCount: number;
+}
+export interface EffectiveMcpConfig {
+  mcpServers: Record<string, McpServerDefinition>;
+  settings?: Record<string, unknown>;
+}
+/**
+ * Says why a session may no longer use its MCP servers, such as a plugin
+ * turned off since it started, or undefined while it may. The adapter keeps
+ * the servers a session started with until the session ends.
+ */
+export type McpGuard = () => Promise<string | undefined>;
+interface AdapterModule {
+  createMcpAdapter(options: { config: EffectiveMcpConfig }): ExtensionFactory;
+}
+/** What pi-mcp-adapter emits on `pi.events` before every MCP tool call, whatever made it. */
+const MCP_TOOL_APPROVAL_REQUEST_EVENT = "pi-mcp-adapter:tool-approval-request";
+let adapterModule: Promise<AdapterModule> | undefined;
+function adapter(): Promise<AdapterModule> {
+  return (adapterModule ??= createJiti(import.meta.url).import(
+    createRequire(import.meta.url).resolve("pi-mcp-adapter"),
+  ) as Promise<AdapterModule>);
+}
+
+/** All game sessions and temporary probes use the same adapter and explicit
+ * resolved configuration. Ambient mcp.json files never bypass plugin settings. */
+export class PluginMcpHost {
+  #runtimes = new Map<string, Map<string, McpStatus>>();
+  #cleanup = new Set<() => Promise<void>>();
+  #auth = new Map<
+    string,
+    {
+      session: AgentSession;
+      close: () => Promise<void>;
+      timer: NodeJS.Timeout;
+      signature: string;
+    }
+  >();
+  #operations = new Map<string, Promise<PluginMcpResult>>();
+  #closed = false;
+  async extension(
+    config: EffectiveMcpConfig,
+    { publishStatus = true, guard, toolHooks, toolNames }: { publishStatus?: boolean; guard?: McpGuard; toolHooks?: HostedToolHooks; toolNames?: Set<string> } = {},
+  ): Promise<ExtensionFactory> {
+    const factory = (await adapter()).createMcpAdapter({
+      config: {
+        ...config,
+        settings: { ...config.settings, hostConfigDiscovery: "off" },
+      },
+    });
+    return async (pi) => {
+      if (this.#closed) throw new Error("MCP host is closed");
+      const id = randomUUID(),
+        statuses = new Map<string, McpStatus>();
+      if (publishStatus) this.#runtimes.set(id, statuses);
+      const subscriptions = [
+        pi.events.on("pi-mcp-adapter/status/v1", (value: unknown) => {
+          const snapshot = value as { servers?: McpStatus[] };
+          if (!Array.isArray(snapshot.servers)) return;
+          statuses.clear();
+          for (const status of snapshot.servers)
+            statuses.set(status.name, status);
+        }),
+      ];
+      const unsubscribe = () => subscriptions.forEach((stop) => stop());
+      pi.on("session_shutdown", () => {
+        unsubscribe();
+        this.#runtimes.delete(id);
+      });
+      // Every tool the adapter registers, its `mcp` proxy and direct tools, asks the guard first,
+      // so nothing starts a server once its plugin changed.
+      const tools = toolNames ?? new Set<string>();
+      if (guard) {
+        pi.on("tool_call", async (event) => {
+          if (!tools.has(event.toolName)) return;
+          try {
+            const reason = await guard();
+            return reason ? { block: true, reason } : undefined;
+          } catch (cause) {
+            return { block: true, reason: cause instanceof Error ? cause.message : String(cause) };
+          }
+        });
+      }
+      if (guard || toolHooks) {
+        subscriptions.push(pi.events.on(MCP_TOOL_APPROVAL_REQUEST_EVENT, (value: unknown) => {
+          const request = value as {
+            requestId: string; serverName: string; originalToolName: string;
+            args: Record<string, unknown>; signal?: AbortSignal;
+            claim(handler: () => Promise<string>): boolean;
+          };
+          request.claim(async () => {
+            const reason = await guard?.();
+            if (reason) throw new Error(reason);
+            await toolHooks?.before({ callId: request.requestId, tool: request.originalToolName,
+              server: request.serverName, args: structuredClone(request.args), source: "mcp" }, request.signal);
+            request.signal?.throwIfAborted();
+            const changed = await guard?.();
+            if (changed) throw new Error(changed);
+            // Preserve the adapter's own approval policy as an additional gate.
+            return "abstain";
+          });
+        }));
+      }
+      if (toolHooks) subscriptions.push(pi.events.on("pi-mcp-adapter:tool-result", (value: unknown) => {
+        const event = value as { callId: string; serverName: string; originalToolName: string;
+          args: Record<string, unknown>; result?: { content?: unknown; contents?: Array<{ text?: string }> }; isError: boolean };
+        const content = event.result?.content ?? event.result?.contents?.map((item) => ({ type: "text", text: item.text }));
+        notifyToolResult(toolHooks, toolHookResult({ callId: event.callId, tool: event.originalToolName,
+          server: event.serverName, args: structuredClone(event.args), source: "mcp" }, event.isError, content));
+      }));
+      const scoped = new Proxy(pi, {
+        get: (target, key, receiver) => key === "registerTool"
+          ? (tool: ToolDefinition) => { tools.add(tool.name); target.registerTool(tool); }
+          : Reflect.get(target, key, receiver),
+      });
+      try {
+        await factory(scoped);
+      } catch (cause) {
+        unsubscribe();
+        this.#runtimes.delete(id);
+        throw cause;
+      }
+    };
+  }
+  status(name: string): McpStatus | undefined {
+    const entries = [...this.#runtimes.values()].flatMap(
+      (statuses) => statuses.get(name) ?? [],
+    );
+    return (
+      entries.find((s) => s.status === "connected") ??
+      entries.find((s) => s.status === "needs-auth") ??
+      entries.at(-1)
+    );
+  }
+  manage(session: AgentSession): () => Promise<void> {
+    const dispose = session.dispose.bind(session);
+    let closing: Promise<void> | undefined;
+    const close = () =>
+      (closing ??= (async () => {
+        try {
+          await shutDownExtensions(session);
+        } finally {
+          dispose();
+          this.#cleanup.delete(close);
+        }
+      })());
+    this.#cleanup.add(close);
+    // Callers that wait for the session to be gone can await this.
+    session.dispose = () => close().catch(() => {});
+    return close;
+  }
+  /**
+   * The `mcp` tool of the active plugin servers, for a coding agent session.
+   * It runs in a session of its own with no model, so the servers, their
+   * settings and their credentials stay in the daemon as they do for Pi.
+   */
+  async tool(
+    config: EffectiveMcpConfig,
+    agentDir: string,
+    guard?: McpGuard,
+    toolHooks?: HostedToolHooks,
+  ): Promise<{ tool: ToolDefinition; close: () => Promise<void> }> {
+    if (this.#closed) throw new Error("MCP host is closed");
+    const settingsManager = SettingsManager.inMemory({ packages: [] });
+    const resourceLoader = new DefaultResourceLoader({
+      cwd: agentDir,
+      agentDir,
+      settingsManager,
+      noExtensions: true,
+      noSkills: true,
+      noPromptTemplates: true,
+      noThemes: true,
+      noContextFiles: true,
+      extensionFactories: [{ name: "plugin-mcp", factory: await this.extension(config, { guard, toolHooks }) }],
+    });
+    await resourceLoader.reload();
+    const { session } = await createAgentSession({
+      cwd: agentDir,
+      agentDir,
+      settingsManager,
+      resourceLoader,
+      noTools: "builtin",
+      sessionManager: SessionManager.inMemory(agentDir),
+    });
+    const close = this.manage(session);
+    try {
+      await session.bindExtensions({ mode: "rpc" });
+    } catch (cause) {
+      await close();
+      throw cause;
+    }
+    const definition = session.getToolDefinition("mcp");
+    if (!definition) {
+      await close();
+      throw new Error("MCP adapter failed to load");
+    }
+    const tool: ToolDefinition = {
+      ...definition,
+      // The coding agent calls the tool directly, past the session's tool_call hook.
+      execute: async (toolCallId, params, signal, onUpdate) => {
+        const reason = await guard?.();
+        if (reason) throw new Error(reason);
+        return definition.execute(
+          toolCallId,
+          params,
+          signal,
+          onUpdate,
+          session.extensionRunner.createToolContext("coding-agent", undefined),
+        );
+      },
+    };
+    return { tool, close };
+  }
+  async probe(
+    key: string,
+    name: string,
+    definition: McpServerDefinition,
+    agentDir: string,
+    action: "test" | "auth-start" | "auth-complete",
+    input?: string,
+  ): Promise<PluginMcpResult> {
+    if (this.#closed) throw new Error("MCP host is closed");
+    const operation = (this.#operations.get(key) ?? Promise.resolve())
+      .catch(() => {})
+      .then(() => this.#probe(key, name, definition, agentDir, action, input));
+    this.#operations.set(key, operation);
+    try {
+      return await operation;
+    } finally {
+      if (this.#operations.get(key) === operation) this.#operations.delete(key);
+    }
+  }
+  async #probe(
+    key: string,
+    name: string,
+    definition: McpServerDefinition,
+    agentDir: string,
+    action: "test" | "auth-start" | "auth-complete",
+    input?: string,
+  ): Promise<PluginMcpResult> {
+    if (this.#closed) throw new Error("MCP host is closed");
+    const signature = createHash("sha256")
+      .update(JSON.stringify(definition))
+      .digest("hex");
+    let runtime = this.#auth.get(key);
+    if (
+      action === "auth-complete" &&
+      runtime &&
+      runtime.signature !== signature
+    ) {
+      clearTimeout(runtime.timer);
+      this.#auth.delete(key);
+      await runtime.close();
+      throw new Error("MCP configuration changed. Start authorization again.");
+    }
+    if (action === "auth-complete" && !runtime)
+      throw new Error("Authorization expired. Start authorization again.");
+    if (action !== "auth-complete") {
+      if (runtime) {
+        clearTimeout(runtime.timer);
+        this.#auth.delete(key);
+        await runtime.close();
+      }
+      const config = {
+        mcpServers: {
+          [name]: {
+            ...definition,
+            disabled: false,
+            lifecycle: "lazy",
+            directTools: false,
+            requestTimeoutMs: 20_000,
+          },
+        },
+      };
+      const settingsManager = SettingsManager.inMemory({ packages: [] });
+      const resourceLoader = new DefaultResourceLoader({
+        cwd: agentDir,
+        agentDir,
+        settingsManager,
+        noExtensions: true,
+        noSkills: true,
+        noPromptTemplates: true,
+        noThemes: true,
+        noContextFiles: true,
+        extensionFactories: [
+          { name: "plugin-mcp", factory: await this.extension(config, { publishStatus: false }) },
+        ],
+      });
+      await resourceLoader.reload();
+      if (resourceLoader.getExtensions().errors.length)
+        throw new Error(JSON.stringify(resourceLoader.getExtensions().errors));
+      const { session } = await createAgentSession({
+        cwd: agentDir,
+        agentDir,
+        settingsManager,
+        resourceLoader,
+        noTools: "builtin",
+        sessionManager: SessionManager.inMemory(agentDir),
+      });
+      const close = this.manage(session);
+      if (this.#closed) {
+        await close();
+        throw new Error("MCP host is closed");
+      }
+      try {
+        await session.bindExtensions({ mode: "rpc" });
+      } catch (cause) {
+        await close();
+        throw cause;
+      }
+      const timer = setTimeout(() => {
+        this.#auth.delete(key);
+        void close().catch(() => {});
+      }, 10 * 60_000);
+      timer.unref();
+      runtime = { session, close, timer, signature };
+    }
+    if (!runtime) throw new Error("MCP runtime unavailable");
+    let keep = false;
+    try {
+      const tool = runtime.session.getToolDefinition("mcp");
+      if (!tool) throw new Error("MCP adapter failed to load");
+      const params =
+        action === "test"
+          ? { connect: name }
+          : { action, server: name, ...(input ? { args: { input } } : {}) };
+      const result = await tool.execute(
+        randomUUID(),
+        params,
+        AbortSignal.timeout(30_000),
+        undefined,
+        runtime.session.extensionRunner.createToolContext(
+          "plugin-probe",
+          undefined,
+        ),
+      );
+      const details = (result.details ?? {}) as Record<string, unknown>;
+      const text = result.content
+        .filter((c) => c.type === "text")
+        .map((c) => c.text)
+        .join("\n");
+      const url =
+        typeof details.authorizationUrl === "string"
+          ? details.authorizationUrl
+          : undefined;
+      if (url) {
+        keep = true;
+        this.#auth.set(key, runtime);
+        return { status: "needs-auth", toolCount: 0, authorizationUrl: url };
+      }
+      // Query machine status after connecting instead of interpreting display text.
+      const statusResult = await tool.execute(
+        randomUUID(),
+        {},
+        AbortSignal.timeout(5_000),
+        undefined,
+        runtime.session.extensionRunner.createToolContext(
+          "plugin-probe",
+          undefined,
+        ),
+      );
+      const statusDetails = statusResult.details as
+        { servers?: McpStatus[] } | undefined;
+      const server = statusDetails?.servers?.find((s) => s.name === name);
+      const authRequired =
+        server?.status === "needs-auth" ||
+        details.error === "needs_auth" ||
+        details.error === "auth_required";
+      return {
+        status:
+          details.authenticated === true || server?.status === "connected"
+            ? "connected"
+            : authRequired
+              ? "needs-auth"
+              : "failed",
+        toolCount: server?.toolCount ?? 0,
+        message: text.slice(0, 4000),
+      };
+    } finally {
+      if (!keep) {
+        clearTimeout(runtime.timer);
+        this.#auth.delete(key);
+        await runtime.close();
+      }
+    }
+  }
+  async close(): Promise<void> {
+    this.#closed = true;
+    for (const runtime of this.#auth.values()) clearTimeout(runtime.timer);
+    this.#auth.clear();
+    await Promise.allSettled([...this.#cleanup].map((close) => close()));
+    await Promise.allSettled([...this.#operations.values()]);
+  }
+}

@@ -1,0 +1,311 @@
+import { useReadyRuntimeGeneration } from "./runtime-connection.js";
+import { FilePlus, FolderOpen, LoaderCircle, RefreshCw } from "./icons.js";
+import { useEffect, useRef, useState } from "react";
+import type { PluginMention, ProjectState, PromptAttachment, PromptImage, PromptMode } from "../shared/contracts.js";
+import { listPluginStarters, listProjects, waitForRuntime } from "./api.js";
+import type { ProjectPluginCommand } from "../shared/plugins.js";
+import { matchesWhen } from "../shared/plugin-when.js";
+import { composerDrafts, homeDraftScope } from "./composer-drafts.js";
+import { commandPrompt, PluginPanelToolbar } from "./project-plugin-contributions.js";
+import { ExampleShelf, useExamples } from "./examples.js";
+import { publishSidebarProjects } from "./sidebar-projects.js";
+import { PageFrame } from "./page-frame.js";
+import { ProjectCard, useProjectActions } from "./project-card.js";
+import { pickProjectFolder, ProjectCreateDialog, type FirstMessage } from "./project-create-dialog.js";
+import { ProjectPromptCreator } from "./project-prompt-creator.js";
+import { PixelTemplateDensityDialog } from "./pixel-template-density-dialog.js";
+import type { PixelArtLevel } from "../shared/canvas-pixel-style.js";
+import { pixelAssetTemplateCategories, type PixelAssetTemplateCategory } from "./asset-canvas-pixel-workflows.js";
+import { templateAssetUrl } from "./template-assets.js";
+import { effectLibraryCoverForLevel } from "./asset-canvas-effect-covers.js";
+import { createdProjectView, type AppNavigationTarget } from "./routes.js";
+import { WindowDragRegion } from "./window-drag-region.js";
+import { useProjectShelfLayout } from "./use-project-shelf-layout.js";
+import { useProjectActivity } from "./use-project-activity.js";
+import { Button } from "./ui/index.js";
+import "./home.css";
+import type { OnboardingStart } from "./onboarding.js";
+import { t } from "./i18n.js";
+
+const PIXEL_TEMPLATE_COVERS: Record<PixelAssetTemplateCategory, string> = {
+  characters: templateAssetUrl("examples/characters-cover.webp"),
+  creatures: templateAssetUrl("examples/creatures-cover.webp"),
+  animation: templateAssetUrl("examples/animation-cover.webp"),
+  scenes: templateAssetUrl("examples/scenes-cover.webp"),
+  terrain: templateAssetUrl("examples/terrain-cover.webp"),
+  objects: templateAssetUrl("examples/objects-cover.webp"),
+  skins: templateAssetUrl("examples/skins-cover.webp"),
+};
+
+interface HomeProps {
+  inert?: boolean;
+  /** Where setup's last step sent the person; Home acts on it once. */
+  start?: OnboardingStart;
+  onStartHandled?: () => void;
+  onNavigate: (page: AppNavigationTarget) => void;
+  onCreate: (project: ProjectState, conversationId: string, prompt: string, mentions: PluginMention[], images: PromptImage[], mode: PromptMode, attachments?: PromptAttachment[]) => void;
+  onOpen: (projectId: string, view?: "design") => void;
+  /** Opens an Asset Canvas project on the node a creation template starts from. */
+  onOpenAssetCanvas: (projectId: string, nodeId?: string) => void;
+}
+
+/** What the new-project dialog opens with, if it is open. */
+interface CreateRequest {
+  firstMessage?: FirstMessage;
+  /** Empties Home's prompt box once the first message has been sent. */
+  clearDraft?: () => void;
+  workspacePath?: string;
+}
+
+// Home is where every project starts: the prompt creates the project at once,
+// with the prompt as its first message, and opens the new-project dialog only
+// when something needs the person; Start blank and Choose project open it.
+/** Plugins' ways to start (`home.starters`), which put their prompt in the box. */
+function PluginStarters() {
+  const generation = useReadyRuntimeGeneration();
+  const [starters, setStarters] = useState<{ plugins: string[]; commands: ProjectPluginCommand[] }>({ plugins: [], commands: [] });
+  useEffect(() => {
+    let active = true;
+    // An answer of another shape, as from a service that predates starters, shows none.
+    void listPluginStarters().catch(() => undefined).then((next) => {
+      if (active) setStarters(Array.isArray(next?.commands) && Array.isArray(next.plugins) ? next : { plugins: [], commands: [] });
+    });
+    return () => { active = false; };
+  }, [generation]);
+  // Outside a project, `when` sees the platform and the plugins a new project starts with.
+  const context = {
+    values: { platform: typeof window === "undefined" ? undefined : window.ohMyGameDesktop?.platform ?? "web" },
+    plugins: new Set(starters.plugins),
+  };
+  const shown = starters.commands.filter((command) => command.slots.some((slot) => matchesWhen(slot.when, context)));
+  return <PluginPanelToolbar commands={shown} onRun={async (command) => {
+    if ("prompt" in command.run) composerDrafts.get(homeDraftScope("home")).insertPrompt(commandPrompt(command.run));
+  }} />;
+}
+
+export function Home({ onNavigate, onCreate, onOpen, onOpenAssetCanvas, inert = false, start, onStartHandled }: HomeProps) {
+  const serviceGeneration = useReadyRuntimeGeneration();
+  const [projects, setProjects] = useState<ProjectState[]>([]);
+  const [phase, setPhase] = useState<"loading" | "ready" | "error">("loading");
+  const activity = useProjectActivity(phase === "ready" && projects.length > 0, setProjects);
+  // Renames, removals and automatic names reach the sidebar too.
+  useEffect(() => { if (phase === "ready") publishSidebarProjects(projects); }, [phase, projects]);
+  const [loadError, setLoadError] = useState<string>();
+  const [importError, setImportError] = useState<string>();
+  const [creating, setCreating] = useState<CreateRequest>();
+  const [templateCreating, setTemplateCreating] = useState<PixelAssetTemplateCategory | "effect-library">();
+  const [templateDensityCategory, setTemplateDensityCategory] = useState<PixelAssetTemplateCategory | "effects">();
+  const [templateError, setTemplateError] = useState<string>();
+  const templateTrigger = useRef<HTMLElement | null>(null);
+  const { examples, covers: exampleCovers } = useExamples();
+  const { sectionRef, columns, recentProjectLimit } = useProjectShelfLayout();
+  const projectActions = useProjectActions(loadProjects);
+  const canImportFolder = !!window.ohMyGameDesktop?.selectProjectDirectory;
+
+  async function loadProjects() {
+    setPhase("loading");
+    setLoadError(undefined);
+    try {
+      await waitForRuntime();
+      const loaded = await listProjects();
+      setProjects(loaded);
+      setPhase("ready");
+    } catch (error) {
+      setLoadError(errorMessage(error));
+      setPhase("error");
+    }
+  }
+
+  useEffect(() => { void loadProjects(); }, [serviceGeneration]);
+
+  // An existing folder opens its project if it has one, or becomes a new project's workspace.
+  async function importFolder(): Promise<void> {
+    setImportError(undefined);
+    try {
+      const picked = await pickProjectFolder();
+      if (!picked) return;
+      if ("owner" in picked) onOpen(picked.owner.id);
+      else setCreating({ workspacePath: picked.path });
+    } catch (error) {
+      setImportError(errorMessage(error));
+    }
+  }
+
+  // Templates make an Asset Canvas project with its starting board and open it there.
+  async function createTemplate(category: PixelAssetTemplateCategory | "effects", level: PixelArtLevel): Promise<void> {
+    setTemplateCreating(category === "effects" ? "effect-library" : category);
+    setTemplateError(undefined);
+    try {
+      const created = category === "effects"
+        ? await (await import("./asset-canvas-templates.js")).createEffectLibraryProject(level)
+        : await (await import("./asset-canvas-template-project.js")).createPixelAssetTemplateProject(category, level);
+      onOpenAssetCanvas(created.projectId, created.nodeId);
+    } catch (error) {
+      setTemplateError(errorMessage(error));
+    } finally {
+      setTemplateCreating(undefined);
+    }
+  }
+
+  useEffect(() => {
+    if (!start || inert) return;
+    onStartHandled?.();
+    if (start === "blank") setCreating({});
+    else if (start === "import") void importFolder();
+    else document.querySelector<HTMLElement>(".home-hero textarea, .home-hero [contenteditable=\"true\"]")?.focus();
+  }, [start, inert]);
+
+  const visibleProjects = projects.slice(0, recentProjectLimit);
+  // Two rows, so every example type has room; Home scrolls when the window is short.
+  const visibleExamples = examples.slice(0, columns * 2);
+
+  // While a prompt's project is being made, the page waits for it rather than lose it.
+  return (
+    <PageFrame active="home" inert={inert || !!creating?.firstMessage} onNavigate={onNavigate}>
+      <main className="home-page">
+        <WindowDragRegion />
+        <div className="home-body">
+          <section className="home-hero">
+            <h1>{t("home.title")}</h1>
+            <ProjectPromptCreator
+              draftKey="home"
+              placeholder={t("home.placeholder")}
+              disabled={!!creating?.firstMessage}
+              onSubmit={(firstMessage, clearDraft) => setCreating({ firstMessage, clearDraft })}
+              starts={<>
+                <Button variant="ghost" size="sm" icon={<FilePlus size={14} />} disabled={!!creating} onClick={() => setCreating({})}>{t("home.startBlank")}</Button>
+                {canImportFolder ? <Button variant="ghost" size="sm" icon={<FolderOpen size={14} />} disabled={!!creating} onClick={() => void importFolder()}>{t("home.importFolder")}</Button> : null}
+                <PluginStarters />
+              </>}
+            />
+            {importError ? <p className="home-notice" role="alert">{importError}</p> : null}
+          </section>
+
+          <section ref={sectionRef} className="home-section home-recent" aria-labelledby="projects-heading">
+            <header className="home-section-head">
+              <h2 id="projects-heading">{t("projects.recent")}</h2>
+              {phase === "error" ? (
+                <Button size="sm" variant="ghost" icon={<RefreshCw size={14} />} onClick={() => void loadProjects()}>{t("common.retry")}</Button>
+              ) : projects.length ? (
+                <Button size="sm" variant="ghost" onClick={() => onNavigate("projects")}>{t("home.allProjects")}</Button>
+              ) : null}
+            </header>
+
+            {phase === "loading" ? <ProjectGridSkeleton count={recentProjectLimit} /> : null}
+            {phase === "error" ? <p className="home-project-state" role="alert">{loadError}</p> : null}
+            {phase === "ready" && projects.length === 0 ? <p className="home-project-state">{t("projects.none")}</p> : null}
+            {phase === "ready" && projects.length > 0 ? (
+              <div className="home-grid">
+                {visibleProjects.map((project) => (
+                  <ProjectCard
+                    key={project.id}
+                    project={project}
+                    agentStatus={activity.get(project.id)}
+                    onOpen={() => onOpen(project.id)}
+                    actions={projectActions.actionsFor(project)}
+                  />
+                ))}
+              </div>
+            ) : null}
+            {projectActions.error ? <p className="home-notice" role="alert">{projectActions.error}</p> : null}
+          </section>
+
+          {visibleExamples.length > 0 ? <section className="home-section home-explore" aria-labelledby="home-examples-heading">
+            <header className="home-section-head">
+              <h2 id="home-examples-heading">{t("home.explore")}</h2>
+              <Button size="sm" variant="ghost" onClick={() => onNavigate("community")}>{t("home.toCommunity")}</Button>
+            </header>
+            <ExampleShelf examples={visibleExamples} covers={exampleCovers} showType onOpenProject={onOpen} />
+          </section> : null}
+
+          <section className="home-section home-explore home-templates" aria-labelledby="home-templates-heading">
+            <header className="home-section-head">
+              <h2 id="home-templates-heading">{t("home.templates")}</h2>
+            </header>
+            <div className="home-whats-new-grid">
+              {pixelAssetTemplateCategories().map((category) => (
+                <button
+                  className="home-whats-new-item home-template-card"
+                  type="button"
+                  key={category.id}
+                  disabled={templateCreating !== undefined}
+                  aria-busy={templateCreating === category.id}
+                  onClick={(event) => {
+                    templateTrigger.current = event.currentTarget;
+                    setTemplateDensityCategory(category.id);
+                  }}
+                >
+                  <span className="home-whats-new-icon home-explore-cover">
+                    <img src={PIXEL_TEMPLATE_COVERS[category.id]} alt="" />
+                    {templateCreating === category.id ? <span className="home-template-loading"><LoaderCircle className="spin" size={16} /></span> : null}
+                  </span>
+                  <span className="home-whats-new-copy">
+                    <strong>{category.label}</strong>
+                    <small>{category.description}</small>
+                  </span>
+                </button>
+              ))}
+              <button
+                className="home-whats-new-item home-template-card home-effect-template-card"
+                type="button"
+                disabled={templateCreating !== undefined}
+                aria-busy={templateCreating === "effect-library"}
+                onClick={(event) => {
+                  templateTrigger.current = event.currentTarget;
+                  setTemplateDensityCategory("effects");
+                }}
+              >
+                <span className="home-whats-new-icon home-explore-cover">
+                  <img src={effectLibraryCoverForLevel()} alt="" />
+                  {templateCreating === "effect-library" ? <span className="home-template-loading"><LoaderCircle className="spin" size={16} /></span> : null}
+                </span>
+                <span className="home-whats-new-copy">
+                  <strong>{t("effectLibrary.title")}</strong>
+                  <small>{t("effectLibrary.cardDescription")}</small>
+                </span>
+              </button>
+            </div>
+            {templateError ? <p className="home-notice" role="alert">{templateError}</p> : null}
+          </section>
+        </div>
+      </main>
+      {projectActions.dialogs}
+      {templateDensityCategory ? <PixelTemplateDensityDialog
+        category={templateDensityCategory}
+        returnFocus={templateTrigger.current}
+        onClose={() => setTemplateDensityCategory(undefined)}
+        onConfirm={(level) => {
+          setTemplateDensityCategory(undefined);
+          void createTemplate(templateDensityCategory, level);
+        }}
+      /> : null}
+      {creating ? <ProjectCreateDialog
+        firstMessage={creating.firstMessage}
+        direct={!!creating.firstMessage}
+        initialWorkspacePath={creating.workspacePath}
+        onClose={() => setCreating(undefined)}
+        onOpenProject={(projectId) => { setCreating(undefined); onOpen(projectId); }}
+        onCreated={(project, start) => {
+          setCreating(undefined);
+          if (start) {
+            creating.clearDraft?.();
+            onCreate(project, start.conversationId, start.prompt, start.mentions, [], start.mode, start.attachments);
+          }
+          else onOpen(project.id, createdProjectView(project.type));
+        }}
+      /> : null}
+    </PageFrame>
+  );
+}
+
+function ProjectGridSkeleton({ count }: { count: number }) {
+  return (
+    <div className="home-grid" aria-label={t("projects.loading")}>
+      {Array.from({ length: count }, (_, item) => <div className="home-project-skeleton" key={item} />)}
+    </div>
+  );
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}

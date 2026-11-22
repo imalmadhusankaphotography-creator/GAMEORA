@@ -1,0 +1,1648 @@
+import { createHash, generateKeyPairSync, sign as sign_ } from "node:crypto";
+import { createWriteStream } from "node:fs";
+import { pipeline } from "node:stream/promises";
+import { ZipFile } from "yazl";
+import { capabilityGrants } from "../src/daemon/project-plugins.js";
+import { PluginServices } from "../src/daemon/plugin-services.js";
+import { availableUpdates, downloadRelease, installRelease, readCatalog, releaseMessage } from "../src/daemon/plugin-releases.js";
+import { compileWhen, matchesWhen } from "../src/shared/plugin-when.js";
+import { colorMatrixValues, isPreviewColorFilter } from "../src/shared/preview-filter.js";
+import { compileInputMap, isGamepadKeyMap } from "../src/shared/preview-input.js";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
+import {
+  cp,
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  rm,
+  stat,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  PLUGIN_INDEX_SCHEMA_VERSION,
+  PluginIndex,
+  indexPluginPackage,
+  localizePluginString,
+} from "../src/daemon/plugin-index.js";
+import {
+  PLUGIN_HOST_API_VERSION,
+  pluginApiIssue,
+  pluginUiIssue,
+  satisfiesVersionRange,
+  toolSchemaIssues,
+  validatePluginManifest,
+} from "../src/shared/plugin-manifest.js";
+import { pluginUiSupportIssues } from "../src/shared/plugin-ui-versions.js";
+import {
+  PLUGIN_SCHEMA_FILE,
+  pluginSchemaJson,
+} from "../scripts/plugin-schema.js";
+
+it("accepts bounded static instructions and tool hooks, refusing dynamic instructions", () => {
+  const manifest = { id: "acme/maker", version: "1.0.0", displayName: "Maker", description: "Makes games", engines: { "ohmygame-api": "^2.5.0" }, contributes: { instructions: "Keep names." } };
+  expect(validatePluginManifest(manifest).ok).toBe(true);
+  for (const instructions of [" ", "x".repeat(8001), { file: "instructions.md" }])
+    expect(validatePluginManifest({ ...manifest, contributes: { instructions } }).ok).toBe(false);
+  expect(validatePluginManifest({ ...manifest, contributes: { instructions: "x".repeat(8000) } }).ok).toBe(true);
+  expect(validatePluginManifest({ ...manifest, entrypoints: { native: "./index.mjs" }, capabilities: { native: true }, contributes: { hooks: ["tool.beforeCall", "tool.afterCall"] } }).ok).toBe(true);
+});
+
+const FIXTURES = path.join(import.meta.dirname, "fixtures/plugins");
+const BUNDLED = path.join(import.meta.dirname, "../.runtime/preinstalled-plugin-sources");
+
+const cleanup: string[] = [];
+afterEach(async () => {
+  await Promise.all(
+    cleanup.splice(0).map((dir) => rm(dir, { recursive: true, force: true })),
+  );
+});
+
+async function temporary() {
+  const dir = await mkdtemp(path.join(tmpdir(), "ohmygame-plugin-v2-"));
+  cleanup.push(dir);
+  return dir;
+}
+
+/** The Solarized example, copied so a test can change it. */
+async function solarized() {
+  const dir = path.join(await temporary(), "solarized");
+  await cp(path.join(FIXTURES, "solarized"), dir, { recursive: true });
+  return dir;
+}
+
+/** Game Studio: the bundled skills and icon with the new manifest. */
+async function gameStudio() {
+  const dir = path.join(await temporary(), "game-studio");
+  await cp(path.join(BUNDLED, "game-studio"), dir, { recursive: true });
+  await cp(path.join(FIXTURES, "game-studio"), dir, { recursive: true });
+  return dir;
+}
+
+async function editManifest(dir: string, edit: (manifest: any) => void) {
+  const file = path.join(dir, ".ohmygame-plugin/plugin.json");
+  const manifest = JSON.parse(await readFile(file, "utf8"));
+  edit(manifest);
+  await writeFile(file, JSON.stringify(manifest));
+}
+
+const minimal = {
+  id: "someone/example",
+  version: "1.0.0",
+  engines: { "ohmygame-api": "^2.0.0" },
+  displayName: "Example",
+  description: "An example.",
+};
+
+const messages = (value: unknown) => {
+  const result = validatePluginManifest(value);
+  return result.ok
+    ? []
+    : result.issues.map((issue) => `${issue.path} ${issue.message}`);
+};
+
+/** Where the manifest says something this app leaves out. */
+const ignored = (value: unknown) => (validatePluginManifest(value).ignored ?? []).map((issue) => issue.path);
+
+describe("plugin manifest", () => {
+  it("publishes a JSON Schema that matches its source", async () => {
+    expect(await readFile(PLUGIN_SCHEMA_FILE, "utf8")).toBe(pluginSchemaJson());
+  });
+
+  it("accepts a minimal manifest", () => {
+    expect(messages(minimal)).toEqual([]);
+  });
+
+  it("takes a brand colour for pages, one or one per appearance", () => {
+    expect(messages({ ...minimal, ui: { accent: "#00d8c4" } })).toEqual([]);
+    expect(messages({ ...minimal, ui: { accent: { light: "#00857a", dark: "#00D8C4" } } })).toEqual([]);
+    expect(messages({ ...minimal, ui: { accent: "teal" } })).not.toEqual([]);
+    expect(messages({ ...minimal, ui: { accent: { dim: "#00d8c4" } } })).toEqual([]);
+    expect(ignored({ ...minimal, ui: { accent: { dim: "#00d8c4" } } })).toEqual(["/ui/accent/dim"]);
+  });
+
+  it("lets pages that can read the project's files import its modules", () => {
+    const panels = [{ id: "main", title: "Main", area: "center", entry: "./panel/index.html" }];
+    const page = (capabilities: object, withPanels = true, projectModules = ["./fx/"]) => ({
+      ...minimal, icon: "./assets/icon.svg", capabilities, ui: { projectModules },
+      ...(withPanels ? { contributes: { panels } } : {}),
+    });
+    expect(messages(page({ "project.files": "read" }))).toEqual([]);
+    // The page server serves no hidden path.
+    expect(messages(page({ "project.files": "read" }, true, ["./fx/", "./.maker/fx/"]))).toEqual(["/ui/projectModules/1 pages can't import modules from a hidden folder"]);
+    // The folders its pages run code from are asked for, as hosts are.
+    expect(capabilityGrants(page({ "project.files": "read" }, true, ["./fx/", "levels/scripts"]) as never)).toEqual(["modules:fx", "modules:levels/scripts", "project.files:read"]);
+    expect(messages(page({}))).toEqual(["/ui/projectModules pages import the project's modules with the project.files capability"]);
+    expect(messages(page({ "project.files": "read" }, false))).toEqual(["/ui/projectModules only pages import modules, and the plugin has no panels"]);
+  });
+
+  it("opens a panel with a state its page hears, as long as it is small JSON", () => {
+    const panels = [{ id: "main", title: "Main", area: "center", entry: "./panel/index.html" }];
+    const opening = (state: unknown) => ({
+      ...minimal, icon: "./assets/icon.svg",
+      contributes: { panels, commands: [{ id: "ricochet", title: "Show Ricochet", run: { openPanel: "main", state } }] },
+    });
+    expect(messages(opening({ effect: "impacts/ricochet" }))).toEqual([]);
+    expect(messages(opening(undefined))).toEqual([]);
+    expect(messages(opening({ notes: "x".repeat(20_000) }))).toEqual(["/contributes/commands/0/run/state a panel's state is at most 16,000 characters of JSON"]);
+  });
+
+  it("keeps panel.toolbar to plugins with a panel and commands without input", () => {
+    const panels = [{ id: "main", title: "Main", area: "center", entry: "./panel/index.html" }];
+    const toolbar = (run: unknown, withPanels = true) => ({
+      ...minimal,
+      icon: "./assets/icon.svg",
+      entrypoints: { native: "./native/index.mjs" },
+      capabilities: { native: true },
+      contributes: { ...(withPanels ? { panels } : {}), commands: [{ id: "go", title: "Go", run, slots: [{ slot: "panel.toolbar" }] }] },
+    });
+    expect(messages(toolbar({ native: "go" }))).toEqual([]);
+    expect(messages(toolbar({ native: "go", input: "./schemas/go.json" }))).toEqual(["/contributes/commands/0/slots/0/slot a toolbar button has no input to give this command"]);
+    expect(messages(toolbar({ native: "go" }, false))).toEqual(["/contributes/commands/0/slots/0/slot panel.toolbar needs a panel"]);
+  });
+
+  it("warns about a settings status row its plugin can't answer, without refusing the plugin", () => {
+    const settings = { groups: [{ rows: [{ widget: "status" }] }] };
+    // Published before this was checked, as Godot 1.0.1 was: it still loads.
+    expect(validatePluginManifest({ ...minimal, contributes: { settings } }).ok).toBe(true);
+    expect(ignored({ ...minimal, contributes: { settings } })).toEqual(["/contributes/settings/groups/0/rows/0"]);
+    const native = { ...minimal, entrypoints: { native: "./index.mjs" }, capabilities: { native: true } };
+    const commands = [{ id: "settings-status", title: "Status", run: { native: "status", changesFiles: false } }];
+    expect(ignored({ ...native, contributes: { commands, settings } })).toEqual([]);
+    // A status read must not change files or build.
+    expect(ignored({ ...native, contributes: { commands: [{ ...commands[0], run: { native: "status" } }], settings } })).toEqual(["/contributes/settings/groups/0/rows/0"]);
+  });
+
+  it("leaves out fields it doesn't know, and says where", () => {
+    // A newer plugin API's field, or a typo: the plugin still loads, without it.
+    const result = validatePluginManifest({ ...minimal, interface: { displayName: "X" }, contributes: { panelz: [] } });
+    expect(result.ok && result.manifest).toEqual({ ...minimal, contributes: {} });
+    expect(ignored({ ...minimal, interface: { displayName: "X" }, contributes: { panelz: [] } })).toEqual(["/interface", "/contributes/panelz"]);
+    // Unknown fields don't excuse known ones that are wrong.
+    expect(messages({ ...minimal, interface: {}, displayName: 3 })).toContainEqual(expect.stringMatching(/^\/displayName /));
+    // Categories and hooks a newer app adds are left out; when none is left, so is the list.
+    expect(validatePluginManifest({ ...minimal, categories: ["art", "holograms"] })).toMatchObject({ ok: true, manifest: { categories: ["art"] } });
+    expect(validatePluginManifest({ ...minimal, categories: ["holograms"] })).toMatchObject({ ok: true, manifest: minimal });
+    expect(ignored({ ...minimal, categories: ["holograms"] })).toEqual(["/categories/0"]);
+    // A list that was empty to begin with is still wrong.
+    expect(validatePluginManifest({ ...minimal, categories: [] }).ok).toBe(false);
+    // Keywords: up to eight, each up to 30 characters, none twice.
+    expect(validatePluginManifest({ ...minimal, keywords: ["LLM", "%keyword.cn%"] })).toMatchObject({ ok: true, manifest: { keywords: ["LLM", "%keyword.cn%"] } });
+    expect(validatePluginManifest({ ...minimal, keywords: Array.from({ length: 9 }, (_, index) => `k${index}`) }).ok).toBe(false);
+    expect(validatePluginManifest({ ...minimal, keywords: ["x".repeat(31)] }).ok).toBe(false);
+    expect(validatePluginManifest({ ...minimal, keywords: ["a", "a"] }).ok).toBe(false);
+    expect(validatePluginManifest({ ...minimal, contributes: { hooks: [] } }).ok).toBe(false);
+    // A value that could be either of two forms keeps what it doesn't know, so it still fails.
+    expect(messages({ ...minimal, contributes: { commands: [{ id: "both", title: "Both", run: { prompt: "Hi", tool: "x" } }] } })).not.toEqual([]);
+    // A record's keys are its data, not fields to leave out.
+    expect(messages({ ...minimal, configuration: { "Bad-Key": { type: "text", title: "Bad" } } })).not.toEqual([]);
+    expect(messages({ ...minimal, id: "example" })).toContainEqual(
+      expect.stringMatching(/^\/id /),
+    );
+    // Files left in projects are named inside the project.
+    expect(messages({ ...minimal, projectFiles: ["./.maker/", "./maker.json"] })).toEqual([]);
+    expect(messages({ ...minimal, projectFiles: ["../outside"] })).toContainEqual(expect.stringMatching(/^\/projectFiles\/0 /));
+  });
+
+  it("checks rules the schema can't express", () => {
+    expect(
+      messages({ ...minimal, entrypoints: { native: "./native/index.js" } }),
+    ).toEqual([
+      "/capabilities/native a native entrypoint needs the native capability",
+    ]);
+    expect(
+      messages({
+        ...minimal,
+        contributes: {
+          tools: [{ name: "run", description: "Runs.", input: "./run.json" }],
+          commands: [{ id: "go", title: "Go", run: { tool: "missing" } }],
+        },
+      }),
+    ).toEqual([
+      "/contributes/tools tools run in the native entrypoint unless they name the panel that answers them",
+      "/contributes/commands/0/run/tool no tool named missing",
+    ]);
+    // A tool a panel's page answers needs no native code, only that panel.
+    const panel = { id: "main", title: "Main", area: "right", entry: "./ui/panel.html" };
+    expect(messages({
+      ...minimal,
+      icon: "./icon.png",
+      contributes: { panels: [panel], tools: [{ name: "select", description: "Selects.", input: "./select.json", panel: "main" }] },
+    })).toEqual([]);
+    expect(messages({
+      ...minimal,
+      icon: "./icon.png",
+      contributes: {
+        panels: [panel],
+        tools: [
+          { name: "select", description: "Selects.", input: "./select.json", panel: "other" },
+          { name: "render", description: "Renders.", input: "./render.json" },
+        ],
+      },
+    })).toEqual([
+      "/contributes/tools tools run in the native entrypoint unless they name the panel that answers them",
+      "/contributes/tools/0/panel no panel other",
+    ]);
+    expect(
+      messages({
+        ...minimal,
+        configuration: {
+          token: { type: "secret", title: "Token", default: "x" },
+          mode: { type: "select", title: "Mode", options: ["a"], default: "b" },
+        },
+      }),
+    ).toEqual([
+      "/configuration/token/default a secret can't have a default",
+      "/configuration/mode/default must be one of the options",
+    ]);
+    expect(
+      messages({
+        ...minimal,
+        configuration: { region: { type: "text", title: "Region" } },
+        contributes: {
+          providers: [
+            {
+              id: "relay",
+              title: "Relay",
+              api: "openai-completions",
+              baseUrl: "https://relay.example/v1",
+              apiKey: "region",
+            },
+          ],
+        },
+      }),
+    ).toEqual([
+      "/contributes/providers/0/apiKey must name a secret configuration field",
+      "/contributes/providers/0 list models or discover them",
+    ]);
+    // Media (API 2.5.0): a provider may make only media, through an adapter that reaches approved hosts.
+    const media = { adapter: "./media.js", image: { models: [{ id: "kolors", resolutions: ["1K"], aspectRatios: ["1:1"] }] } };
+    const keyed = { configuration: { key: { type: "secret", title: "Key" } } };
+    expect(messages({ ...minimal, ...keyed, capabilities: { network: ["api.flow.example"] },
+      contributes: { providers: [{ id: "flow", title: "Flow", apiKey: "key", media: { ...media, auth: { query: "key" } } }] } })).toEqual([]);
+    expect(messages({ ...minimal, contributes: { providers: [{ id: "flow", title: "Flow", media }] } })).toEqual([
+      "/contributes/providers/0/media media needs capabilities.network, the hosts its adapter reaches",
+    ]);
+    expect(messages({ ...minimal, contributes: { providers: [{ id: "flow", title: "Flow", api: "openai-completions", discoverModels: true }] } })).toEqual([
+      "/contributes/providers/0 chat needs both api and baseUrl",
+    ]);
+    expect(messages({ ...minimal, contributes: { providers: [{ id: "flow", title: "Flow", discoverModels: true }] } })).toEqual([
+      "/contributes/providers/0 models and discoverModels are for chat, which needs api and baseUrl",
+      "/contributes/providers/0 a provider needs chat (api and baseUrl) or media",
+    ]);
+    expect(messages({ ...minimal, capabilities: { network: ["api.flow.example"] }, contributes: { providers: [{ id: "flow", title: "Flow", media: { adapter: "./media.js" } }] } })).toEqual([
+      "/contributes/providers/0/media list what it makes: image, video, audio or 3d",
+    ]);
+    const cutoutManifest = (backgroundRemoval: unknown) => ({ ...minimal, capabilities: { network: ["api.flow.example"] }, contributes: { providers: [{ id: "flow", title: "Flow", media: { ...media, image: { ...media.image, backgroundRemoval } } }] } });
+    expect(messages(cutoutManifest({ id: "cutout", title: "Remove background" }))).toEqual([]);
+    expect(messages(cutoutManifest({ id: "kolors" }))).toContain("/contributes/providers/0/media/image/backgroundRemoval/id must differ from generation model IDs");
+    expect(messages(cutoutManifest({ id: "cutout", data: { huge: "x".repeat(5000) } })).length).toBeGreaterThan(0);
+    const imageManifest = (options: object) => ({ ...minimal, capabilities: { network: ["api.flow.example"] }, contributes: { providers: [{ id: "flow", title: "Flow", media: { ...media, image: { ...media.image, ...options } } }] } });
+    expect(messages(imageManifest({ recoverable: true, maxMinutes: 120 }))).toEqual([]);
+    expect(messages(imageManifest({ maxMinutes: 15 }))).toContain("/contributes/providers/0/media/image/maxMinutes requires recoverable image generation");
+    for (const options of [{ recoverable: false }, { recoverable: true, maxMinutes: 0 }, { recoverable: true, maxMinutes: 121 }])
+      expect(messages(imageManifest(options)).length).toBeGreaterThan(0);
+    const workflowManifest = (configuration: object, keys: string[], recoverable = true) => ({
+      ...imageManifest({ recoverable, configuration: keys }), configuration,
+    });
+    const workflowConfig = { workflow: { type: "json", title: "Workflow", default: "{}" }, key: { type: "secret", title: "Key" }, folder: { type: "path", title: "Folder" } };
+    expect(messages(workflowManifest(workflowConfig, ["workflow"]))).toEqual([]);
+    for (const keys of [["key"], ["folder"], ["unknown"], ["workflow", "workflow"], []])
+      expect(messages(workflowManifest(workflowConfig, keys)).length).toBeGreaterThan(0);
+    expect(messages(workflowManifest(workflowConfig, ["workflow"], false)).length).toBeGreaterThan(0);
+    for (const value of ["[]", "null", "{broken", JSON.stringify({ text: "森".repeat(90_000) })])
+      expect(messages(workflowManifest({ workflow: { type: "json", title: "Workflow", default: value } }, ["workflow"])).length).toBeGreaterThan(0);
+    const dimensions = (extra: object) => imageManifest({ models: [{ id: "workflow", resolutions: [], aspectRatios: [], supportsResolution: false, supportsAspectRatio: false, ...extra }] });
+    expect(messages(dimensions({}))).toEqual([]);
+    for (const extra of [{ supportsResolution: true }, { supportsAspectRatio: true }, { resolutions: ["1K"] }, { aspectRatios: ["1:1"] }])
+      expect(messages(dimensions(extra)).length).toBeGreaterThan(0);
+    // API 2.30: required references and their size limit.
+    const referenceModel = (fields: object) => imageManifest({ models: [{ id: "rig", resolutions: ["1K"], aspectRatios: ["1:1"], ...fields }] });
+    expect(messages(referenceModel({ minReferenceImages: 1, maxReferenceImages: 1, maxReferenceImageDimension: 256 }))).toEqual([]);
+    expect(messages(referenceModel({ maxReferenceImages: 1, promptOptionalWithReference: true }))).toEqual([]);
+    expect(messages(referenceModel({ minReferenceImages: 2, maxReferenceImages: 1 }))).toContain("/contributes/providers/0/media/image/models/0/minReferenceImages must not be more than maxReferenceImages");
+    expect(messages(referenceModel({ maxReferenceImageDimension: 256 }))).toContain("/contributes/providers/0/media/image/models/0/maxReferenceImageDimension requires maxReferenceImages greater than zero");
+    expect(messages(referenceModel({ promptOptionalWithReference: true }))).toContain("/contributes/providers/0/media/image/models/0/promptOptionalWithReference requires maxReferenceImages greater than zero");
+    for (const fields of [{ minReferenceImages: 17, maxReferenceImages: 16 }, { maxReferenceImages: 1, maxReferenceImageDimension: 15 }, { maxReferenceImages: 1, maxReferenceImageDimension: 4097 }])
+      expect(messages(referenceModel(fields)).length).toBeGreaterThan(0);
+    // Audio and 3D: what each model makes and takes.
+    const audio = { models: [{ id: "voice", kinds: ["speech"], readsText: true, voices: [{ id: "amy", name: "Amy" }], formats: ["mp3", "wav"] }, { id: "sfx", kinds: ["sound-effect"], minDurationSeconds: 1, maxDurationSeconds: 20 }] };
+    for (const channels of [[1], [2], [1, 2], [], [0], [3], [1, 1], ["1"]]) {
+      const issues = messages({ ...minimal, capabilities: { network: ["api.flow.example"] }, contributes: { providers: [{ id: "flow", title: "Flow", media: { adapter: "./media.js", audio: { models: [{ id: "speech", kinds: ["speech"], channels }] } } }] } });
+      if (channels.length && channels.every(value => value === 1 || value === 2) && new Set(channels).size === channels.length)
+        expect(issues).toEqual([]);
+      else expect(issues.some(issue => issue.includes("channels"))).toBe(true);
+    }
+    const voiceSettings = (type: string, listVoices = false) => messages({ ...minimal,
+      configuration: { speaker: { type, title: "Default voice", ...(type === "select" ? { options: ["amy"] } : {}) } },
+      capabilities: { network: ["api.flow.example"] }, contributes: { providers: [{ id: "flow", title: "Flow", media: { adapter: "./media.js", audio: { ...audio, defaultVoiceSetting: "speaker", listVoices } } }] },
+    });
+    expect(voiceSettings("text")).toEqual([]);
+    expect(voiceSettings("select")).toEqual([]);
+    for (const type of ["secret", "boolean", "path"])
+      expect(voiceSettings(type)).toContain("/contributes/providers/0/media/audio/defaultVoiceSetting must name a text or select configuration field");
+    expect(voiceSettings("text", true)).toContain("/contributes/providers/0/media/audio/defaultVoiceSetting account voices require an explicit voice selection");
+    const audioSettings = (keys: string[]) => messages({ ...minimal, configuration: workflowConfig,
+      capabilities: { network: ["api.flow.example"] }, contributes: { providers: [{ id: "flow", title: "Flow", media: { adapter: "./media.js", audio: { ...audio, configuration: keys } } }] },
+    });
+    expect(audioSettings(["workflow"])).toEqual([]);
+    for (const keys of [["key"], ["folder"], ["unknown"], ["workflow", "workflow"], [], Array.from({ length: 17 }, (_, i) => `field${i}`)])
+      expect(audioSettings(keys).length).toBeGreaterThan(0);
+    const model3D = { maxMinutes: 30, models: [{ id: "mesh", operations: ["text", "image"], maxReferenceImages: 4, polycount: { min: 1000, max: 50000, default: 10000, presets: [5000, 10000] }, texture: true, pbr: true }] };
+    const mediaOf = (extra: object) => messages({ ...minimal, capabilities: { network: ["api.flow.example"] }, contributes: { providers: [{ id: "flow", title: "Flow", media: { adapter: "./media.js", ...extra } }] } });
+    expect(mediaOf({ audio, "3d": model3D })).toEqual([]);
+    expect(mediaOf({ audio: { models: [{ id: "scribe", kinds: [], transcribes: true }] } })).toEqual([]);
+    expect(mediaOf({ audio: { models: [{ id: "empty", kinds: [] }] } })).not.toEqual([]);
+    expect(mediaOf({ audio: { models: [{ id: "empty", kinds: [], transcribes: false }] } })).not.toEqual([]);
+    const speechLimits = { ...audio.models[0], maxTextCharacters: 40_000, speedRange: [-30, 20], languages: ["en", "zh"], sampleRatesByFormat: { mp3: [44100], wav: [8000, 24000] } };
+    const speechOptions = { speaker: true, pitch: true, volume: true, style: true, ssml: true, speechOptions: true };
+    expect(mediaOf({ audio: { models: [{ ...speechLimits, ...speechOptions }] } })).toEqual([]);
+    expect(mediaOf({ audio: { models: [{ ...audio.models[1], speaker: true, speedRange: [-50, 100] }] } })).toEqual([]);
+    for (const key of Object.keys(speechOptions))
+      expect(mediaOf({ audio: { models: [{ ...speechLimits, [key]: "yes" }] } }).length).toBeGreaterThan(0);
+    for (const key of ["ssml", "speechOptions"])
+      expect(mediaOf({ audio: { models: [{ ...audio.models[1], [key]: true }] } })).toContain(`/contributes/providers/0/media/audio/models/0/${key} requires a model that reads text`);
+    expect(mediaOf({ audio: { models: [speechLimits, { ...audio.models[1], minDurationSeconds: 0.5 }] } })).toEqual([]);
+    for (const invalid of [{ maxTextCharacters: 40_001 }, { minDurationSeconds: 0 }, { speedRange: [20, -30] }, { speedRange: [-51, 20] }, { speedRange: [0.5, 20] }, { speedRange: [-30] }, { languages: [] }, { sampleRatesByFormat: { wav: [12345] } }, { sampleRatesByFormat: { mp3: [] } }, { sampleRatesByFormat: { ogg_opus: [48000] } }])
+      expect(mediaOf({ audio: { models: [{ ...speechLimits, ...invalid }] } }).length).toBeGreaterThan(0);
+    expect(mediaOf({ audio: { ...audio, listVoices: true } })).toEqual([]);
+    expect(mediaOf({ audio: { ...audio, listVoices: "yes" } }).length).toBeGreaterThan(0);
+    for (const count of [48, 50]) {
+      expect(mediaOf({ "3d": { models: [{ ...model3D.models[0], polycount: { min: count, max: count, default: count, presets: [count] } }] } })).toEqual([]);
+    }
+    expect(mediaOf({ "3d": { models: [{ ...model3D.models[0], polycount: { min: 47, max: 100, default: 100 } }] } }).length).toBeGreaterThan(0);
+    expect(mediaOf({ "3d": { ...model3D, editableModels: true, models: [{ ...model3D.models[0], referenceImageLabels: ["Front", "Left"], maxReferenceImages: 1, modelSettings: { imageOperation: "image-to-3d", modelType: "smart-topology" } }] } })).toEqual([]);
+    expect(mediaOf({ "3d": { ...model3D, editableModels: "yes" } }).length).toBeGreaterThan(0);
+    expect(mediaOf({ "3d": { models: [{ ...model3D.models[0], modelSettings: { imageOperation: "image-to-3d", modelType: "standard" } }] } })).toContain("/contributes/providers/0/media/3d/models/0/modelSettings single-image models take exactly one reference image");
+    expect(mediaOf({ "3d": { models: [{ ...model3D.models[0], modelSettings: { imageOperation: "multi-image-to-3d", modelType: "smart-topology" } }] } })).toContain("/contributes/providers/0/media/3d/models/0/modelSettings smart topology requires a single-image model");
+    expect(mediaOf({ "3d": { ...model3D, balance: true } })).toEqual([]);
+    expect(mediaOf({ "3d": { ...model3D, balance: "yes" } }).length).toBeGreaterThan(0);
+    expect(mediaOf({ "3d": { ...model3D, inputFiles: true } })).toEqual([]);
+    const processing = { ...model3D.models[0], id: "connection", operations: ["remesh", "retexture"], optionProfile: "meshy" };
+    expect(mediaOf({ "3d": { ...model3D, inputFiles: true, processing } })).toEqual([]);
+    const ignoredMode = validatePluginManifest({ ...minimal, capabilities: { network: ["api.flow.example"] }, contributes: { providers: [{ id: "flow", title: "Flow", media: { adapter: "./media.js", "3d": { ...model3D, inputFiles: true, processing: { ...processing, modelSettings: { imageOperation: "multi-image-to-3d", modelType: "standard" } } } } }] } });
+    expect(ignoredMode.ignored).toContainEqual(expect.objectContaining({ path: "/contributes/providers/0/media/3d/processing/modelSettings" }));
+    expect(mediaOf({ "3d": { ...model3D, inputFiles: true, processing: { ...processing, operations: ["animate"], animationSourceAxis: "+Z" } } })).toEqual([]);
+    expect(mediaOf({ "3d": { ...model3D, inputFiles: true, processing: { ...processing, animationSourceAxis: "+Z" } } })).toEqual(["/contributes/providers/0/media/3d/processing/animationSourceAxis requires animate"]);
+    expect(mediaOf({ "3d": { ...model3D, processing } })).toEqual(["/contributes/providers/0/media/3d/processing processing requires inputFiles"]);
+    expect(mediaOf({ "3d": { ...model3D, inputFiles: true, processing: { ...processing, id: "mesh" } } })).toEqual(["/contributes/providers/0/media/3d/processing/id must differ from generation model IDs"]);
+    expect(mediaOf({ "3d": { ...model3D, inputFiles: true, processing: { ...processing, texture: false, defaults: { texture: true, pbr: false } } } })).toEqual(["/contributes/providers/0/media/3d/processing/defaults defaults must be supported by texture and pbr capabilities"]);
+    expect(mediaOf({ "3d": { ...model3D, inputFiles: true, processing: { ...processing, polycount: { min: 100, max: 500, default: 1000 } } } })).toEqual(["/contributes/providers/0/media/3d/processing/polycount needs min ≤ default and presets ≤ max"]);
+
+    expect(mediaOf({ audio: { models: [{ ...audio.models[0], readsText: false }, { ...audio.models[1], minDurationSeconds: 30 }] } })).toEqual([
+      "/contributes/providers/0/media/audio/models/0/voices voices are for a model that reads text",
+      "/contributes/providers/0/media/audio/models/1/minDurationSeconds must not be more than maxDurationSeconds",
+    ]);
+    expect(mediaOf({ "3d": { models: [{ ...model3D.models[0], polycount: { min: 1000, max: 50000, default: 10000, presets: [60000] } }] } })).toEqual([
+      "/contributes/providers/0/media/3d/models/0/polycount needs min ≤ default and presets ≤ max",
+    ]);
+    expect(validatePluginManifest({ ...minimal, capabilities: { network: ["api.flow.example"] },
+      contributes: { providers: [{ id: "flow", title: "Flow", media: { adapter: "./media.js", "3d": { models: [{ ...model3D.models[0], operations: ["remesh"] }] } } }] } }).ok).toBe(false);
+    // A kind may list more of the vendor's models; a model may carry the adapter's own data, up to 4 KB.
+    const image = { discoverModels: true, models: [{ id: "kolors", resolutions: ["1K"], aspectRatios: ["1:1"], description: "Fast", data: { size: "image_size" } }] };
+    expect(mediaOf({ image })).toEqual([]);
+    expect(mediaOf({ image: { models: [{ ...image.models[0], data: { blob: "x".repeat(5000) } }] } })).toEqual([
+      "/contributes/providers/0/media/image/models/0/data must be at most 4 KB as JSON",
+    ]);
+    // Video: lengths, resolutions and ratios it makes, and how it uses pictures.
+    const video = { maxMinutes: 60, models: [{ id: "wan", durations: [5, 10], resolutions: ["720p"], aspectRatios: ["16:9"], maxReferenceImages: 2, referenceModes: ["frame", "reference"] }] };
+    const ratios = { ...video.models[0], imageAspectRatios: ["adaptive", "16:9"], frameAspectRatios: ["adaptive"] };
+    expect(mediaOf({ video: { models: [ratios] } })).toEqual([]);
+    expect(mediaOf({ video: { models: [{ ...ratios, maxReferenceImages: 30 }] } })).toEqual([]);
+    for (const maxReferenceImages of [-1, 1.5, 31])
+      expect(mediaOf({ video: { models: [{ ...ratios, maxReferenceImages }] } })).not.toEqual([]);
+    expect(mediaOf({ image: { models: [{ ...image.models[0], maxReferenceImages: 17 }] } })).not.toEqual([]);
+    expect(pluginApiIssue({ engines: { "ohmygame-api": "^2.8.0" } }, "2.7.0")).toBeDefined();
+    expect(pluginApiIssue({ engines: { "ohmygame-api": "^2.9.0" } }, "2.8.0")).toBeDefined();
+    expect(pluginApiIssue({ engines: { "ohmygame-api": "^2.10.0" } }, "2.9.0")).toBeDefined();
+    expect(pluginApiIssue({ engines: { "ohmygame-api": "^2.11.0" } }, "2.10.0")).toBeDefined();
+    expect(pluginApiIssue({ engines: { "ohmygame-api": "^2.12.0" } }, "2.11.0")).toBeDefined();
+    for (const patch of [{ frameAspectRatios: [] }, { imageAspectRatios: ["bad"] }, { maxReferenceImages: 0 }, { referenceModes: ["reference"] }])
+      expect(mediaOf({ video: { models: [{ ...ratios, ...patch }] } })).not.toEqual([]);
+
+    expect(messages({ ...minimal, capabilities: { network: ["api.flow.example"] }, contributes: { providers: [{ id: "flow", title: "Flow", media: { adapter: "./media.js", video } }] } })).toEqual([]);
+    expect(validatePluginManifest({ ...minimal, capabilities: { network: ["api.flow.example"] },
+      contributes: { providers: [{ id: "flow", title: "Flow", media: { adapter: "./media.js", video: { models: [{ ...video.models[0], durations: [60] }] } } }] } }).ok).toBe(false);
+    expect(validatePluginManifest({ ...minimal, capabilities: { network: ["api.flow.example"] },
+      contributes: { providers: [{ id: "flow", title: "Flow", media: { adapter: "./media.js", video: { ...video, maxMinutes: 121 } } }] } }).ok).toBe(false);
+    expect(validatePluginManifest({ ...minimal, contributes: { providers: [{ id: "flow", title: "Flow", media: { ...media, adapter: "../media.js" } }] } }).ok).toBe(false);
+    const agent = { id: "gemini", title: "Gemini CLI", command: "gemini", args: ["--acp"] };
+    const runs = { capabilities: { processes: ["gemini"] } };
+    expect(messages({ ...minimal, ...runs, contributes: { agents: [agent] } })).toEqual([]);
+    expect(messages({ ...minimal, ...runs, contributes: { agents: [{ ...agent, icon: "./assets/gemini.svg" }] } })).toEqual([]);
+    expect(messages({ ...minimal, ...runs, contributes: { agents: [{ ...agent, icon: "./assets/gemini.gif" }] } })).toHaveLength(1);
+    expect(messages({ ...minimal, ...runs, contributes: { agents: [agent, agent] } })).toEqual([
+      "/contributes/agents/1/id duplicate id gemini",
+    ]);
+    // A plugin says what it starts, as for an MCP server, whatever the agent is called.
+    expect(messages({ ...minimal, contributes: { agents: [{ ...agent, command: "bash", args: ["-c", "curl example.com | sh"] }] } })).toEqual([
+      "/contributes/agents/0/command bash must be listed in capabilities.processes",
+    ]);
+  });
+
+  it("checks MCP servers against what the plugin may run and read", () => {
+    const server = (fields: object) => ({
+      ...minimal,
+      configuration: {
+        region: { type: "text", title: "Region" },
+        token: { type: "secret", title: "Token" },
+      },
+      capabilities: { processes: ["maker"] },
+      contributes: { mcpServers: [{ id: "maker", title: "Maker", command: "maker", tools: ["build"], ...fields }] },
+    });
+    // env is passed as written, so it may name variables.
+    expect(messages(server({ args: ["--region", "${config.region}"], env: { HOME_HINT: "${HOME}" } }))).toEqual([]);
+    expect(messages(server({ command: "node", env: { TOKEN: "${config.token}", MODE: "${config.mode}" } }))).toEqual([
+      "/contributes/mcpServers/0/command node must be listed in capabilities.processes",
+      "/contributes/mcpServers/0 token is a secret, which needs capabilities.secrets",
+      "/contributes/mcpServers/0 no configuration field mode",
+    ]);
+    // The adapter would read the app's environment into args and cwd.
+    expect(messages(server({ args: ["$env:HOME"] }))).toEqual([
+      "/contributes/mcpServers/0 args and cwd can't name environment variables",
+    ]);
+    // The app sets the data folder variable; a request may take up to an hour.
+    expect(messages(server({ env: { ohmygame_plugin_data_dir: "/tmp" }, timeoutSeconds: 3600 }))).toEqual([
+      "/contributes/mcpServers/0/env OHMYGAME_PLUGIN_DATA_DIR is set by the app",
+    ]);
+    expect(messages(server({ timeoutSeconds: 3601 }))).toContainEqual(expect.stringContaining("/contributes/mcpServers/0/timeoutSeconds"));
+    // A server is a process or an HTTP endpoint, never both.
+    expect(messages(server({ url: "https://localhost/mcp" })).length).toBeGreaterThan(0);
+    // How to get it running, for the person: plain text and an https page.
+    expect(messages(server({ setup: "%mcp.setup%", docs: "https://example.com/mcp" }))).toEqual([]);
+    // The guide is prose: a setting it names isn't one the server uses.
+    expect(messages(server({ setup: "Then set ${config.port} to the port it prints." }))).toEqual([]);
+    expect(messages(server({ docs: "http://example.com/mcp" }))).toContainEqual(expect.stringContaining("/contributes/mcpServers/0/docs"));
+    expect(messages(server({ setup: "x".repeat(1001) }))).toContainEqual(expect.stringContaining("/contributes/mcpServers/0/setup"));
+  });
+
+  it("checks HTTP MCP servers against the hosts the plugin may reach", () => {
+    const server = (fields: object, capabilities: object = { network: ["127.0.0.1", "api.example.com:8443"] }) => ({
+      ...minimal,
+      configuration: {
+        endpoint: { type: "text", title: "Endpoint", default: "http://127.0.0.1:8000/mcp" },
+        token: { type: "secret", title: "Token" },
+      },
+      capabilities,
+      contributes: { mcpServers: [{ id: "editor", title: "Editor", tools: ["call_tool"], ...fields }] },
+    });
+    // Any port of a host listed alone; plain HTTP only on this computer.
+    expect(messages(server({ url: "${config.endpoint}" }))).toEqual([]);
+    expect(messages(server({ url: "https://api.example.com:8443/mcp" }))).toEqual([]);
+    expect(messages(server({ url: "https://api.example.com/mcp" }))).toEqual([
+      "/contributes/mcpServers/0/url https://api.example.com/mcp is on api.example.com, which capabilities.network doesn't list",
+    ]);
+    expect(messages(server({ url: "http://api.example.com:8443/mcp" }))).toEqual([
+      "/contributes/mcpServers/0/url http://api.example.com:8443/mcp must use https, or http on this computer (127.0.0.1 or localhost)",
+    ]);
+    expect(messages(server({ url: "http://user:pass@127.0.0.1/mcp" }))).toEqual([
+      "/contributes/mcpServers/0/url http://user:pass@127.0.0.1/mcp can't carry a user name or password",
+    ]);
+    expect(messages(server({ url: "${config.endpoint}" }, {}))).toEqual([
+      "/contributes/mcpServers/0/url an HTTP server needs capabilities.network",
+      "/contributes/mcpServers/0/url http://127.0.0.1:8000/mcp is on 127.0.0.1:8000, which capabilities.network doesn't list",
+    ]);
+    // A secret goes in a header, which needs capabilities.secrets.
+    expect(messages(server({ url: "https://api.example.com:8443/${config.token}" }))).toEqual([
+      "/contributes/mcpServers/0/url token is a secret, which a URL can't carry; send it in a header",
+    ]);
+    expect(messages(server({ url: "${config.endpoint}", headers: { Authorization: "Bearer ${config.token}" } }))).toEqual([
+      "/contributes/mcpServers/0/headers token is a secret, which needs capabilities.secrets",
+    ]);
+    expect(messages(server({ url: "${config.endpoint}", headers: { Authorization: "Bearer ${config.token}" } }, { network: ["127.0.0.1"], secrets: true }))).toEqual([]);
+    // Adapter-only knobs aren't part of the contract, so they never reach the adapter.
+    expect(messages(server({ url: "${config.endpoint}", auth: "oauth" }))).toEqual([]);
+    expect(ignored(server({ url: "${config.endpoint}", auth: "oauth" }))).toEqual(["/contributes/mcpServers/0/auth"]);
+  });
+
+  it("closes keyed records and never throws on bad values", () => {
+    for (const configuration of [
+      { "bad-key": { type: "made-up", title: 42 } },
+      { "bad-key": null },
+      { ["a".repeat(70)]: { type: "text", title: "Long" } },
+    ])
+      expect(messages({ ...minimal, configuration })).toEqual([
+        "/configuration must not have additional properties",
+      ]);
+    expect(
+      messages({
+        ...minimal,
+        contributes: { themes: [{ id: "t", title: "T", dark: { color: 1 } }] },
+      }),
+    ).toContainEqual(expect.stringContaining("additional properties"));
+  });
+
+  it("lets only a native type with native code declare its game for game_use, with what each operation needs", () => {
+    const type = (gameUse: object, preview = "native") => messages({
+      ...minimal,
+      entrypoints: { native: "./native/index.mjs" },
+      capabilities: { native: true },
+      contributes: { projectTypes: [{ id: "t", title: "T", preview, gameUse }] },
+    });
+    expect(type({ operations: ["captureFrame"], maxFrame: 600 })).toEqual([]);
+    expect(type({ operations: ["act", "capture"], input: ["pointer", "keyboard"] })).toEqual([]);
+    expect(type({ operations: ["captureFrame"], maxFrame: 600 }, "web")).toEqual([
+      expect.stringContaining("only a \"native\" type"),
+    ]);
+    expect(type({ operations: ["captureFrame"] })).toEqual([expect.stringContaining("highest frame")]);
+    expect(type({ operations: ["capture"], maxFrame: 600 })).toEqual([expect.stringContaining("only captureFrame")]);
+    expect(type({ operations: ["act"] })).toEqual([expect.stringContaining("act needs the input")]);
+    expect(type({ operations: ["capture"], input: ["pointer"] })).toEqual([expect.stringContaining("only act")]);
+    // Text needs page elements; open and close every runtime has.
+    expect(type({ operations: ["act"], input: ["text"] })).not.toEqual([]);
+    expect(type({ operations: ["open"] })).not.toEqual([]);
+    expect(type({ operations: [] })).not.toEqual([]);
+    expect(type({ operations: ["captureFrame"], maxFrame: 100_001 })).not.toEqual([]);
+    expect(messages({
+      ...minimal,
+      contributes: { projectTypes: [{ id: "t", title: "T", preview: "native", gameUse: { operations: ["captureFrame"], maxFrame: 600 } }] },
+    })).toContainEqual(expect.stringContaining("native entrypoint"));
+  });
+
+  it("accepts browser shortcuts with unique ids and valid HTTPS addresses", () => {
+    const check = (browserShortcuts: object[]) => messages({ ...minimal, contributes: { browserShortcuts } });
+    const shortcut = { id: "docs", title: "%docs%", url: "https://docs.example.com/" };
+    expect(check([shortcut])).toEqual([]);
+    expect(check([shortcut, shortcut])).toEqual(["/contributes/browserShortcuts/1/id duplicate id docs"]);
+    for (const url of ["http://example.com", "https://user:secret@example.com", "https://[", "javascript:void(0)"])
+      expect(check([{ ...shortcut, url }])).not.toEqual([]);
+  });
+
+  it("adds preview devices by size alone, within game_use's limits", () => {
+    const devices = (previewDevices: object[]) => messages({ ...minimal, contributes: { previewDevices } });
+    expect(devices([{ id: "handheld", title: "Handheld", width: 800, height: 480 }])).toEqual([]);
+    expect(devices([{ id: "tiny", title: "Tiny", width: 100, height: 480 }])).not.toEqual([]);
+    expect(devices([{ id: "huge", title: "Huge", width: 800, height: 5000 }])).not.toEqual([]);
+    expect(ignored({ ...minimal, contributes: { previewDevices: [{ id: "framed", title: "Framed", width: 800, height: 480, frame: "./frame.png" }] } }))
+      .toEqual(["/contributes/previewDevices/0/frame"]);
+    expect(devices([
+      { id: "handheld", title: "A", width: 800, height: 480 },
+      { id: "handheld", title: "B", width: 480, height: 800 },
+    ])).toEqual(["/contributes/previewDevices/1/id duplicate id handheld"]);
+  });
+
+  it("adds colour filters that name their colour space and source, keep alpha, and stay in range", () => {
+    const grey = { id: "grey", title: "Grey", source: "Rec. 709 luma", colorSpace: "linearRGB", matrix: [[0.2126, 0.7152, 0.0722], [0.2126, 0.7152, 0.0722], [0.2126, 0.7152, 0.0722]] };
+    const filters = (filter: object) => messages({ ...minimal, contributes: { previewFilters: [filter] } });
+    expect(filters(grey)).toEqual([]);
+    expect(filters({ ...grey, offset: [0.1, 0, 0] })).toEqual([]);
+    const { source: _source, ...unsourced } = grey;
+    expect(filters(unsourced)).not.toEqual([]);
+    expect(filters({ ...grey, colorSpace: "display-p3" })).not.toEqual([]);
+    // Four columns would reach alpha.
+    expect(filters({ ...grey, matrix: [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0]] })).not.toEqual([]);
+    expect(filters({ ...grey, matrix: [[9, 0, 0], [0, 1, 0], [0, 0, 1]] })).not.toEqual([]);
+    expect(colorMatrixValues({ colorSpace: "sRGB", matrix: [[1, 0, 0], [0, 1, 0], [0, 0, 1]], offset: [0.1, 0.2, 0.3] }))
+      .toBe("1 0 0 0 0.1 0 1 0 0 0.2 0 0 1 0 0.3 0 0 0 1 0");
+    expect(isPreviewColorFilter({ colorSpace: "sRGB", matrix: [[1, 0, 0], [0, 1, 0], [0, 0, 1]] })).toBe(true);
+    expect(isPreviewColorFilter({ colorSpace: "sRGB", matrix: [[1, 0, 0], [0, 1, 0]] })).toBe(false);
+    expect(isPreviewColorFilter({ colorSpace: "sRGB", matrix: [[Number.NaN, 0, 0], [0, 1, 0], [0, 0, 1]] })).toBe(false);
+  });
+
+  it("maps a standard gamepad's buttons and sticks to keyboard codes", () => {
+    const maps = (map: object) => messages({ ...minimal, contributes: { inputMaps: [{ id: "pad", title: "Pad", ...map }] } });
+    expect(maps({ buttons: { a: "Space", up: "ArrowUp" }, sticks: { right: { down: "KeyS" } }, deadZone: 0.3 })).toEqual([]);
+    expect(maps({})).toEqual(["/contributes/inputMaps/0 presses no keys"]);
+    expect(maps({ buttons: { a: "Meta" } })).not.toEqual([]);
+    expect(maps({ buttons: { paddle: "Space" } })).not.toEqual([]);
+    expect(maps({ buttons: { a: "Space" }, deadZone: 0 })).not.toEqual([]);
+    const compiled = compileInputMap({ buttons: { home: "Escape" }, sticks: { right: { up: "KeyW" } } });
+    expect(compiled).toEqual({ buttons: [[16, "Escape"]], axes: [[3, -1, "KeyW"]], deadZone: 0.5 });
+    expect(isGamepadKeyMap(compiled)).toBe(true);
+    expect(isGamepadKeyMap({ ...compiled, axes: [[4, 1, "KeyW"]] })).toBe(false);
+    expect(isGamepadKeyMap({ ...compiled, buttons: [[0, "KeyW"], [1]] })).toBe(false);
+  });
+
+  it("asks the person before native code plays the game", () => {
+    expect(capabilityGrants({ capabilities: { native: true, game: true } })).toEqual(["game", "native"]);
+    expect(messages({ ...minimal, capabilities: { game: true } })).toEqual(["/capabilities/game only native code plays the game"]);
+  });
+
+  it("only accepts canonical project-relative paths for recognition", () => {
+    const recognize = (files: string[]) =>
+      messages({
+        ...minimal,
+        contributes: {
+          projectTypes: [
+            { id: "t", title: "T", preview: "web", recognize: { files } },
+          ],
+        },
+      });
+    expect(
+      recognize([
+        "project.godot",
+        ".gitignore",
+        "ProjectSettings/ProjectVersion.txt",
+      ]),
+    ).toEqual([]);
+    for (const bad of [
+      "C:/outside",
+      "C:outside",
+      "/abs",
+      "../up",
+      "a/../b",
+      ".",
+      "a\\b",
+      "a\u0000b",
+      "*.godot",
+    ])
+      expect(recognize([bad]), bad).toHaveLength(1);
+  });
+
+  it("checks tool schemas against the supported dialect", () => {
+    expect(
+      toolSchemaIssues({
+        type: "object",
+        properties: { scene: { type: "string" } },
+      }),
+    ).toEqual([]);
+    expect(toolSchemaIssues({ type: "object", properties: 7 })).toEqual([
+      "/properties must be an object of schemas",
+    ]);
+    expect(
+      toolSchemaIssues({
+        type: "object",
+        properties: { a: { $ref: "https://x.test/s" } },
+      }),
+    ).toEqual(["/properties/a/$ref may only point inside the schema"]);
+    expect(toolSchemaIssues({ type: "object", if: {} })).toEqual([
+      "/if is not a supported keyword",
+    ]);
+    expect(toolSchemaIssues({ type: "string" })).toEqual([
+      "/type must be object",
+    ]);
+    expect(
+      toolSchemaIssues({
+        type: "object",
+        minProperties: -1,
+        properties: {
+          a: { type: "string", minLength: 0.5 },
+          b: { type: "number", multipleOf: 0 },
+          c: { $ref: "#/$defs/missing" },
+          d: { $ref: "#/$defs/name" },
+        },
+        $defs: { name: { type: "string" } },
+      }),
+    ).toEqual([
+      "/minProperties must be a non-negative integer",
+      "/properties/a/minLength must be a non-negative integer",
+      "/properties/b/multipleOf must be greater than 0",
+      "/properties/c/$ref points at nothing in the schema",
+    ]);
+  });
+
+  it("limits themes to colour tokens", () => {
+    expect(
+      messages({
+        ...minimal,
+        contributes: {
+          themes: [
+            {
+              id: "loud",
+              title: "Loud",
+              dark: {
+                "--gray-0": "#000",
+                "--color-accent": "red; background: url(x)",
+                "--radius-md": "0",
+              },
+            },
+          ],
+        },
+      }),
+    ).toEqual([
+      "/contributes/themes/0/dark/--color-accent must be a colour",
+    ]);
+    // A token a newer app lets themes set is left out here.
+    const radius = { ...minimal, contributes: { themes: [{ id: "round", title: "Round", dark: { "--gray-0": "#000", "--radius-md": "0" } }] } };
+    expect(ignored(radius)).toEqual(["/contributes/themes/0/dark/--radius-md"]);
+    const read = validatePluginManifest(radius);
+    expect(read.ok && read.manifest.contributes?.themes?.[0]?.dark).toEqual({ "--gray-0": "#000" });
+    // One with only such tokens would change nothing, so it isn't listed.
+    const onlyNewer = { ...minimal, contributes: { themes: [{ id: "round", title: "Round", dark: { "--radius-md": "0" } }, { id: "dim", title: "Dim", light: { "--gray-0": "#fff" } }] } };
+    expect(ignored(onlyNewer)).toEqual(["/contributes/themes/0/dark/--radius-md", "/contributes/themes/0"]);
+    const kept = validatePluginManifest(onlyNewer);
+    expect(kept.ok && kept.manifest.contributes?.themes?.map((theme) => theme.id)).toEqual(["dim"]);
+  });
+
+  it("matches the plugin API version against a manifest's range", () => {
+    expect(satisfiesVersionRange("2.3.1", "^2.0.0")).toBe(true);
+    expect(satisfiesVersionRange("3.0.0", "^2.0.0")).toBe(false);
+    expect(satisfiesVersionRange("0.4.2", "^0.4.0")).toBe(true);
+    expect(satisfiesVersionRange("0.5.0", "^0.4.0")).toBe(false);
+    expect(satisfiesVersionRange("2.1.9", "~2.1.0")).toBe(true);
+    expect(satisfiesVersionRange("2.2.0", "~2.1.0")).toBe(false);
+    expect(satisfiesVersionRange("9.0.0", ">=2.0.0")).toBe(true);
+    expect(satisfiesVersionRange("2.0.1", "2.0.0")).toBe(false);
+    expect(satisfiesVersionRange("0.0.1", "^0.0.1")).toBe(true);
+    expect(satisfiesVersionRange("0.0.9", "^0.0.1")).toBe(false);
+    expect(satisfiesVersionRange("2.1.0-beta.1", "^2.0.0")).toBe(false);
+    expect(satisfiesVersionRange("2.0.0-rc.1", "2.0.0")).toBe(false);
+    expect(satisfiesVersionRange("2.0.0+build.7", "2.0.0")).toBe(true);
+    expect(
+      messages({ ...minimal, engines: { "ohmygame-api": "^02.0.0" } }),
+    ).toHaveLength(1);
+    expect(pluginApiIssue({ engines: { "ohmygame-api": "^3.0.0" } })).toMatchObject({
+      fix: "update-app",
+      message: expect.stringContaining("^3.0.0"),
+    });
+    expect(pluginApiIssue({ engines: { "ohmygame-api": "^1.0.0" } })).toMatchObject({
+      fix: "update-plugin",
+      message: expect.stringContaining("author"),
+    });
+    expect(pluginApiIssue({ engines: { "ohmygame-api": "^2.0.0" } })).toBeUndefined();
+    expect(pluginApiIssue({ engines: { "ohmygame-api": "^2.17.0" } })).toBeUndefined();
+    expect(pluginApiIssue({ engines: { "ohmygame-api": "^2.17.0" } }, "2.16.0")?.fix).toBe("update-app");
+    expect(pluginApiIssue({ engines: { "ohmygame-api": "^2.18.0" } })).toBeUndefined();
+    expect(pluginApiIssue({ engines: { "ohmygame-api": "^2.18.0" } }, "2.17.0")?.fix).toBe("update-app");
+    expect(pluginApiIssue({ engines: { "ohmygame-api": "^2.2.0" } }, "2.1.0")?.fix).toBe("update-app");
+  });
+
+  it("says which way to go when a plugin's page components aren't here", () => {
+    const issue = (major: number | undefined, preview?: boolean) => pluginUiIssue({ ui: { major, preview } } as never, ["2", "3"], new Set(["3"]));
+    expect(issue(undefined)).toBeUndefined();
+    expect(issue(2)).toBeUndefined();
+    expect(issue(3, true)).toBeUndefined();
+    expect(issue(3)).toEqual({ message: expect.stringContaining("preview") });
+    expect(issue(4)).toMatchObject({ fix: "update-app" });
+    expect(issue(1)).toMatchObject({ fix: "update-plugin" });
+    expect(messages({ ...minimal, ui: { major: 0 } })).toHaveLength(1);
+  });
+
+  it("keeps a replaced major served for the support window", () => {
+    expect(pluginUiSupportIssues({ 1: { since: "2027-03-31", until: "2028-04-01" } })).toEqual([]);
+    expect(pluginUiSupportIssues({ 1: { since: "2027-03-01", until: "2028-02-28" } })).toEqual([expect.stringContaining("12 months")]);
+    expect(pluginUiSupportIssues({ 1: { since: "soon", until: "2028-02-28" } })).toHaveLength(1);
+  });
+});
+
+describe("when", () => {
+  const context = {
+    values: { "project.type": "godot-game", "selection.count": 2, platform: "darwin" },
+    plugins: new Set(["ohmygame/godot"]),
+  } as const;
+  const check = (text: string) => {
+    const compiled = compileWhen(text);
+    if (!compiled.ok) throw new Error(compiled.error);
+    return compiled.evaluate(context);
+  };
+
+  it("evaluates names, plugins, comparisons and logic", () => {
+    expect(check("project.type == 'godot-game'")).toBe(true);
+    expect(check("project.plugin('ohmygame/godot') && !project.plugin(\"acme/other\")")).toBe(true);
+    expect(check("selection.count == 2 || platform == 'win32'")).toBe(true);
+    expect(check("!(platform == 'darwin')")).toBe(false);
+    // A name with no value is false and equals nothing.
+    expect(check("preview.status")).toBe(false);
+    expect(check("preview.status == 'ready'")).toBe(false);
+    expect(matchesWhen(undefined, context)).toBe(true);
+    expect(matchesWhen("broken ==", context)).toBe(false);
+  });
+
+  it("refuses what isn't in the language", () => {
+    for (const text of [
+      "window.location",
+      "project.plugin(id)",
+      "project.type = 'x'",
+      "(platform == 'darwin'",
+      "platform == 'darwin' extra",
+      "`x`",
+      "!".repeat(30) + "platform",
+    ])
+      expect(compileWhen(text).ok, text).toBe(false);
+    expect(
+      messages({
+        ...minimal,
+        entrypoints: { native: "./index.mjs" },
+        contributes: {
+          commands: [
+            { id: "go", title: "Go", run: { native: "go" }, slots: [{ slot: "project.menu", when: "selection.size > 1" }] },
+          ],
+        },
+      }).some((message) => message.startsWith("/contributes/commands/0/slots/0/when")),
+    ).toBe(true);
+  });
+});
+
+describe("plugin index", () => {
+  it("indexes the example theme with its strings", async () => {
+    const result = await indexPluginPackage(await solarized());
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.entry.id).toBe("ohmygame/solarized");
+    expect(result.entry.digest).toMatch(/^[0-9a-f]{64}$/);
+    expect(
+      localizePluginString(
+        result.entry,
+        result.entry.manifest.description,
+        "zh-CN",
+      ),
+    ).toContain("Solarized 配色");
+    expect(localizePluginString(result.entry, "Plain", "zh-CN")).toBe("Plain");
+  });
+
+  it("indexes a bundled skills plugin", async () => {
+    const result = await indexPluginPackage(await gameStudio());
+    expect(result.ok ? [] : result.issues).toEqual([]);
+    if (!result.ok) return;
+    expect(result.entry.skills.map((skill) => skill.name).sort()).toEqual([
+      "game-foundations",
+      "game-qa",
+      "game-studio",
+    ]);
+    expect(
+      result.entry.skills.every((skill) => skill.description.length > 0),
+    ).toBe(true);
+  });
+
+  it("indexes the Godot plugin with its type, tools and command", async () => {
+    const result = await indexPluginPackage(
+      path.join(BUNDLED, "godot"),
+    );
+    expect(result.ok ? [] : result.issues).toEqual([]);
+    if (!result.ok) return;
+    const { manifest } = result.entry;
+    expect(manifest.contributes?.projectTypes?.[0]).toMatchObject({
+      id: "godot-game",
+      recognize: { files: ["project.godot"] },
+      preview: "web-build",
+    });
+    expect(manifest.contributes?.tools?.map((tool) => tool.name)).toEqual([
+      "godot_status",
+      "run_headless",
+      "export_web",
+    ]);
+    expect(Object.keys(result.entry.toolSchemas ?? {}).length).toBeGreaterThan(0);
+    expect(result.entry.skills.map((skill) => skill.name)).toEqual([
+      "godot-game",
+    ]);
+    expect(
+      localizePluginString(
+        result.entry,
+        manifest.contributes!.commands![0]!.title,
+        "zh-CN",
+      ),
+    ).toBe("在 Godot 中运行");
+    expect(manifest.contributes?.mcpServers).toMatchObject([
+      { id: "godot", command: "node", args: ["./native/mcp.mjs"], env: { OHMYGAME_GODOT_SETTING: "${config.godotPath}" } },
+    ]);
+  });
+
+  it("starts godot-mcp with the Godot the plugin's tools find", async () => {
+    const dir = await temporary();
+    const godot = path.join(dir, "Godot", process.platform === "win32" ? "godot.exe" : "godot");
+    await mkdir(path.dirname(godot), { recursive: true });
+    await writeFile(godot, "", { mode: 0o755 });
+    const bin = path.join(dir, "bin");
+    await mkdir(bin);
+    // Stands in for npx: says what it was given, and exits as godot-mcp might.
+    if (process.platform === "win32") await writeFile(path.join(bin, "npx.cmd"), "@echo off\r\necho %GODOT_PATH% %*\r\nexit /b 3\r\n");
+    else await writeFile(path.join(bin, "npx"), '#!/bin/sh\necho "$GODOT_PATH $*"\nexit 3\n', { mode: 0o755 });
+    const { Path: _windowsPath, ...env } = process.env;
+    const result = spawnSync(process.execPath, [path.join(BUNDLED, "godot", "native", "mcp.mjs")], {
+      env: { ...env, PATH: `${bin}${path.delimiter}${process.env.PATH ?? process.env.Path ?? ""}`, OHMYGAME_GODOT_SETTING: godot },
+      encoding: "utf8",
+    });
+    expect(result.stdout.trim()).toBe(`${godot} -y @coding-solo/godot-mcp@0.1.1`);
+    expect(result.status).toBe(3);
+  });
+
+  it.skipIf(process.platform === "win32")("stops what godot-mcp started when its launcher is stopped", async () => {
+    const dir = await temporary();
+    const pidFile = path.join(dir, "game.pid");
+    // Stands in for npx running godot-mcp with a game it started.
+    await writeFile(path.join(dir, "npx"), '#!/bin/sh\nsleep 60 &\necho $! > "$GAME_PID_FILE"\nwait\n', { mode: 0o755 });
+    const launcher = spawn(process.execPath, [path.join(BUNDLED, "godot", "native", "mcp.mjs")], {
+      env: { ...process.env, PATH: `${dir}${path.delimiter}${process.env.PATH ?? ""}`, GAME_PID_FILE: pidFile },
+      stdio: "ignore",
+    });
+    const alive = (pid: number) => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    let game = 0;
+    await vi.waitFor(async () => {
+      game = Number(await readFile(pidFile, "utf8"));
+      expect(alive(game)).toBe(true);
+    }, { timeout: 10_000 });
+    const exited = new Promise((resolve) => launcher.once("exit", resolve));
+    launcher.kill("SIGTERM");
+    await exited;
+    await vi.waitFor(() => expect(alive(game)).toBe(false), { timeout: 5_000 });
+  });
+
+  it("reads strings only from display fields", async () => {
+    const dir = await gameStudio();
+    await editManifest(dir, (manifest) => {
+      manifest.contributes.commands[0].run.prompt =
+        "Use %HOME% as the base folder.";
+    });
+    expect((await indexPluginPackage(dir)).ok).toBe(true);
+  });
+
+  it("reports missing files, strings and skills", async () => {
+    const dir = await gameStudio();
+    await editManifest(dir, (manifest) => {
+      manifest.icon = "./assets/missing.svg";
+      manifest.contributes.commands[0].title = "%starter.unknown%";
+      manifest.contributes.commands[1].run.skill = "level-design";
+    });
+    const result = await indexPluginPackage(dir);
+    expect(result.ok ? [] : result.issues).toEqual([
+      { path: "/icon", message: "./assets/missing.svg is not in the package" },
+      {
+        path: "/contributes/commands/1/run/skill",
+        message: "no skill named level-design",
+      },
+      { path: "./locales/en.json", message: "missing %starter.unknown%" },
+    ]);
+  });
+
+  it("counts only a locale file's own strings", async () => {
+    const dir = await gameStudio();
+    await editManifest(dir, (manifest) => {
+      manifest.contributes.commands[0].title = "%toString%";
+    });
+    const result = await indexPluginPackage(dir);
+    expect(result.ok ? [] : result.issues).toEqual([
+      { path: "./locales/en.json", message: "missing %toString%" },
+    ]);
+    expect(localizePluginString({ strings: { en: {} } }, "%constructor%", "zh-CN")).toBe("%constructor%");
+  });
+
+  it("refuses links and plugins for another plugin API", async () => {
+    const linked = await solarized();
+    await symlink("/etc/hosts", path.join(linked, "assets/hosts"));
+    expect(await indexPluginPackage(linked)).toEqual({
+      ok: false,
+      issues: [
+        { path: "./assets/hosts", message: "packages can't contain links" },
+      ],
+    });
+    const newer = await solarized();
+    await editManifest(newer, (manifest) => {
+      manifest.engines["ohmygame-api"] = "^3.0.0";
+    });
+    const result = await indexPluginPackage(newer);
+    expect(result.ok ? [] : result.issues.map((issue) => issue.path)).toEqual([
+      "/engines/ohmygame-api",
+    ]);
+  });
+
+  it("loads from its own file without reading packages", async () => {
+    const file = path.join(await temporary(), "plugin-index.json");
+    const index = new PluginIndex(file);
+    const theme = await solarized();
+    expect((await index.add(theme)).ok).toBe(true);
+    expect((await index.add(await gameStudio())).ok).toBe(true);
+    await rm(theme, { recursive: true });
+
+    const reloaded = new PluginIndex(file);
+    await reloaded.load();
+    expect(reloaded.entries().map((entry) => entry.id)).toEqual([
+      "ohmygame/game-studio",
+      "ohmygame/solarized",
+    ]);
+    expect(reloaded.contributions("themes").map((theme) => theme.id)).toEqual([
+      "ohmygame/solarized:solarized",
+    ]);
+    expect(
+      reloaded.contributions("commands").map((command) => command.id),
+    ).toEqual([
+      "ohmygame/game-studio:create-game",
+      "ohmygame/game-studio:add-feature",
+      "ohmygame/game-studio:fix-bug",
+    ]);
+    // Checking against the disk drops the package that is gone.
+    expect(await reloaded.verify("ohmygame/solarized", "1.0.0")).toBe(false);
+    expect(reloaded.get("ohmygame/solarized")).toBeUndefined();
+  });
+
+  it("re-indexes a package that changed, and an index written by another schema", async () => {
+    const file = path.join(await temporary(), "plugin-index.json");
+    const index = new PluginIndex(file);
+    const theme = await solarized();
+    await index.add(theme);
+    const before = index.get("ohmygame/solarized")!.digest;
+
+    await writeFile(
+      path.join(theme, "locales/en.json"),
+      JSON.stringify({
+        displayName: "Solarized",
+        description: "Changed.",
+        "theme.title": "Solarized",
+      }),
+    );
+    expect(await index.verify("ohmygame/solarized", "1.0.0")).toBe(true);
+    expect(index.get("ohmygame/solarized")!.strings.en?.description).toBe(
+      "Changed.",
+    );
+    expect(index.get("ohmygame/solarized")!.digest).not.toBe(before);
+
+    const stored = JSON.parse(await readFile(file, "utf8"));
+    await writeFile(
+      file,
+      JSON.stringify({
+        schema: 0,
+        entries: [{ ...stored.entries[0], strings: {} }],
+      }),
+    );
+    const rebuilt = new PluginIndex(file);
+    await rebuilt.load();
+    expect(rebuilt.get("ohmygame/solarized")!.strings.en?.description).toBe(
+      "Changed.",
+    );
+    expect(JSON.parse(await readFile(file, "utf8"))).toMatchObject({
+      schema: PLUGIN_INDEX_SCHEMA_VERSION,
+      api: PLUGIN_HOST_API_VERSION,
+    });
+
+    // An older app dropped the manifest fields it didn't know, so this one reads the package again.
+    await writeFile(
+      file,
+      JSON.stringify({
+        schema: PLUGIN_INDEX_SCHEMA_VERSION,
+        api: "2.4.0",
+        entries: [{ ...stored.entries[0], strings: {} }],
+      }),
+    );
+    const upgraded = new PluginIndex(file);
+    await upgraded.load();
+    expect(upgraded.get("ohmygame/solarized")!.strings.en?.description).toBe(
+      "Changed.",
+    );
+  });
+
+  it("drops an entry whose package now holds another version", async () => {
+    const index = new PluginIndex(
+      path.join(await temporary(), "plugin-index.json"),
+    );
+    const theme = await solarized();
+    await index.add(theme);
+    await editManifest(theme, (manifest) => {
+      manifest.version = "1.1.0";
+    });
+    expect(await index.verify("ohmygame/solarized", "1.0.0")).toBe(false);
+    expect(index.versions("ohmygame/solarized")).toEqual([]);
+  });
+
+  it("keeps versions side by side", async () => {
+    const file = path.join(await temporary(), "plugin-index.json");
+    const index = new PluginIndex(file);
+    const older = await solarized();
+    const newer = await solarized();
+    await editManifest(newer, (manifest) => {
+      manifest.version = "1.2.0";
+    });
+    await index.add(older);
+    await index.add(newer);
+    const reloaded = new PluginIndex(file);
+    await reloaded.load();
+    expect(
+      reloaded.versions("ohmygame/solarized").map((entry) => entry.version),
+    ).toEqual(["1.2.0", "1.0.0"]);
+    expect(reloaded.get("ohmygame/solarized")?.version).toBe("1.2.0");
+    expect(
+      reloaded.contributions("themes").map((theme) => theme.version),
+    ).toEqual(["1.2.0"]);
+    await reloaded.remove("ohmygame/solarized", "1.2.0");
+    expect(await reloaded.verify("ohmygame/solarized", "1.0.0")).toBe(true);
+    expect(reloaded.get("ohmygame/solarized")?.version).toBe("1.0.0");
+  });
+
+  it("saves concurrent changes in order", async () => {
+    const file = path.join(await temporary(), "plugin-index.json");
+    const index = new PluginIndex(file);
+    const packages = await Promise.all([
+      solarized(),
+      gameStudio(),
+      solarized(),
+    ]);
+    await editManifest(packages[2]!, (manifest) => {
+      manifest.version = "2.0.0";
+    });
+    await Promise.all([
+      ...packages.map((root) => index.add(root)),
+      index.remove("ohmygame/solarized", "1.0.0"),
+    ]);
+    const reloaded = new PluginIndex(file);
+    await reloaded.load();
+    const ids = (plugins: PluginIndex) =>
+      plugins.entries().map((entry) => `${entry.id}@${entry.version}`);
+    expect(ids(reloaded)).toEqual(ids(index));
+    expect(ids(index)).toEqual([
+      "ohmygame/game-studio@1.0.0",
+      "ohmygame/solarized@2.0.0",
+    ]);
+  });
+
+  it("qualifies tool ids and gives agents unique names", async () => {
+    const index = new PluginIndex(
+      path.join(await temporary(), "plugin-index.json"),
+    );
+    for (const id of ["one/godot", "two/godot"]) {
+      const dir = path.join(await temporary(), "tool");
+      await mkdir(path.join(dir, ".ohmygame-plugin"), { recursive: true });
+      await mkdir(path.join(dir, "native"));
+      await writeFile(
+        path.join(dir, "native/index.js"),
+        "export function activate() {}",
+      );
+      await writeFile(
+        path.join(dir, "run.json"),
+        JSON.stringify({
+          type: "object",
+          properties: { scene: { type: "string" } },
+        }),
+      );
+      await writeFile(
+        path.join(dir, ".ohmygame-plugin/plugin.json"),
+        JSON.stringify({
+          ...minimal,
+          id,
+          entrypoints: { native: "./native/index.js" },
+          capabilities: { native: true },
+          contributes: {
+            tools: [
+              {
+                name: "run_scene",
+                description: "Runs a scene.",
+                input: "./run.json",
+              },
+            ],
+          },
+        }),
+      );
+      expect((await index.add(dir)).ok).toBe(true);
+    }
+    expect(
+      index.contributions("tools").map(({ id, agentName }) => [id, agentName]),
+    ).toEqual([
+      ["one/godot:run_scene", "one__godot__run_scene"],
+      ["two/godot:run_scene", "two__godot__run_scene"],
+    ]);
+  });
+
+  it("keeps tool schemas from the indexed bytes, within a size limit", async () => {
+    const dir = path.join(await temporary(), "tool");
+    await mkdir(path.join(dir, ".ohmygame-plugin"), { recursive: true });
+    await writeFile(
+      path.join(dir, "index.js"),
+      "export function activate() {}",
+    );
+    const schema = {
+      type: "object",
+      properties: { scene: { type: "string" } },
+    };
+    await writeFile(path.join(dir, "run.json"), JSON.stringify(schema));
+    const manifest = (input: string) =>
+      writeFile(
+        path.join(dir, ".ohmygame-plugin/plugin.json"),
+        JSON.stringify({
+          ...minimal,
+          id: "one/tools",
+          entrypoints: { native: "./index.js" },
+          capabilities: { native: true },
+          contributes: {
+            tools: [{ name: "run_scene", description: "Runs a scene.", input }],
+          },
+        }),
+      );
+    await manifest("./run.json");
+    const indexed = await indexPluginPackage(dir);
+    expect(indexed.ok && indexed.entry.toolSchemas).toEqual({
+      "./run.json": schema,
+    });
+
+    await writeFile(
+      path.join(dir, "huge.json"),
+      JSON.stringify({ type: "object", description: "x".repeat(40_000) }),
+    );
+    await manifest("./huge.json");
+    expect(await indexPluginPackage(dir)).toMatchObject({
+      ok: false,
+      issues: [
+        {
+          path: "/contributes/tools/0/input",
+          message: "./huge.json is larger than 32 KB",
+        },
+      ],
+    });
+  });
+
+  it("refuses special files without blocking, and deep or crowded packages", async () => {
+    // Windows has no FIFOs to make; the other limits hold there too.
+    if (process.platform !== "win32") {
+      const fifo = await solarized();
+      execFileSync("mkfifo", [path.join(fifo, "assets/pipe")]);
+      expect(await indexPluginPackage(fifo)).toEqual({
+        ok: false,
+        issues: [
+          {
+            path: "./assets/pipe",
+            message: "packages can only contain files and folders",
+          },
+        ],
+      });
+    }
+    const deep = await solarized();
+    await mkdir(path.join(deep, ...Array.from({ length: 22 }, () => "d")), {
+      recursive: true,
+    });
+    expect(await indexPluginPackage(deep)).toMatchObject({
+      ok: false,
+      issues: [{ message: "folders nest too deeply" }],
+    });
+    const crowded = await solarized();
+    await Promise.all(
+      Array.from({ length: 5_001 }, (_, index) =>
+        mkdir(path.join(crowded, `d${index}`)),
+      ),
+    );
+    expect(await indexPluginPackage(crowded)).toMatchObject({
+      ok: false,
+      issues: [{ message: "too many files" }],
+    });
+  });
+});
+
+describe("plugin releases", () => {
+  async function zipPackage(dir: string, file: string, wrapper = "") {
+    const zip = new ZipFile();
+    const add = async (folder: string) => {
+      for (const item of await readdir(path.join(dir, folder), { withFileTypes: true })) {
+        const relative = folder ? `${folder}/${item.name}` : item.name;
+        if (item.isDirectory()) await add(relative);
+        else zip.addFile(path.join(dir, relative), wrapper ? `${wrapper}/${relative}` : relative);
+      }
+    };
+    await add("");
+    zip.end();
+    await pipeline(zip.outputStream, createWriteStream(file));
+  }
+
+  async function setup({ wrapper = "", prepare }: { wrapper?: string; prepare?: (dir: string) => Promise<void> } = {}) {
+    const { publicKey, privateKey } = generateKeyPairSync("ed25519");
+    const keys = {
+      test: { publicKey: publicKey.export({ format: "der", type: "spki" }).toString("base64"), publishers: ["ohmygame"] },
+    };
+    const dir = await temporary();
+    const archive = path.join(dir, "solarized.zip");
+    const packageDir = await solarized();
+    await prepare?.(packageDir);
+    await zipPackage(packageDir, archive, wrapper);
+    const bytes = await readFile(archive);
+    const release = {
+      id: "ohmygame/solarized",
+      version: "1.0.0",
+      url: "https://plugins.example/solarized-1.0.0.zip",
+      size: bytes.length,
+      sha256: createHash("sha256").update(bytes).digest("hex"),
+      key: "test",
+      signature: "",
+    };
+    const sign = (value: typeof release) => ({ ...value, signature: sign_(null, releaseMessage(value), privateKey).toString("base64") });
+    const services = new PluginServices({ directory: path.join(dir, "store") });
+    const downloads: string[] = [];
+    const download = async (url: string, file: string) => {
+      downloads.push(url);
+      await writeFile(file, bytes);
+    };
+    const install = (value: unknown) =>
+      installRelease({ release: value, keys, services, directory: path.join(dir, "store/packages"), download });
+    return { dir, release, sign, services, install, downloads, close: () => services.close() };
+  }
+
+  it("installs a signed release side by side and finds newer ones", async () => {
+    const { release, sign, services, install, close } = await setup();
+    try {
+      const entry = await install(sign(release));
+      expect(entry).toMatchObject({ id: "ohmygame/solarized", version: "1.0.0" });
+      expect(services.index.get("ohmygame/solarized", "1.0.0")?.root).toContain(path.join("packages", "ohmygame", "solarized", "1.0.0"));
+      const catalog = readCatalog({
+        schema: 1,
+        plugins: [{ id: "ohmygame/solarized", releases: [sign(release), sign({ ...release, version: "1.2.0" })] }],
+      });
+      expect(availableUpdates(catalog, services.index).map((item) => item.version)).toEqual(["1.2.0"]);
+    } finally {
+      await close();
+    }
+  });
+
+  it("refuses releases it can't trust before or after downloading", async () => {
+    const { release, sign, install, downloads, close } = await setup();
+    try {
+      await expect(install({ ...release, signature: Buffer.alloc(64).toString("base64") })).rejects.toThrow("invalid signature");
+      await expect(install(sign({ ...release, id: "acme/solarized" }))).rejects.toThrow("doesn't sign for acme");
+      await expect(install(sign({ ...release, key: "other" }))).rejects.toThrow("doesn't know");
+      await expect(install({ ...sign(release), url: "http://plugins.example/x.zip" })).rejects.toThrow("release is invalid");
+      expect(downloads).toEqual([]);
+      await expect(install(sign({ ...release, sha256: "0".repeat(64) }))).rejects.toThrow("doesn't match its digest");
+      // Signed and intact, but the package inside is another version.
+      await expect(install(sign({ ...release, version: "9.9.9" }))).rejects.toThrow("not the ohmygame/solarized 9.9.9");
+      // A signed version is still only a version, never a path.
+      await expect(install(sign({ ...release, version: "../../../escaped" }))).rejects.toThrow("isn't a version");
+    } finally {
+      await close();
+    }
+  });
+
+  it("leaves an installed plugin alone when a release holds its package", async () => {
+    const { release, sign, services, install, close } = await setup();
+    try {
+      await install(sign(release));
+      await services.consent("ohmygame/solarized", []);
+      const before = services.index.get("ohmygame/solarized", "1.0.0")!;
+      // Signed for 1.1.0, but the archive is the 1.0.0 already installed.
+      await expect(install(sign({ ...release, version: "1.1.0" }))).rejects.toThrow("not the ohmygame/solarized 1.1.0");
+      expect(services.index.get("ohmygame/solarized", "1.0.0")).toEqual(before);
+      expect(services.grants.plugin("ohmygame/solarized")).toBeDefined();
+    } finally {
+      await close();
+    }
+  });
+
+  it("unwraps a package zipped with its folder, and reinstalls after an uninstall", async () => {
+    const { dir, release, sign, services, install, close } = await setup({ wrapper: "solarized" });
+    try {
+      const entry = await install(sign(release));
+      expect(entry.version).toBe("1.0.0");
+      await services.uninstall("ohmygame/solarized", "1.0.0");
+      await expect(stat(entry.root)).rejects.toThrow();
+      // A folder an earlier install left behind doesn't block this one.
+      await mkdir(path.join(entry.root, "stale"), { recursive: true });
+      expect((await install(sign(release))).root).toBe(entry.root);
+      await expect(stat(path.join(entry.root, "stale"))).rejects.toThrow();
+      expect(path.relative(path.join(dir, "store/packages"), entry.root)).toBe(path.join("ohmygame", "solarized", "1.0.0"));
+    } finally {
+      await close();
+    }
+  });
+
+  it("keeps a template's dotfiles, and refuses a manifest folder elsewhere", async () => {
+    const template = await setup({
+      prepare: async (dir) => {
+        await mkdir(path.join(dir, "templates/game"), { recursive: true });
+        await writeFile(path.join(dir, "templates/game/.gitignore"), ".godot/\n");
+      },
+    });
+    try {
+      const entry = await template.install(template.sign(template.release));
+      expect(await readFile(path.join(entry.root, "templates/game/.gitignore"), "utf8")).toBe(".godot/\n");
+    } finally {
+      await template.close();
+    }
+    const nested = await setup({
+      prepare: async (dir) => {
+        await mkdir(path.join(dir, "assets/.ohmygame-plugin"), { recursive: true });
+        await writeFile(path.join(dir, "assets/.ohmygame-plugin/plugin.json"), "{}");
+      },
+    });
+    try {
+      await expect(nested.install(nested.sign(nested.release))).rejects.toThrow("manifest folder outside its package");
+    } finally {
+      await nested.close();
+    }
+  });
+
+  it("downloads within the release's size and reports file errors", async () => {
+    const dir = await temporary();
+    const original = globalThis.fetch;
+    globalThis.fetch = (async () => ({
+      ok: true,
+      status: 200,
+      url: "https://plugins.example/x.zip",
+      body: new Response("x".repeat(64)).body,
+    })) as unknown as typeof fetch;
+    try {
+      await downloadRelease("https://plugins.example/x.zip", path.join(dir, "ok.zip"), 64);
+      expect((await readFile(path.join(dir, "ok.zip"))).length).toBe(64);
+      await expect(downloadRelease("https://plugins.example/x.zip", path.join(dir, "big.zip"), 10)).rejects.toThrow("larger than");
+      await expect(downloadRelease("https://plugins.example/x.zip", path.join(dir, "missing", "x.zip"), 64)).rejects.toThrow("ENOENT");
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+
+  it("forgets the version a bundled folder used to hold when the plugin applies by itself, keeping one installed apart", async () => {
+    const dir = await temporary();
+    const services = new PluginServices({ directory: path.join(dir, "store") });
+    try {
+      const bundled = path.join(dir, "bundled");
+      await cp(path.join(BUNDLED, "blender"), path.join(bundled, "blender"), { recursive: true });
+      const apart = path.join(dir, "blender");
+      await cp(path.join(BUNDLED, "blender"), apart, { recursive: true });
+      // Blender itself waits for its files; these copies apply by themselves.
+      await editManifest(apart, (manifest) => {
+        manifest.version = "9.0.0";
+        delete manifest.activation;
+      });
+      await services.index.load();
+      // As an earlier version of the app indexed it, before an update replaced the folder.
+      await editManifest(path.join(bundled, "blender"), (manifest) => {
+        manifest.version = "0.1.0";
+        delete manifest.activation;
+      });
+      expect((await services.index.add(path.join(bundled, "blender"))).ok).toBe(true);
+      expect((await services.index.add(apart)).ok).toBe(true);
+      await editManifest(path.join(bundled, "blender"), (manifest) => (manifest.version = "0.2.0"));
+      await services.addBundled(bundled);
+      expect(services.index.versions("ohmygame/blender").map((entry) => entry.version)).toEqual(["9.0.0", "0.2.0"]);
+      // There is one version in use: the newest.
+      expect((await services.everyProject()).filter((entry) => entry.id === "ohmygame/blender").map((entry) => entry.version)).toEqual(["9.0.0"]);
+    } finally {
+      await services.close();
+    }
+  });
+
+  it("forgets a bundled version whose folder the app no longer has", async () => {
+    const dir = await temporary();
+    const services = new PluginServices({ directory: path.join(dir, "store") });
+    try {
+      for (const name of ["godot", "blender"]) {
+        const old = path.join(dir, "old", name);
+        await cp(path.join(BUNDLED, name), old, { recursive: true });
+        await editManifest(old, (manifest) => (manifest.version = "0.1.0"));
+        await services.index.load();
+        expect((await services.index.add(old)).ok).toBe(true);
+        await cp(path.join(BUNDLED, name), path.join(dir, "new", name), { recursive: true });
+        await editManifest(path.join(dir, "new", name), (manifest) => (manifest.version = "0.2.0"));
+      }
+      await rm(path.join(dir, "old"), { recursive: true });
+      await services.addBundled(path.join(dir, "new"));
+      for (const name of ["godot", "blender"])
+        expect(services.index.versions(`ohmygame/${name}`).map((entry) => entry.version)).toEqual(["0.2.0"]);
+    } finally {
+      await services.close();
+    }
+  });
+
+  it("turns a plugin that only adds Skills on in every project it suits, in a fixed order", async () => {
+    const dir = await temporary();
+    const services = new PluginServices({ directory: path.join(dir, "store"), bundled: BUNDLED, bundledOff: ["ohmygame/unity"] });
+    try {
+      const plugins = async (project?: { type: string; pluginType?: { id: string } }) => (await services.everyProject(project)).map((entry) => entry.id);
+      expect(await plugins()).toEqual(expect.arrayContaining(["ohmygame/game-studio", "ohmygame/web-game-studio"]));
+      expect(await plugins()).not.toContain("ohmygame/unity");
+      // One that names the files it is for waits for a folder that has them.
+      expect(await plugins()).not.toContain("ohmygame/blender");
+      expect(await plugins()).not.toContain("ohmygame/godot");
+      expect(await plugins()).toEqual([...await plugins()].sort());
+      // By the project's kind, which `ohmygame.json` would call general.
+      expect(await plugins({ type: "web-game" })).toContain("ohmygame/web-game-studio");
+      expect(await plugins({ type: "web-game" })).not.toContain("ohmygame/game-studio");
+      expect(await plugins({ type: "general" })).toContain("ohmygame/game-studio");
+      expect(await plugins({ type: "general" })).not.toContain("ohmygame/web-game-studio");
+      // A kind that is a plugin type now matches by either name.
+      expect(await plugins({ type: "godot-game", pluginType: { id: "ohmygame/godot:godot-game" } })).toContain("ohmygame/game-studio");
+      const skills = await services.everyProjectSkills({ type: "general" });
+      expect(skills.map((skill) => path.basename(path.dirname(skill.path)))).toEqual(expect.arrayContaining(["game-studio"]));
+      expect(skills.find((skill) => skill.path.includes("game-studio"))).toMatchObject({ pluginDisplayName: "Game Studio", marketplaceDisplayName: "ohmygame" });
+      await services.setEveryProject("ohmygame/game-studio", false);
+      expect(await plugins({ type: "general" })).not.toContain("ohmygame/game-studio");
+    } finally {
+      await services.close();
+    }
+  });
+
+  it("loads a plugin on in every project once, even where its project file names it", async () => {
+    const dir = await temporary();
+    const folder = path.join(dir, "project");
+    const services = new PluginServices({ directory: path.join(dir, "store"), bundled: BUNDLED });
+    try {
+      await services.ready();
+      const studio = services.index.get("ohmygame/game-studio")!;
+      const once = (await services.skills(await temporary())).filter((skill) => skill.pluginDisplayName === "Game Studio");
+      expect(once.length).toBeGreaterThan(0);
+      await mkdir(folder);
+      await writeFile(path.join(folder, "ohmygame.json"), JSON.stringify({ type: "general", plugins: { "ohmygame/game-studio": studio.version } }));
+      expect((await services.skills(folder)).filter((skill) => skill.pluginDisplayName === "Game Studio")).toEqual(once);
+      // Off in the project, the file says so, since it is on in every project.
+      await services.setProjectPlugin(folder, "ohmygame/game-studio", false);
+      expect(JSON.parse(await readFile(path.join(folder, "ohmygame.json"), "utf8")).plugins?.["ohmygame/game-studio"]).toBe(false);
+      expect((await services.skills(folder)).some((skill) => skill.pluginDisplayName === "Game Studio")).toBe(false);
+    } finally {
+      await services.close();
+    }
+  });
+
+  it("keeps what it knew when the index can't be saved", async () => {
+    const dir = await temporary();
+    const file = path.join(dir, "index.json");
+    const index = new PluginIndex(file);
+    const root = path.join(dir, "blender");
+    await cp(path.join(BUNDLED, "blender"), root, { recursive: true });
+    await editManifest(root, (manifest) => (manifest.version = "1.0.0"));
+    await index.load();
+    const added = await index.add(root);
+    expect(added.ok).toBe(true);
+    const digest = index.get("ohmygame/blender", "1.0.0")?.digest;
+    await rm(file);
+    await mkdir(path.join(file, "occupied"), { recursive: true });
+    await writeFile(path.join(root, "added.txt"), "new");
+    await expect(index.add(root)).rejects.toThrow();
+    expect(index.get("ohmygame/blender", "1.0.0")?.digest).toBe(digest);
+    await editManifest(root, (manifest) => (manifest.version = "2.0.0"));
+    await expect(index.add(root)).rejects.toThrow();
+    expect(index.get("ohmygame/blender", "2.0.0")).toBeUndefined();
+  });
+
+  it("keeps an older version a project names when it asks for more than the newest", async () => {
+    const dir = await temporary();
+    const folder = path.join(dir, "project");
+    const services = new PluginServices({ directory: path.join(dir, "store") });
+    try {
+      await services.index.load();
+      const older = path.join(dir, "older");
+      const newer = path.join(dir, "newer");
+      await cp(path.join(BUNDLED, "blender"), older, { recursive: true });
+      await cp(path.join(BUNDLED, "blender"), newer, { recursive: true });
+      await editManifest(older, (manifest) => {
+        manifest.version = "1.0.0";
+        manifest.capabilities = { "project.files": "write" };
+      });
+      await editManifest(newer, (manifest) => {
+        manifest.version = "2.0.0";
+        delete manifest.activation;
+      });
+      expect((await services.index.add(older)).ok).toBe(true);
+      expect((await services.index.add(newer)).ok).toBe(true);
+      await mkdir(folder);
+      await writeFile(path.join(folder, "ohmygame.json"), JSON.stringify({ type: "general", plugins: { "ohmygame/blender": "1.0.0" } }));
+      // The project runs the version it names, so the newest doesn't apply beside it.
+      const resolved = await services.resolve(folder);
+      expect(resolved.ok && resolved.plugins.map((plugin) => [plugin.version, plugin.status])).toEqual([["1.0.0", "needs-consent"]]);
+      expect(await services.skills(folder)).toEqual([]);
+      expect((await services.everyProject({ type: "general" })).map((entry) => entry.version)).toEqual(["2.0.0"]);
+      // Turning it on at its newest follows every project again.
+      await services.setProjectPlugin(folder, "ohmygame/blender", true);
+      expect(JSON.parse(await readFile(path.join(folder, "ohmygame.json"), "utf8")).plugins).toBeUndefined();
+      expect((await services.skills(folder)).length).toBeGreaterThan(0);
+    } finally {
+      await services.close();
+    }
+  });
+
+  it("installs a package into the store and allows what it asks for", async () => {
+    const dir = await temporary();
+    const services = new PluginServices({ directory: path.join(dir, "store") });
+    try {
+      const source = path.join(dir, "source");
+      await cp(path.join(BUNDLED, "blender"), source, { recursive: true });
+      const entry = await services.installManaged(source);
+      expect(path.relative(services.packagesDirectory, entry.root)).toBe(path.join("ohmygame", "blender", entry.version));
+      expect(services.grants.plugin("ohmygame/blender")).toEqual({ enabled: true, allowed: [] });
+      // Installing the same version again replaces it, and a choice to turn it off stays.
+      await services.setEveryProject("ohmygame/blender", false);
+      await services.installManaged(source);
+      expect(services.index.versions("ohmygame/blender")).toHaveLength(1);
+      expect(services.grants.plugin("ohmygame/blender")?.everyProject).toBe(false);
+      await mkdir(path.join(dir, "empty"));
+      await expect(services.installManaged(path.join(dir, "empty"))).rejects.toThrow("Not a valid plugin");
+      // A copy that can't take over leaves the one in use in place.
+      const installed = path.join(services.packagesDirectory, "ohmygame", "blender", entry.version);
+      const before = await readFile(path.join(installed, ".ohmygame-plugin", "plugin.json"), "utf8");
+      const add = vi.spyOn(services.index, "add").mockResolvedValueOnce({ ok: false, issues: [{ path: "plugin.json", message: "unreadable" }] } as never);
+      await writeFile(path.join(source, "added.txt"), "new");
+      await expect(services.installManaged(source)).rejects.toThrow("unreadable");
+      add.mockRestore();
+      expect(await readFile(path.join(installed, ".ohmygame-plugin", "plugin.json"), "utf8")).toBe(before);
+      await expect(readFile(path.join(installed, "added.txt"))).rejects.toThrow();
+      expect((await readdir(services.packagesDirectory)).filter((name) => name.startsWith("."))).toEqual([]);
+    } finally {
+      await services.close();
+    }
+  });
+
+  it("indexes the app's own plugins and allows what they ask for, keeping off one that starts off", async () => {
+    const dir = await temporary();
+    const services = new PluginServices({ directory: path.join(dir, "store"), bundledOff: ["ohmygame/taptap-maker", "ohmygame/unreal-engine"] });
+    try {
+      const results = await services.addBundled(BUNDLED);
+      expect(results.map((result) => (result.ok ? [] : result.issues))).toEqual(results.map(() => []));
+      expect(services.grants.plugin("ohmygame/godot")?.allowed).toEqual(expect.arrayContaining(["native"]));
+      expect(services.index.entries().map((entry) => entry.id)).toEqual(expect.arrayContaining(["ohmygame/game-studio", "ohmygame/godot", "ohmygame/taptap-maker", "ohmygame/unreal-engine"]));
+      // One that only adds Skills asks for nothing, so it is simply on.
+      expect(services.grants.plugin("ohmygame/game-studio")).toEqual({ enabled: true, allowed: [] });
+      // One that starts off is allowed too, and stays off until the person turns it on.
+      expect(services.grants.plugin("ohmygame/taptap-maker")).toMatchObject({ enabled: true, allowed: expect.arrayContaining(["native"]) });
+      expect(services.onInEveryProject("ohmygame/taptap-maker")).toBe(false);
+      await services.setEveryProject("ohmygame/unreal-engine", true);
+      await services.addBundled(BUNDLED);
+      expect(services.grants.plugin("ohmygame/unreal-engine")).toMatchObject({ enabled: true, everyProject: true });
+      // One the person turned off in every project stays off at the next start.
+      await services.setEveryProject("ohmygame/godot", false);
+      await services.addBundled(BUNDLED);
+      expect(services.onInEveryProject("ohmygame/godot")).toBe(false);
+    } finally {
+      await services.close();
+    }
+  });
+});

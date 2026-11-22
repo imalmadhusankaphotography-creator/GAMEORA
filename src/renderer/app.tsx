@@ -1,0 +1,211 @@
+import { lazy, Suspense, useEffect, useState } from "react";
+import { Home } from "./home.js";
+// Only lazy routes use this; loading it eagerly keeps it ahead of styles.css as before code splitting.
+import "./plugin-builder.css";
+import { communityHash, createdProjectView, conversationHash, DEFAULT_SETTINGS_SECTION, gameHash, parseAppRoute, pluginBuilderHash, pluginHash, pluginsTabHash, projectHash, projectsHash, settingsHash, sidebarHash, type AppNavigationTarget, type SettingsSection } from "./routes.js";
+import { historyState, useAppNavigation } from "./app-navigation.js";
+import { PageFrame } from "./page-frame.js";
+import { SidebarPageLayout } from "./sidebar-page.js";
+import type { SidebarActive } from "./app-sidebar.js";
+import { WindowDragRegion } from "./window-drag-region.js";
+import type { PluginMention, ProjectState, PromptAttachment, PromptImage, PromptMode } from "../shared/contracts.js";
+import type { PluginTryTarget } from "./plugin-try.js";
+import { pluginMentionToken } from "../shared/plugins.js";
+import { t } from "./i18n.js";
+import { createConversation, createProject, getProject, listPluginThemes, MODELS_CHANGED_EVENT, turnOnProjectPlugin } from "./api.js";
+import { syncPluginTheme } from "./appearance.js";
+import type { ComposerDraft } from "./composer.js";
+import { runtimeConnection, useReadyRuntimeGeneration } from "./runtime-connection.js";
+import { Onboarding, OnboardingArrival, OnboardingLoadError, OnboardingLoading, type OnboardingStart } from "./onboarding.js";
+import { useOnboarding } from "./use-onboarding.js";
+import { CommandMenuHost } from "./command-menu.js";
+import { useNotificationTargets } from "./agent-notifications.js";
+import { rememberLastProject } from "./general-preferences.js";
+import { useRunAlerts } from "./run-alerts.js";
+import { GameRecordingNotices } from "./game-recording.js";
+
+// Home and onboarding stay in the main chunk; every other route loads on first visit.
+const CommunityProfilePage = lazy(() => import("./community-profile.js").then((module) => ({ default: module.CommunityProfilePage })));
+const GamesPage = lazy(() => import("./games.js").then((module) => ({ default: module.GamesPage })));
+const GamePlayer = lazy(() => import("./games.js").then((module) => ({ default: module.GamePlayer })));
+const LibraryPage = lazy(() => import("./library.js").then((module) => ({ default: module.LibraryPage })));
+const ProjectsPage = lazy(() => import("./projects.js").then((module) => ({ default: module.ProjectsPage })));
+const ProjectShell = lazy(() => import("./project-shell.js").then((module) => ({ default: module.ProjectShell })));
+const SettingsPage = lazy(() => import("./settings-page.js").then((module) => ({ default: module.SettingsPage })));
+const PluginsSettings = lazy(() => import("./plugins.js").then((module) => ({ default: module.PluginsSettings })));
+const PluginBuilder = lazy(() => import("./plugin-builder.js").then((module) => ({ default: module.PluginBuilder })));
+
+export function App() {
+  const navigation = useAppNavigation();
+  useRunAlerts((projectId) => navigation.navigate(projectHash(projectId)));
+  return <>
+    <AppRoute navigation={navigation} />
+    <CommandMenuHost navigate={navigation.navigate} />
+    <GameRecordingNotices />
+  </>;
+}
+
+function AppRoute({ navigation }: { navigation: ReturnType<typeof useAppNavigation> }) {
+  const serviceGeneration = useReadyRuntimeGeneration();
+  const { route, navigate, projectReturnTo, projectBackLabel } = navigation;
+  const onboarding = useOnboarding(route.page === "home");
+  const [welcoming, setWelcoming] = useState(false);
+  const [start, setStart] = useState<OnboardingStart>();
+  const [initialPrompt, setInitialPrompt] = useState<{ generation: number; conversationId: string; prompt: string; mentions: PluginMention[]; images: PromptImage[]; mode: PromptMode; attachments?: PromptAttachment[] }>();
+  const [initialDraft, setInitialDraft] = useState<{ conversationId: string; draft: ComposerDraft }>();
+  const [initialCanvasNode, setInitialCanvasNode] = useState<{ projectId: string; nodeId: string }>();
+  const [playtestEditorProjectId, setPlaytestEditorProjectId] = useState<string>();
+
+  // A reconnected runtime may have different providers; model pickers reload theirs.
+  useEffect(() => {
+    if (serviceGeneration > 1) window.dispatchEvent(new Event(MODELS_CHANGED_EVENT));
+  }, [serviceGeneration]);
+  // A plugin theme follows its plugin: updated with it, gone with it.
+  useEffect(() => {
+    void syncPluginTheme(listPluginThemes);
+  }, [serviceGeneration]);
+
+  // A Playtest window that cannot play asks for its project's editor.
+  const routeProjectId = route.page === "project" ? route.projectId : undefined;
+  // Settings → General can reopen it at the next launch.
+  useEffect(() => { if (routeProjectId) rememberLastProject(routeProjectId); }, [routeProjectId]);
+  useEffect(() => window.ohMyGameDesktop?.onShowPlaytestEditor?.((projectId) => {
+    if (projectId !== routeProjectId) openProject(projectId);
+    setPlaytestEditorProjectId(projectId);
+  }), [routeProjectId]);
+  useNotificationTargets((target) => navigateToConversation(target.projectId, target.conversationId));
+
+  if ((route.page === "home" || onboarding.replaying) && onboarding.state?.status === "pending") {
+    return <Onboarding step={onboarding.state.step}
+      onStepChange={(step) => onboarding.save({ status: "pending", step })}
+      onFinish={async (status, next) => { await onboarding.save({ status, step: onboarding.state?.step ?? "welcome" }); setStart(next); setWelcoming(true); navigate("#/"); }} />;
+  }
+  if (route.page === "home" && !onboarding.state) {
+    return onboarding.error
+      ? <OnboardingLoadError error={onboarding.error} onRetry={onboarding.retry} />
+      : <PageFrame active="home" onNavigate={navigateToSidebarPage}><OnboardingLoading /></PageFrame>;
+  }
+  if (route.page === "plugin-builder") return <Suspense fallback={<RouteLoading />}><PluginBuilder key={route.sessionId} sessionId={route.sessionId} conversationId={route.conversationId}
+    onOpenConversation={(conversationId, replace) => navigate(pluginBuilderHash(route.sessionId, conversationId), { replace })} onNavigate={navigateToSidebarPage} onTryPlugin={tryPlugin} /></Suspense>;
+  if (route.page === "settings") {
+    return <Suspense fallback={sidebarFallback("settings")}><SettingsPage section={route.section} agent={route.agent} onSectionChange={navigateToSettingsSection} onNavigate={navigateToSidebarPage} onOpenOnboarding={onboarding.open} /></Suspense>;
+  }
+  if (route.page === "plugins") return <SidebarPageLayout active="plugins" onNavigate={navigateToSidebarPage}>
+    <Suspense fallback={null}><PluginsSettings pluginId={route.pluginId} adds={route.adds} tab={route.tab} onPluginChange={navigateToPlugin}
+      onTabChange={tab => navigate(pluginsTabHash(tab), { replace: true, state: historyState() })} onTryPlugin={tryPlugin} /></Suspense>
+  </SidebarPageLayout>;
+  if (route.page === "home") {
+    return <><Home inert={welcoming} start={start} onStartHandled={() => setStart(undefined)} onNavigate={navigateToSidebarPage} onCreate={openCreatedProject} onOpen={openProject} onOpenAssetCanvas={openAssetCanvasProject} />{welcoming ? <OnboardingArrival onComplete={() => setWelcoming(false)} /> : null}</>;
+  }
+  if (route.page === "community") {
+    return <Suspense fallback={sidebarFallback("community")}><GamesPage onNavigate={navigateToSidebarPage} onOhMyGame={ohMyGame} /></Suspense>;
+  }
+  if (route.page === "community-profile") return <Suspense fallback={sidebarFallback("community")}><CommunityProfilePage authorId={route.authorId} onNavigate={navigateToSidebarPage} onBack={goToGames} onOpenGame={ohMyGame} /></Suspense>;
+  if (route.page === "game") return <Suspense fallback={sidebarFallback("community")}><GamePlayer gameId={route.gameId} onBack={goToGames} onNavigate={navigateToSidebarPage} onOhMyGame={ohMyGame} /></Suspense>;
+  if (route.page === "projects") return <Suspense fallback={sidebarFallback("projects")}><ProjectsPage projectType={route.projectType} query={route.query} sort={route.sort} onFiltersChange={(filters, replace) => navigate(projectsHash(filters), { replace })} onNavigate={navigateToSidebarPage} onOpenProject={openProject} /></Suspense>;
+  if (route.page === "library") return <Suspense fallback={sidebarFallback("library")}><LibraryPage onNavigate={navigateToSidebarPage} onOpenProject={openProject} /></Suspense>;
+  if (route.page === "playtest") return null;
+  if (route.page !== "project") return null;
+  return (
+    <Suspense fallback={<RouteLoading />}><ProjectShell
+      key={route.projectId}
+      projectId={route.projectId}
+      conversationId={route.conversationId}
+      view={route.view}
+      onViewChange={(view, options) => {
+        const nextView = view === "design" ? "design" : undefined;
+        const hash = route.conversationId ? conversationHash(route.projectId, route.conversationId, nextView) : projectHash(route.projectId, nextView);
+        navigate(hash, { replace: options?.replace });
+      }}
+      initialPrompt={initialPrompt && initialPrompt.conversationId === route.conversationId ? initialPrompt : undefined}
+      initialDraft={initialDraft && initialDraft.conversationId === route.conversationId ? initialDraft.draft : undefined}
+      initialCanvasNodeId={initialCanvasNode?.projectId === route.projectId ? initialCanvasNode.nodeId : undefined}
+      onInitialCanvasNodeHandled={() => setInitialCanvasNode(undefined)}
+      showStoryMap={playtestEditorProjectId === route.projectId}
+      onStoryMapShown={() => setPlaytestEditorProjectId(undefined)}
+      onInitialPromptHandled={clearInitialPrompt}
+      onInitialDraftHandled={() => setInitialDraft(undefined)}
+      onOpenConversation={(conversationId, replace = false) => navigateToConversation(route.projectId, conversationId, replace)}
+      onNavigate={navigateToSidebarPage}
+      onHome={() => navigate(projectReturnTo)}
+      homeLabel={projectBackLabel}
+    /></Suspense>
+  );
+
+  // Keeps the sidebar in place while a sidebar page's chunk loads.
+  function sidebarFallback(active: SidebarActive) {
+    return <PageFrame active={active} onNavigate={navigateToSidebarPage}>{null}</PageFrame>;
+  }
+
+  function openCreatedProject(project: ProjectState, conversationId: string, prompt: string, mentions: PluginMention[], images: PromptImage[], mode: PromptMode, attachments?: PromptAttachment[]): void {
+    const connection = runtimeConnection();
+    setInitialPrompt({ generation: connection.status === "ready" ? connection.generation : -1, conversationId, prompt, mentions, images, mode, attachments });
+    navigateToConversation(project.id, conversationId, false, createdProjectView(project.type));
+  }
+
+  function openProject(projectId: string, view?: "design"): void {
+    setInitialPrompt(undefined);
+    setInitialDraft(undefined);
+    navigate(projectHash(projectId, view));
+  }
+
+  // Home's creation templates open their new canvas on the node to start from.
+  function openAssetCanvasProject(projectId: string, nodeId?: string): void {
+    setInitialPrompt(undefined);
+    setInitialDraft(undefined);
+    setInitialCanvasNode(nodeId ? { projectId, nodeId } : undefined);
+    navigate(projectHash(projectId));
+  }
+
+  async function tryPlugin({ mention, turnOn, newProjectType }: PluginTryTarget, prompt: string, projectId?: string): Promise<void> {
+    const project = projectId ? await getProject(projectId) : await createProject({ type: newProjectType ?? "general" });
+    const blocked = turnOn ? await turnOnProjectPlugin(project.id, turnOn) : undefined;
+    if (blocked) throw new Error(blocked === "not-offered" ? t("pluginStore.doesNotSuitProject") : t(`projectPlugins.status.${blocked}`));
+    const conversation = await createConversation(project.id);
+    setInitialPrompt(undefined);
+    setInitialDraft({
+      conversationId: conversation.id,
+      draft: mention ? { prompt: `${pluginMentionToken(mention)} ${prompt}`, mentions: [mention] } : { prompt, mentions: [] },
+    });
+    navigateToConversation(project.id, conversation.id, false, createdProjectView(project.type));
+  }
+
+  function clearInitialPrompt(): void {
+    setInitialPrompt(undefined);
+  }
+
+  function navigateToConversation(projectId: string, conversationId: string, replace = false, initialView?: "design"): void {
+    const current = parseAppRoute(window.location.hash);
+    const view = initialView ?? (current.page === "project" && current.projectId === projectId ? current.view : undefined);
+    navigate(conversationHash(projectId, conversationId, view), { replace });
+  }
+
+  function ohMyGame(gameId: string): void {
+    navigate(gameHash(gameId));
+  }
+
+  function goToGames(): void {
+    const hash = communityHash();
+    navigate(hash, { replace: true });
+  }
+
+  function navigateToSidebarPage(page: AppNavigationTarget): void {
+    const hash = page === "settings" ? settingsHash(DEFAULT_SETTINGS_SECTION) : sidebarHash(page);
+    if (window.location.hash === hash) return;
+    navigate(hash);
+  }
+
+  function navigateToSettingsSection(section: SettingsSection, agent?: string): void {
+    // An agent's page is a step into its section, so Back returns to the list.
+    navigate(settingsHash(section, agent), agent ? { state: historyState() } : { replace: true, state: historyState() });
+  }
+
+  function navigateToPlugin(pluginId?: string): void {
+    navigate(pluginHash(pluginId), { replace: true, state: historyState() });
+  }
+
+}
+
+function RouteLoading() {
+  return <main className="route-loading" aria-busy="true"><WindowDragRegion /></main>;
+}

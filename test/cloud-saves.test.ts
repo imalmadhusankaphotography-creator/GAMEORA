@@ -1,0 +1,269 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { createLocalJWKSet, exportJWK, generateKeyPair, SignJWT } from "jose";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { init, isOhMyGameError, SAVE_MAX_BYTES, SAVE_MAX_KEYS, SCORE_SUBMITS_PER_MINUTE, type CloudConfig } from "@ohmygame/game-sdk";
+import { gameTokenAudience } from "@ohmygame/game-sdk/account-protocol";
+import type { AccountEnvironment } from "../packages/game-sdk/src/account.js";
+import { createMultiplayerServer, MemoryGameDataStore } from "@ohmygame/server";
+
+/** A browser's localStorage, one per simulated browser. */
+function browser(): Storage {
+  const items = new Map<string, string>();
+  return {
+    get length() {
+      return items.size;
+    },
+    key: (index) => [...items.keys()][index] ?? null,
+    getItem: (key) => items.get(key) ?? null,
+    setItem: (key, value) => void items.set(key, String(value)),
+    removeItem: (key) => void items.delete(key),
+    clear: () => items.clear(),
+  };
+}
+
+const ISSUER = "https://accounts.example.test";
+let directory: string;
+let service: ReturnType<typeof createMultiplayerServer>;
+let cloud: CloudConfig;
+let sign: (sub: string, name: string) => Promise<string>;
+
+beforeAll(async () => {
+  const { publicKey, privateKey } = await generateKeyPair("ES256");
+  const accountKeys = createLocalJWKSet({ keys: [{ ...(await exportJWK(publicKey)), alg: "ES256" }] });
+  sign = (sub, name) =>
+    new SignJWT({ name })
+      .setProtectedHeader({ alg: "ES256" })
+      .setIssuer(ISSUER)
+      .setAudience(gameTokenAudience("puzzle"))
+      .setSubject(sub)
+      .setIssuedAt()
+      .setExpirationTime("15m")
+      .sign(privateKey);
+  directory = await mkdtemp(path.join(tmpdir(), "ohmygame-cloud-saves-"));
+  service = createMultiplayerServer({
+    deployments: [],
+    auth: { guestSecret: "a".repeat(32), accountIssuer: ISSUER, accountKeys },
+    databasePath: path.join(directory, "rooms.sqlite"),
+    host: "127.0.0.1",
+    port: 0,
+    allowLocalhost: true,
+    logger: false,
+    gameData: { store: new MemoryGameDataStore() },
+  });
+  await service.start();
+  cloud = { serverUrl: `http://127.0.0.1:${service.port}`, gameId: "puzzle" };
+});
+afterAll(async () => {
+  await service.stop();
+  await rm(directory, { recursive: true, force: true });
+});
+
+/** The browser features game.auth uses, for a page at a published game's address. */
+function page(storage: Storage): AccountEnvironment {
+  return {
+    fetch: () => Promise.reject(new Error("No account service in this test.")),
+    storage,
+    location: { href: "https://g-puzzle.play.example.test/", origin: "https://g-puzzle.play.example.test", assign() {} },
+    replaceUrl() {},
+    openPopup: () => null,
+    opener: null,
+    parent: null,
+    close() {},
+    listen: () => () => {},
+    crypto: globalThis.crypto,
+    now: () => Date.now(),
+  };
+}
+
+/** A game page in one browser: a guest, or signed in when token is given. */
+function open(storage: Storage, options: { token?: () => Promise<string>; serverUrl?: string } = {}) {
+  return init({
+    manifest: { cloud: { ...cloud, ...(options.serverUrl ? { serverUrl: options.serverUrl } : {}) } },
+    allowLocalhost: true,
+    storage,
+    ...(options.token ? { identity: { getToken: options.token } } : {}),
+  });
+}
+
+describe("cloud saves in the browser SDK", () => {
+  it("keeps saves in the browser for a game without a game service", async () => {
+    const storage = browser();
+    const game = await init({ manifest: {}, storage });
+    expect(game.storage.cloud).toBe(false);
+    await game.storage.set("progress", { level: 3 });
+    await game.storage.set("settings", { sound: false });
+    expect(await game.storage.get("progress")).toEqual({ level: 3 });
+    expect(await game.storage.keys()).toEqual(["progress", "settings"]);
+    await game.storage.remove("settings");
+    expect(await game.storage.get("settings")).toBeUndefined();
+    // The same browser opens the game again.
+    expect(await (await init({ manifest: {}, storage })).storage.get("progress")).toEqual({ level: 3 });
+    expect(game.leaderboard.available).toBe(false);
+    await expect(game.leaderboard.top("points")).rejects.toMatchObject({ code: "not_configured" });
+    await expect(game.storage.set("bad key", 1)).rejects.toMatchObject({ code: "invalid_option" });
+    await expect(game.storage.set("fn", () => {})).rejects.toMatchObject({ code: "invalid_option" });
+    await expect(game.storage.set("big", "x".repeat(SAVE_MAX_BYTES))).rejects.toMatchObject({ code: "quota_exceeded" });
+    await expect(init({ manifest: { cloud: { ...cloud, gameId: "../x" } }, allowLocalhost: true })).rejects.toMatchObject({ code: "not_configured" });
+    await expect(init({ manifest: { cloud } })).rejects.toMatchObject({ code: "not_configured" });
+  });
+
+  it("saves offline, sends the save once the service is back, and keeps the same guest", async () => {
+    const storage = browser();
+    // The service cannot be reached: the save stays in the browser.
+    const offline = await open(storage, { serverUrl: "http://127.0.0.1:9" });
+    await offline.storage.set("progress", { level: 1 });
+    expect(await offline.storage.get("progress")).toEqual({ level: 1 });
+    expect(await offline.storage.keys()).toEqual(["progress"]);
+
+    const online = await open(storage);
+    await online.storage.sync();
+    // Another tab of the same browser reads the copy the service now has.
+    const service = (await open(browser())).storage;
+    expect(await service.get("progress")).toBeUndefined();
+    const guestToken = JSON.parse(storage.getItem(`ohmygame:multiplayer:guest:${cloud.serverUrl}`)!).token as string;
+    const response = await fetch(`${cloud.serverUrl}/v1/games/puzzle/saves/progress`, { headers: { Authorization: `Bearer ${guestToken}` } });
+    expect(await response.json()).toMatchObject({ value: { level: 1 }, version: 1 });
+
+    // An expired guest session renews as the same guest, who still has the save.
+    const key = `ohmygame:multiplayer:guest:${cloud.serverUrl}`;
+    storage.setItem(key, JSON.stringify({ ...JSON.parse(storage.getItem(key)!), expiresAt: Date.now() - 1000 }));
+    for (const name of Object.keys(Object.fromEntries(Array.from({ length: storage.length }, (_, index) => [storage.key(index)!, 1]))))
+      if (name.startsWith("ohmygame:save:")) storage.removeItem(name);
+    expect(await (await open(storage)).storage.get("progress")).toEqual({ level: 1 });
+  });
+
+  it("brings a guest's saves into the account on sign-in and follows the player to another device", async () => {
+    const laptop = browser();
+    const guest = await open(laptop);
+    await guest.storage.set("progress", { level: 7 });
+    await guest.storage.set("settings", { music: 0.5 });
+
+    const token = () => sign("ada", "Ada");
+    const signedIn = await open(laptop, { token });
+    expect(await signedIn.storage.get("progress")).toEqual({ level: 7 });
+    await signedIn.storage.set("progress", { level: 8 });
+
+    const phone = await open(browser(), { token });
+    expect(await phone.storage.get("progress")).toEqual({ level: 8 });
+    // Only what the player read after signing in came along; the rest stays with the guest.
+    expect(await phone.storage.keys()).toEqual(["progress"]);
+    expect(await phone.storage.get("settings")).toBeUndefined();
+    expect(await signedIn.storage.get("settings")).toEqual({ music: 0.5 });
+    expect(await phone.storage.keys()).toEqual(["progress", "settings"]);
+
+    // A save the account already has wins over the guest's.
+    const other = browser();
+    await (await open(other)).storage.set("progress", { level: 1 });
+    expect(await (await open(other, { token })).storage.get("progress")).toEqual({ level: 8 });
+
+    await phone.storage.remove("settings");
+    expect(await signedIn.storage.get("settings")).toBeUndefined();
+  });
+
+  it("gives everything a guest kept to the OhMyGame account they sign in to, and a new guest after signing out", async () => {
+    const laptop = browser();
+    const guest = await open(laptop);
+    await guest.storage.set("progress", { level: 7 });
+    await guest.storage.set("settings", { music: 0.5 });
+    await guest.leaderboard.submit("guest-points", 42);
+    const guestKey = `ohmygame:multiplayer:guest:${cloud.serverUrl}`;
+    expect(laptop.getItem(guestKey)).not.toBeNull();
+
+    // OhMyGame signs the player in: a session in this browser, as game.auth keeps it.
+    const signIn = async (storage: Storage) => {
+      storage.setItem(`ohmygame:account:${ISSUER}`, JSON.stringify({
+        accessToken: await sign("dee", "Dee"),
+        expiresAt: Date.now() + 600_000,
+        player: { id: "dee", name: "Dee" },
+      }));
+      return init({ manifest: { cloud, account: { issuer: ISSUER } }, allowLocalhost: true, storage, accountEnvironment: page(storage) });
+    };
+    const signedIn = await signIn(laptop);
+    expect(signedIn.auth.player).toEqual({ id: "dee", name: "Dee" });
+    // Every save comes along at once, not only those read after signing in, and so does the score, now public.
+    expect(await signedIn.storage.keys()).toEqual(["progress", "settings"]);
+    expect(laptop.getItem(guestKey)).toBeNull();
+    const phone = await signIn(browser());
+    expect(await phone.storage.get("settings")).toEqual({ music: 0.5 });
+    expect(await phone.leaderboard.top("guest-points")).toEqual([expect.objectContaining({ playerId: "dee", name: "Dee", score: 42 })]);
+
+    // Signed out, the laptop plays as a new guest with nothing kept.
+    await signedIn.auth.signOut();
+    expect(signedIn.auth.player).toBeUndefined();
+    expect(await signedIn.storage.keys()).toEqual([]);
+    expect(await signedIn.leaderboard.me("guest-points")).toBeUndefined();
+  });
+
+  it("leaves a guest the saves their account already had, and keeps a guest whose account token is refused", async () => {
+    // The account saved level 2 on another device; on a new laptop the player reaches level 30 as a guest.
+    const other = await open(browser(), { token: () => sign("eve", "Eve") });
+    await other.storage.set("progress", { level: 2 });
+    const laptop = browser();
+    const guest = await open(laptop);
+    await guest.storage.set("progress", { level: 30 });
+    await guest.storage.set("settings", { music: 1 });
+    const guestKey = `ohmygame:multiplayer:guest:${cloud.serverUrl}`;
+    const session = async (storage: Storage, accessToken: string) => {
+      storage.setItem(`ohmygame:account:${ISSUER}`, JSON.stringify({ accessToken, expiresAt: Date.now() + 600_000, player: { id: "eve", name: "Eve" } }));
+      return init({ manifest: { cloud, account: { issuer: ISSUER } }, allowLocalhost: true, storage, accountEnvironment: page(storage) });
+    };
+
+    // A refused account token is not the guest's: they stay, and so does everything they kept.
+    const refused = await session(laptop, "not-a-token");
+    await expect(refused.storage.keys()).rejects.toMatchObject({ code: "request_failed" });
+    expect(laptop.getItem(guestKey)).not.toBeNull();
+
+    const signedIn = await session(laptop, await sign("eve", "Eve"));
+    // The account keeps its own save and takes the one it lacked; the guest is not forgotten.
+    expect(await signedIn.storage.get("progress")).toEqual({ level: 2 });
+    expect(await signedIn.storage.get("settings")).toEqual({ music: 1 });
+    expect(laptop.getItem(guestKey)).not.toBeNull();
+    // Signed out, the same guest finds the level-30 save again.
+    await signedIn.auth.signOut();
+    expect(await signedIn.storage.get("progress")).toEqual({ level: 30 });
+    expect(await signedIn.storage.keys()).toEqual(["progress"]);
+  });
+
+  it("reports the service's quota with its code", async () => {
+    const game = await open(browser(), { token: () => sign("hoarder", "Hoarder") });
+    for (let index = 0; index < SAVE_MAX_KEYS; index++) await game.storage.set(`slot-${index}`, index);
+    const refused = await game.storage.set("one-more", 1).catch((cause: unknown) => cause);
+    expect(isOhMyGameError(refused, "quota_exceeded")).toBe(true);
+    // A refused save does not wait to be sent again.
+    await game.storage.sync();
+    expect(await game.storage.keys()).toHaveLength(SAVE_MAX_KEYS);
+  });
+});
+
+describe("leaderboards in the browser SDK", () => {
+  it("ranks signed-in players, keeps a guest's score private and reports limits", async () => {
+    const ada = await open(browser(), { token: () => sign("lb-ada", "Ada") });
+    const bo = await open(browser(), { token: () => sign("lb-bo", "Bo") });
+    const guest = await open(browser());
+    expect(ada.leaderboard.available).toBe(true);
+    expect(await ada.leaderboard.me("points")).toBeUndefined();
+    expect(await ada.leaderboard.submit("points", 300)).toMatchObject({ score: 300, rank: 1, public: true, improved: true });
+    expect(await bo.leaderboard.submit("points", 200)).toMatchObject({ rank: 2 });
+    expect(await ada.leaderboard.submit("points", 100)).toMatchObject({ score: 300, improved: false });
+    expect(await guest.leaderboard.submit("points", 250)).toMatchObject({ rank: 2, public: false });
+    expect((await guest.leaderboard.top("points")).map(({ playerId, name, score }) => ({ playerId, name, score }))).toEqual([
+      { playerId: "lb-ada", name: "Ada", score: 300 },
+      { playerId: "lb-bo", name: "Bo", score: 200 },
+    ]);
+    expect(await bo.leaderboard.top("points", { limit: 1, offset: 1 })).toEqual([expect.objectContaining({ rank: 2, name: "Bo" })]);
+    expect(await guest.leaderboard.me("points")).toMatchObject({ score: 250, rank: 2, public: false });
+
+    expect(await ada.leaderboard.submit("time", 42.5, { order: "asc" })).toMatchObject({ score: 42.5 });
+    // Later scores take the board's order; naming the other one is refused.
+    expect(await ada.leaderboard.submit("time", 40)).toMatchObject({ score: 40, improved: true });
+    await expect(ada.leaderboard.submit("time", 30, { order: "desc" })).rejects.toMatchObject({ code: "conflict" });
+    await expect(ada.leaderboard.submit("time", Number.NaN)).rejects.toMatchObject({ code: "invalid_option" });
+    await expect(ada.leaderboard.top("time", { limit: 1000 })).rejects.toMatchObject({ code: "invalid_option" });
+
+    const eager = await open(browser(), { token: () => sign("lb-eager", "Eager") });
+    for (let index = 0; index < SCORE_SUBMITS_PER_MINUTE; index++) await eager.leaderboard.submit("points", index);
+    await expect(eager.leaderboard.submit("points", 1)).rejects.toMatchObject({ code: "rate_limited" });
+  });
+});

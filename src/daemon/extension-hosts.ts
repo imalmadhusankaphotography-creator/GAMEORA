@@ -1,0 +1,1140 @@
+import type { PluginSessionRequest } from "../shared/plugin-sessions.js";
+import { fork, type ChildProcess } from "node:child_process";
+import { existsSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import {
+  EXTENSION_HOST_PROTOCOL_VERSION,
+  HOST_MESSAGE_MAX_CHARS,
+  HOST_RESULT_MAX_BYTES,
+  isHostMessage,
+  type ExtensionHostPlugin,
+  type HostMessage,
+  type HostRequest,
+  type HostStats,
+  type PluginBuild,
+  type PluginConfigurationValues,
+  type PluginGameRequest,
+  type PluginBrowserRequest,
+  type PluginModelsHostRequest,
+} from "../shared/extension-host-protocol.js";
+import type { PluginLogEntry } from "../shared/plugins.js";
+import {
+  registerProjectProcess,
+  terminateProjectProcess,
+} from "./process-lifecycle.js";
+import { projectProcessEnvironment } from "./project-process.js";
+
+// Plugin native code runs here: in extension host processes the daemon
+// starts on first need, one for app-level plugins and one per project, never
+// in the daemon itself. A host that crashes or hangs takes only its own calls
+// with it; the next call starts a fresh one. A plugin that keeps crashing its
+// host is quarantined until it is released.
+//
+// Native code has the person's full trust, so these limits keep mistakes
+// (a hang, a leak, a huge result) from spreading; they don't contain a
+// plugin that means harm.
+
+export type ExtensionHostFailure =
+  | "cancelled"
+  | "timeout"
+  | "crashed"
+  | "quarantined"
+  | "failed"
+  /** The plugin isn't on where it was called, or doesn't declare what was called. */
+  | "unavailable";
+
+export class ExtensionHostError extends Error {
+  constructor(
+    readonly code: ExtensionHostFailure,
+    message: string,
+  ) {
+    super(message);
+    this.name = "ExtensionHostError";
+  }
+}
+
+export interface ExtensionHostOptions {
+  /** Stops a host with no calls in flight after this long. */
+  idleMs?: number;
+  callTimeoutMs?: number;
+  activationTimeoutMs?: number;
+  /**
+   * How long a cancelled call may take to settle, or a stopping host to
+   * clean up, before its process is stopped.
+   */
+  cancelGraceMs?: number;
+  /** Crashes or hangs within `crashWindowMs` that quarantine a plugin. */
+  crashLimit?: number;
+  crashWindowMs?: number;
+  /** A host's JavaScript heap limit; running out crashes the host, which counts as a crash. */
+  maxHeapMb?: number;
+  /** The host process entry; tests may point at their own. */
+  hostEntry?: string;
+  /** Hears what each plugin printed, what of its failed, and when its host stopped, for its log. */
+  onLog?: (plugin: string, entry: Omit<PluginLogEntry, "at">) => void;
+}
+
+export type InvokeOptions = {
+  /** "app", or the key of the project the call is for. */
+  scope: string;
+  /** The folder a project scope serves; plugins see it as `context.project`. */
+  project?: string;
+  plugin: ExtensionHostPlugin;
+  input?: unknown;
+  signal?: AbortSignal;
+  timeoutMs?: number;
+  onProgress?: (message: string, url?: string) => void;
+  /** The agent turn the call belongs to. */
+  turn?: string;
+  /** The plugin's configuration values, sent with the call so a change applies to the next one. */
+  configuration?: PluginConfigurationValues;
+  /** The web build a command asked for. */
+  build?: PluginBuild;
+  /**
+   * Runs once the plugin is active, right before the call is sent; throwing
+   * refuses the call. Lets the caller check that the plugin is still allowed
+   * after waiting for its activation.
+   */
+  check?: () => void | Promise<void>;
+} & (
+  | { tool: string; command?: never; projectType?: never; hook?: never }
+  | { command: string; tool?: never; projectType?: never; hook?: never }
+  /** A project type hook, `<type>:<hook>`. */
+  | { projectType: string; tool?: never; command?: never; hook?: never }
+  /** An event hook from `contributes.hooks`. */
+  | { hook: string; tool?: never; command?: never; projectType?: never }
+);
+
+/** Who a host's `game` request comes from. */
+export interface HostGameCaller {
+  scope: string;
+  /** The folder the host serves. */
+  project: string | undefined;
+  generation: number;
+  plugin: string;
+}
+
+/** What answers plugins' `context.game`; see `ExtensionHosts.serveGame`. */
+export interface HostGameService {
+  handle(caller: HostGameCaller, request: PluginGameRequest, signal: AbortSignal): Promise<unknown>;
+  /** A host stopped, or unloaded `plugin`: the sessions they opened end. */
+  release(released: { scope: string; generation: number; plugin?: string }): void;
+}
+
+type HostBrowserService = (folder: string, plugin: string, request: PluginBrowserRequest, signal: AbortSignal) => Promise<void>;
+
+export interface HostSessionService {
+  handle(caller: HostGameCaller, request: PluginSessionRequest, signal: AbortSignal): Promise<unknown>;
+}
+
+/** What answers plugins' `context.models`; see `ExtensionHosts.serveModels`. */
+export interface HostModelService {
+  handle(caller: HostGameCaller, request: PluginModelsHostRequest, signal: AbortSignal): Promise<unknown>;
+}
+
+export interface ActivePlugin {
+  version: string;
+  tools: string[];
+  commands: string[];
+  activationMs: number;
+}
+
+/** A plugin a scope's host has loaded or is loading. */
+export interface ScopePlugin {
+  version: string;
+  /** The package folder the version comes from. */
+  root: string;
+  loaded: boolean;
+}
+
+export interface ExtensionHostStatus {
+  scope: string;
+  pid: number | undefined;
+  startMs: number | undefined;
+  pending: number;
+  plugins: Record<string, ActivePlugin>;
+  stats?: HostStats;
+}
+
+type WithoutId<T> = T extends unknown ? Omit<T, "id"> : never;
+
+/** The reply each request expects, besides `error`. */
+const REPLIES: Record<HostRequest["type"], HostMessage["type"] | undefined> = {
+  activate: "activated",
+  invoke: "result",
+  deactivate: "result",
+  stats: "stats",
+  cancel: undefined,
+  shutdown: undefined,
+  "game-reply": undefined,
+  "sessions-reply": undefined,
+  "browser-reply": undefined,
+  "models-reply": undefined,
+};
+
+interface Pending {
+  type: HostRequest["type"];
+  plugin?: string;
+  /** Diagnostics requests don't count as use, so they don't keep a host alive. */
+  activity: boolean;
+  settle(message: HostMessage | ExtensionHostError): void;
+  /** Gives up on the call: cancels it, and stops the host if it doesn't settle. */
+  giveUp(error: ExtensionHostError): void;
+  onProgress?: (message: string, url?: string) => void;
+}
+
+interface Activation {
+  version: string;
+  root: string;
+  done: Promise<void>;
+}
+
+const DEFAULTS = {
+  idleMs: 5 * 60_000,
+  callTimeoutMs: 60_000,
+  activationTimeoutMs: 15_000,
+  cancelGraceMs: 2_000,
+  crashLimit: 3,
+  crashWindowMs: 5 * 60_000,
+  maxHeapMb: 1024,
+} satisfies Omit<Required<ExtensionHostOptions>, "hostEntry" | "onLog">;
+
+/** The built host is a sibling `.js`; from source (tsx, Bun, tests) it is the `.ts`. */
+function defaultHostEntry(): string {
+  const built = fileURLToPath(
+    new URL("./extension-host-process.js", import.meta.url),
+  );
+  return existsSync(built) ? built : built.replace(/\.js$/, ".ts");
+}
+
+/** Loader flags such as `--import tsx` carry over; watch, inspector and heap flags don't. */
+function hostExecArgv(maxHeapMb: number): string[] {
+  return [
+    ...process.execArgv.filter(
+      (arg) => !/^--(watch|inspect|debug|max-old-space-size)/.test(arg),
+    ),
+    `--max-old-space-size=${maxHeapMb}`,
+  ];
+}
+
+const unavailable = (message: string) =>
+  new ExtensionHostError("unavailable", message);
+
+class ExtensionHost {
+  readonly #child: ChildProcess;
+  readonly #pending = new Map<number, Pending>();
+  /** Per plugin, the version calls should use: activated or activating. */
+  readonly #activations = new Map<string, Activation>();
+  /** Plugins whose code this process imported, turned off since or not: it keeps their modules. */
+  readonly #imported = new Set<string>();
+  /** Per plugin, what the host process has loaded. */
+  readonly #loaded = new Map<string, ActivePlugin & { root: string; sessions?: boolean }>();
+  /** Per plugin, its activations and deactivations, one at a time. */
+  readonly #queues = new Map<string, Promise<unknown>>();
+  /** Calls in flight per plugin, so a new version waits for the old one's. */
+  readonly #inflight = new Map<string, Set<Promise<unknown>>>();
+  readonly #ready: Promise<void>;
+  #settleReady: ((error?: ExtensionHostError) => void) | undefined;
+  readonly #started = performance.now();
+  #startMs: number | undefined;
+  #nextId = 1;
+  #exited = false;
+  /** Stopped on purpose: idle, disposed, or its scope closed. */
+  #stopping = false;
+  /** Killed because a call never settled; that counts against its plugin. */
+  #killing = false;
+  /** The plugin whose call got its host killed, when one did. */
+  #culprit: string | undefined;
+  #idle: ReturnType<typeof setTimeout> | undefined;
+  /** Holds that keep the host from stopping while idle, such as an open game session. */
+  #holds = 0;
+  /** The host's `game` requests the daemon is answering, by the host's id. */
+  readonly #sessionCalls = new Map<number, { plugin: string; controller: AbortController }>();
+  readonly #browserCalls = new Map<number, { plugin: string; controller: AbortController }>();
+  readonly #gameCalls = new Map<number, { plugin: string; controller: AbortController }>();
+  readonly #modelCalls = new Map<number, { plugin: string; controller: AbortController }>();
+  /** The plugin whose `activate` is running, which may already play the game. */
+  #activating: string | undefined;
+  /** Last lines of stdout and stderr, for diagnostics. */
+  readonly log: string[] = [];
+
+  constructor(
+    /** Which start of its scope's host this is; a new host gets a higher one. */
+    readonly generation: number,
+    readonly scope: string,
+    readonly project: string | undefined,
+    entry: string,
+    private readonly options: typeof DEFAULTS,
+    private readonly onExit: (host: ExtensionHost, plugins: string[], reason: string) => void,
+    private readonly game: () => HostGameService | undefined,
+    private readonly sessions: () => HostSessionService | undefined,
+    private readonly browser: () => HostBrowserService | undefined,
+    private readonly models: () => HostModelService | undefined,
+    private readonly onLog?: (plugin: string, level: PluginLogEntry["level"], text: string) => void,
+  ) {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    this.#ready = new Promise<void>((resolve, reject) => {
+      this.#settleReady = (error) => {
+        clearTimeout(timer);
+        this.#settleReady = undefined;
+        if (error) {
+          reject(error);
+          void this.stop().catch(() => {});
+        } else {
+          this.#startMs = performance.now() - this.#started;
+          resolve();
+        }
+      };
+    });
+    this.#ready.catch(() => {});
+    // The project folder is passed as an argument, not as the working folder,
+    // so loader flags still resolve from the app rather than the project.
+    this.#child = fork(entry, project ? ["--project", project] : [], {
+      execPath: process.execPath,
+      execArgv: hostExecArgv(options.maxHeapMb),
+      env: { ...projectProcessEnvironment(), ELECTRON_RUN_AS_NODE: "1" },
+      stdio: ["ignore", "pipe", "pipe", "ipc"],
+      detached: process.platform !== "win32",
+    });
+    registerProjectProcess(this.#child);
+    timer = setTimeout(
+      () =>
+        this.#settleReady?.(
+          new ExtensionHostError("failed", "Extension host did not start"),
+        ),
+      this.options.activationTimeoutMs,
+    );
+    for (const stream of [this.#child.stdout, this.#child.stderr])
+      stream?.setEncoding("utf8").on("data", (chunk: string) => {
+        this.log.push(...chunk.split("\n").filter(Boolean));
+        this.log.splice(0, Math.max(0, this.log.length - 50));
+      });
+    this.#child.on("message", (message) => {
+      try {
+        this.#receive(message);
+      } catch {
+        // A bad message fails its own call at most, never the daemon.
+      }
+    });
+    this.#child.on("error", (error) => {
+      this.log.push(`Extension host error: ${error.message}`);
+      // Without a pid it never started, and no exit will follow.
+      if (this.#child.pid === undefined) this.#gone(error.message);
+    });
+    this.#child.once("exit", (code, signal) =>
+      this.#gone(String(signal ?? code)),
+    );
+  }
+
+  get pid() {
+    return this.#child.pid;
+  }
+
+  get alive() {
+    return !this.#exited && !this.#stopping && !this.#killing;
+  }
+
+  status(): Omit<ExtensionHostStatus, "stats"> {
+    return {
+      scope: this.scope,
+      pid: this.pid,
+      startMs: this.#startMs,
+      pending: this.#pending.size,
+      plugins: Object.fromEntries(this.#loaded),
+    };
+  }
+
+  imported(plugin: string): boolean {
+    return this.#imported.has(plugin);
+  }
+
+  /** Plugins loaded or loading, at the version calls will use. */
+  plugins(): Record<string, ScopePlugin> {
+    const plugins: Record<string, ScopePlugin> = {};
+    for (const [id, loaded] of this.#loaded)
+      plugins[id] = {
+        version: loaded.version,
+        root: loaded.root,
+        loaded: true,
+      };
+    for (const [id, activation] of this.#activations) {
+      const loaded = this.#loaded.get(id);
+      plugins[id] = {
+        version: activation.version,
+        root: activation.root,
+        loaded:
+          loaded?.version === activation.version &&
+          loaded.root === activation.root,
+      };
+    }
+    return plugins;
+  }
+
+  /**
+   * Activates a plugin once. Asked for another version, it lets the running
+   * version's calls finish, deactivates it, then activates the new one.
+   */
+  activate(plugin: ExtensionHostPlugin): Promise<void> {
+    const current = this.#activations.get(plugin.id);
+    if (current?.version === plugin.version && current.root === plugin.root)
+      return current.done;
+    const activation: Activation = {
+      version: plugin.version,
+      root: plugin.root,
+      done: Promise.resolve(),
+    };
+    activation.done = this.#enqueue(plugin.id, async () => {
+      // Replaced before its turn came: the newer one activates instead.
+      if (this.#activations.get(plugin.id) !== activation) return;
+      if (this.#loaded.has(plugin.id)) {
+        await this.#drained(plugin.id);
+        await this.#unload(plugin.id);
+      }
+      await this.#ready;
+      // Turned off or replaced while the old version drained.
+      if (this.#activations.get(plugin.id) !== activation) return;
+      // Even an import that fails stays in the process's module cache.
+      this.#imported.add(plugin.id);
+      this.#activating = plugin.id;
+      let activated = false;
+      try {
+        const message = await this.#request(
+          { type: "activate", plugin },
+          plugin.id,
+          this.options.activationTimeoutMs,
+        );
+        if (message.type === "activated") {
+          this.#loaded.set(plugin.id, {
+            sessions: plugin.sessions,
+            version: plugin.version,
+            root: plugin.root,
+            tools: message.tools,
+            commands: message.commands,
+            activationMs: message.ms,
+          });
+          activated = true;
+        }
+      } finally {
+        if (this.#activating === plugin.id) this.#activating = undefined;
+        // What a failed activation opened ends with it.
+        if (!activated) this.#release(plugin.id);
+      }
+    });
+    // A failed activation can be retried by the next call.
+    activation.done.catch(() => {
+      if (this.#activations.get(plugin.id) === activation)
+        this.#activations.delete(plugin.id);
+    });
+    this.#activations.set(plugin.id, activation);
+    return activation.done;
+  }
+
+  async invoke(options: InvokeOptions): Promise<unknown> {
+    const { plugin } = options;
+    await this.activate(plugin);
+    const current = () => {
+      const activation = this.#activations.get(plugin.id);
+      if (
+        activation?.version !== plugin.version ||
+        activation.root !== plugin.root ||
+        this.#loaded.get(plugin.id)?.version !== plugin.version ||
+        this.#loaded.get(plugin.id)?.root !== plugin.root
+      )
+        throw unavailable(
+          `${plugin.id} ${plugin.version} was turned off or replaced while the call waited`,
+        );
+      return activation;
+    };
+    const activation = current();
+    await options.check?.();
+    if (current() !== activation)
+      throw unavailable(`${plugin.id} was replaced while the call waited`);
+    const call = this.#request(
+      {
+        type: "invoke",
+        plugin: plugin.id,
+        kind:
+          options.command !== undefined
+            ? "command"
+            : options.projectType !== undefined
+              ? "projectType"
+              : options.hook !== undefined
+                ? "hook"
+                : "tool",
+        name: (options.command ?? options.projectType ?? options.hook ?? options.tool)!,
+        input: options.input,
+        ...(options.turn ? { turn: options.turn } : {}),
+        ...(options.configuration ? { configuration: options.configuration } : {}),
+        ...(options.build ? { build: options.build } : {}),
+      },
+      plugin.id,
+      options.timeoutMs ?? this.options.callTimeoutMs,
+      options.signal,
+      options.onProgress,
+    );
+    const inflight = this.#inflight.get(plugin.id) ?? new Set();
+    this.#inflight.set(plugin.id, inflight);
+    inflight.add(call);
+    void call
+      .catch(() => {})
+      .finally(() => {
+        inflight.delete(call);
+        if (!inflight.size && this.#inflight.get(plugin.id) === inflight)
+          this.#inflight.delete(plugin.id);
+      });
+    const message = await call;
+    return message.type === "result" ? message.value : undefined;
+  }
+
+  /**
+   * Turns a plugin off: cancels its running calls, then disposes what it
+   * registered. Its next call activates it again.
+   */
+  deactivate(plugin: string): Promise<void> {
+    this.#activations.delete(plugin);
+    // Cancel at once, not after whatever is queued for the plugin.
+    const cancel = () => {
+      const error = new ExtensionHostError(
+        "cancelled",
+        `${plugin} was turned off`,
+      );
+      for (const pending of this.#pending.values())
+        if (pending.plugin === plugin && pending.type === "invoke")
+          pending.giveUp(error);
+    };
+    cancel();
+    return this.#enqueue(plugin, async () => {
+      cancel();
+      await this.#drained(plugin);
+      await this.#unload(plugin);
+    });
+  }
+
+  async stats(): Promise<HostStats | undefined> {
+    if (!this.alive) return undefined;
+    await this.#ready;
+    const message = await this.#request({ type: "stats" }, undefined, 5_000);
+    return message.type === "stats" ? message.stats : undefined;
+  }
+
+  /**
+   * Stops the host: asks it to clean up (`onDispose`, `deactivate`), then
+   * stops its process and anything it started.
+   */
+  async stop(): Promise<void> {
+    if (this.#exited) return;
+    this.#stopping = true;
+    clearTimeout(this.#idle);
+    if (this.#child.connected) {
+      const exited = new Promise<void>((resolve) =>
+        this.#child.once("exit", () => resolve()),
+      );
+      this.#send({ type: "shutdown", id: this.#nextId++ });
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([
+        exited,
+        new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, this.options.cancelGraceMs);
+        }),
+      ]);
+      clearTimeout(timer);
+    }
+    await terminateProjectProcess(this.#child);
+  }
+
+  #enqueue(plugin: string, task: () => Promise<void>): Promise<void> {
+    const run = (this.#queues.get(plugin) ?? Promise.resolve()).then(task);
+    const settled = run.catch(() => {});
+    this.#queues.set(plugin, settled);
+    void settled.then(() => {
+      if (this.#queues.get(plugin) === settled) this.#queues.delete(plugin);
+    });
+    return run;
+  }
+
+  async #unload(plugin: string): Promise<void> {
+    if (!this.#loaded.delete(plugin) || !this.alive) return;
+    try {
+      await this.#request(
+        { type: "deactivate", plugin },
+        plugin,
+        this.options.activationTimeoutMs,
+      );
+    } finally {
+      this.#release(plugin);
+    }
+  }
+
+  /**
+   * The game sessions the plugin, or every plugin, opened end. Its requests
+   * still running are given up first, so none opens a session after.
+   */
+  #release(plugin?: string) {
+    for (const [id, call] of this.#browserCalls)
+      if (!plugin || call.plugin === plugin) {
+        this.#browserCalls.delete(id);
+        call.controller.abort(new Error(`${call.plugin} stopped`));
+      }
+    for (const [id, call] of this.#sessionCalls)
+      if (!plugin || call.plugin === plugin) {
+        this.#sessionCalls.delete(id);
+        call.controller.abort(new Error(`${call.plugin} stopped`));
+      }
+    for (const [id, call] of this.#gameCalls)
+      if (!plugin || call.plugin === plugin) {
+        this.#gameCalls.delete(id);
+        call.controller.abort(new Error(`${call.plugin} stopped`));
+      }
+    for (const [id, call] of this.#modelCalls)
+      if (!plugin || call.plugin === plugin) {
+        this.#modelCalls.delete(id);
+        call.controller.abort(new Error(`${call.plugin} stopped`));
+      }
+    try {
+      this.game()?.release({ scope: this.scope, generation: this.generation, ...(plugin ? { plugin } : {}) });
+    } catch {
+      // Cleanup failing doesn't stop the host's.
+    }
+  }
+
+  /** Answers a plugin's `context.game` request; a plugin not loaded here gets nothing. */
+  #serveGame(id: number, plugin: string, request: PluginGameRequest) {
+    const service = this.game();
+    const reply = (answer: { value?: unknown; error?: string }) => {
+      this.#gameCalls.delete(id);
+      if (this.alive) this.#send({ type: "game-reply", id, ...answer });
+    };
+    if (!service || !(this.#loaded.has(plugin) || this.#activating === plugin)) {
+      reply({ error: `${plugin} can't play the game here` });
+      return;
+    }
+    const controller = new AbortController();
+    this.#gameCalls.set(id, { plugin, controller });
+    void Promise.resolve()
+      .then(() => service.handle({ scope: this.scope, project: this.project, generation: this.generation, plugin }, request, controller.signal))
+      .then(
+        (value) => reply({ value: value ?? null }),
+        (error: unknown) => {
+          const message = error instanceof Error ? error.message : String(error);
+          reply({ error: message.slice(0, HOST_MESSAGE_MAX_CHARS) });
+        },
+      );
+  }
+
+  #serveBrowser(id: number, plugin: string, request: PluginBrowserRequest): void {
+    if (this.#browserCalls.has(id)) return;
+    const service = this.browser();
+    const folder = this.project;
+    if (!service || !folder || !(this.#loaded.has(plugin) || this.#activating === plugin)) {
+      this.#send({ type: "browser-reply", id, error: request.operation === "panel" ? "Panels can't be opened here" : "Browser access is unavailable here" });
+      return;
+    }
+    if (this.#browserCalls.size >= 64) {
+      this.#send({ type: "browser-reply", id, error: "Too many browser requests" });
+      return;
+    }
+    const controller = new AbortController();
+    const call = { plugin, controller };
+    this.#browserCalls.set(id, call);
+    const reply = (error?: string) => {
+      if (this.#browserCalls.get(id) !== call) return;
+      this.#browserCalls.delete(id);
+      if (this.alive) this.#send({ type: "browser-reply", id, error });
+    };
+    void Promise.resolve()
+      .then(() => service(folder, plugin, request, controller.signal))
+      .then(() => reply(), (error: unknown) =>
+        reply((error instanceof Error ? error.message : String(error)).slice(0, HOST_MESSAGE_MAX_CHARS)),
+      );
+  }
+
+  #serveModels(id: number, plugin: string, request: PluginModelsHostRequest) {
+    const service = this.models();
+    const reply = (answer: { value?: unknown; error?: string }) => {
+      this.#modelCalls.delete(id);
+      if (this.alive) this.#send({ type: "models-reply", id, ...answer });
+    };
+    if (!service || !(this.#loaded.has(plugin) || this.#activating === plugin)) {
+      reply({ error: "AI models are unavailable here" });
+      return;
+    }
+    if (this.#modelCalls.has(id) || this.#modelCalls.size >= 64) {
+      // Duplicate IDs cannot replace another request's owner.
+      if (!this.#modelCalls.has(id)) reply({ error: "Too many model requests" });
+      return;
+    }
+    const controller = new AbortController();
+    this.#modelCalls.set(id, { plugin, controller });
+    void Promise.resolve().then(() => service.handle({ scope: this.scope, project: this.project, generation: this.generation, plugin }, request, controller.signal))
+      .then((value) => {
+        if (Buffer.byteLength(JSON.stringify(value ?? null)) > HOST_RESULT_MAX_BYTES) throw new Error("The model's answer is too large");
+        reply({ value: value ?? null });
+      }).catch((error: unknown) => reply({ error: (error instanceof Error ? error.message : String(error)).slice(0, HOST_MESSAGE_MAX_CHARS) }));
+  }
+
+  #serveSessions(id: number, plugin: string, request: PluginSessionRequest) {
+    const service = this.sessions();
+    const reply = (answer: { value?: unknown; error?: string }) => {
+      this.#sessionCalls.delete(id);
+      if (this.alive) this.#send({ type: "sessions-reply", id, ...answer });
+    };
+    if (!service || this.scope !== "app" || !(this.#loaded.has(plugin) || this.#activating === plugin)) {
+      reply({ error: "Session access is unavailable here" });
+      return;
+    }
+    if (this.#sessionCalls.has(id) || this.#sessionCalls.size >= 64) {
+      // Duplicate IDs cannot replace another request's owner.
+      if (!this.#sessionCalls.has(id)) reply({ error: "Too many session requests" });
+      return;
+    }
+    const controller = new AbortController();
+    this.#sessionCalls.set(id, { plugin, controller });
+    void Promise.resolve().then(() => service.handle({ scope: this.scope, project: this.project, generation: this.generation, plugin }, request, controller.signal))
+      .then((value) => {
+        if (Buffer.byteLength(JSON.stringify(value ?? null)) > HOST_RESULT_MAX_BYTES) throw new Error("Session response is too large");
+        reply({ value: value ?? null });
+      }).catch((error: unknown) => reply({ error: (error instanceof Error ? error.message : String(error)).slice(0, HOST_MESSAGE_MAX_CHARS) }));
+  }
+
+  async #drained(plugin: string): Promise<void> {
+    await Promise.allSettled([...(this.#inflight.get(plugin) ?? [])]);
+  }
+
+  /** The process is gone, by exit or a failed start; runs once. */
+  #gone(reason: string) {
+    if (this.#exited) return;
+    this.#exited = true;
+    clearTimeout(this.#idle);
+    this.#settleReady?.(
+      new ExtensionHostError("crashed", `Extension host exited (${reason})`),
+    );
+    const plugins = new Set<string>([...this.#loaded].filter(([, plugin]) => plugin.sessions).map(([id]) => id));
+    for (const pending of this.#pending.values())
+      if (pending.plugin) plugins.add(pending.plugin);
+    const error = new ExtensionHostError(
+      "crashed",
+      `Extension host exited (${reason})`,
+    );
+    for (const pending of [...this.#pending.values()]) pending.settle(error);
+    this.#pending.clear();
+    this.#loaded.clear();
+    this.#activations.clear();
+    for (const call of this.#gameCalls.values()) call.controller.abort(error);
+    this.#gameCalls.clear();
+    this.#release();
+    // Whatever the plugins started outlives the host unless it is stopped too.
+    void terminateProjectProcess(this.#child).catch(() => {});
+    // A crash can't be traced to one call, so every plugin with a call in
+    // flight is counted; a hang is traced to the call that hung.
+    const blamed = this.#stopping
+      ? []
+      : this.#culprit
+        ? [this.#culprit]
+        : [...plugins];
+    this.onExit(this, blamed, reason);
+  }
+
+  #request(
+    request: WithoutId<HostRequest>,
+    plugin: string | undefined,
+    timeoutMs: number,
+    signal?: AbortSignal,
+    onProgress?: (message: string, url?: string) => void,
+  ): Promise<HostMessage> {
+    if (!this.alive)
+      return Promise.reject(
+        new ExtensionHostError("crashed", "Extension host is not running"),
+      );
+    if (signal?.aborted)
+      return Promise.reject(
+        new ExtensionHostError("cancelled", "Plugin call cancelled"),
+      );
+    const activity = request.type !== "stats";
+    if (activity) clearTimeout(this.#idle);
+    const id = this.#nextId++;
+    return new Promise<HostMessage>((resolve, reject) => {
+      let grace: ReturnType<typeof setTimeout> | undefined;
+      let failure: ExtensionHostError | undefined;
+      // Cancel cooperatively first; code that ignores the signal, or never
+      // yields, loses its host after the grace period.
+      const giveUp = (error: ExtensionHostError) => {
+        if (failure || !this.#pending.has(id)) return;
+        failure = error;
+        this.#send({ type: "cancel", id });
+        grace = setTimeout(() => {
+          if (!this.#pending.has(id) || this.#exited) return;
+          this.#killing = true;
+          this.#culprit ??= plugin;
+          void terminateProjectProcess(this.#child).catch(() => {});
+        }, this.options.cancelGraceMs);
+      };
+      const abort = () =>
+        giveUp(new ExtensionHostError("cancelled", "Plugin call cancelled"));
+      const timer = setTimeout(
+        () =>
+          giveUp(
+            new ExtensionHostError(
+              "timeout",
+              `Plugin call timed out after ${timeoutMs} ms`,
+            ),
+          ),
+        timeoutMs,
+      );
+      signal?.addEventListener("abort", abort, { once: true });
+      const settle = (message: HostMessage | ExtensionHostError) => {
+        if (!this.#pending.has(id)) return;
+        clearTimeout(timer);
+        clearTimeout(grace);
+        signal?.removeEventListener("abort", abort);
+        this.#pending.delete(id);
+        if (activity) this.#scheduleIdle();
+        // A host stopped for a call that never settled reports why it was stopped.
+        if (failure && message instanceof ExtensionHostError) reject(failure);
+        else if (message instanceof ExtensionHostError) reject(message);
+        else if (message.type === "error")
+          reject(
+            failure ??
+              new ExtensionHostError(
+                message.cancelled ? "cancelled" : "failed",
+                message.message,
+              ),
+          );
+        else if (failure) reject(failure);
+        else if (message.type !== REPLIES[request.type])
+          reject(
+            new ExtensionHostError(
+              "failed",
+              `Extension host answered ${request.type} with ${message.type}`,
+            ),
+          );
+        else resolve(message);
+      };
+      this.#pending.set(id, {
+        type: request.type,
+        plugin,
+        activity,
+        onProgress,
+        settle,
+        giveUp,
+      });
+      // Input IPC can't carry (BigInt, cycles) fails here, not as a hang.
+      this.#send({ ...request, id } as HostRequest, (error) =>
+        settle(
+          new ExtensionHostError(
+            "failed",
+            `The request could not be sent to the extension host: ${error.message}`,
+          ),
+        ),
+      );
+    });
+  }
+
+  #send(request: HostRequest, onError?: (error: Error) => void) {
+    if (!this.#child.connected) {
+      onError?.(new Error("not connected"));
+      return;
+    }
+    try {
+      this.#child.send(request, (error) => {
+        if (error) onError?.(error);
+      });
+    } catch (error) {
+      onError?.(error instanceof Error ? error : new Error(String(error)));
+    }
+  }
+
+  #receive(message: unknown) {
+    if (!isHostMessage(message)) return;
+    if (message.type === "ready") {
+      this.#settleReady?.(
+        message.protocol === EXTENSION_HOST_PROTOCOL_VERSION
+          ? undefined
+          : new ExtensionHostError(
+              "failed",
+              "Extension host protocol mismatch",
+            ),
+      );
+      return;
+    }
+    if (message.type === "game") {
+      this.#serveGame(message.id, message.plugin, message.request);
+      return;
+    }
+    if (message.type === "browser") {
+      this.#serveBrowser(message.id, message.plugin, message.request);
+      return;
+    }
+    if (message.type === "browser-cancel") {
+      const call = this.#browserCalls.get(message.id);
+      this.#browserCalls.delete(message.id);
+      call?.controller.abort(new Error("Browser request cancelled"));
+      return;
+    }
+    if (message.type === "sessions") {
+      this.#serveSessions(message.id, message.plugin, message.request);
+      return;
+    }
+    if (message.type === "sessions-cancel") {
+      this.#sessionCalls.get(message.id)?.controller.abort(new Error("Session request cancelled"));
+      return;
+    }
+    if (message.type === "models") {
+      this.#serveModels(message.id, message.plugin, message.request);
+      return;
+    }
+    if (message.type === "models-cancel") {
+      this.#modelCalls.get(message.id)?.controller.abort(new Error("Model request cancelled"));
+      return;
+    }
+    if (message.type === "game-cancel") {
+      this.#gameCalls.get(message.id)?.controller.abort(new Error("The plugin gave up on its game request"));
+      return;
+    }
+    if (message.type === "log") {
+      // Only a plugin this host runs can have printed it.
+      if (this.#activations.has(message.plugin)) this.onLog?.(message.plugin, message.level, message.text);
+      return;
+    }
+    const pending = this.#pending.get(message.id);
+    if (!pending) return;
+    if (message.type === "progress") {
+      if (pending.type !== "invoke") return;
+      try {
+        pending.onProgress?.(message.message, message.url);
+      } catch {
+        // The caller's progress handler failing doesn't fail the call.
+      }
+    } else pending.settle(message);
+  }
+
+  /** Keeps the host running while idle until the returned release is called. */
+  hold(): () => void {
+    this.#holds += 1;
+    clearTimeout(this.#idle);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.#holds -= 1;
+      this.#scheduleIdle();
+    };
+  }
+
+  #scheduleIdle() {
+    clearTimeout(this.#idle);
+    const busy = [...this.#pending.values()].some(
+      (pending) => pending.activity,
+    );
+    if (busy || this.#holds > 0 || !this.alive) return;
+    this.#idle = setTimeout(
+      () => void this.stop().catch(() => {}),
+      this.options.idleMs,
+    );
+    this.#idle.unref();
+  }
+}
+
+export class ExtensionHosts {
+  readonly #hosts = new Map<string, ExtensionHost>();
+  readonly #crashes = new Map<string, number[]>();
+  /** Plugins that reached the crash limit; they stay off until released. */
+  readonly #quarantined = new Set<string>();
+  #generation = 0;
+  #game: HostGameService | undefined;
+  #sessions: HostSessionService | undefined;
+  #browser: HostBrowserService | undefined;
+  #models: HostModelService | undefined;
+  readonly #options: typeof DEFAULTS;
+  readonly #entry: string;
+  readonly #onLog: ExtensionHostOptions["onLog"];
+  #disposed = false;
+
+  constructor(options: ExtensionHostOptions = {}) {
+    const { hostEntry, onLog, ...rest } = options;
+    this.#options = { ...DEFAULTS, ...rest };
+    this.#entry = hostEntry ?? defaultHostEntry();
+    this.#onLog = onLog;
+  }
+
+  /** Activate and hold an app plugin without inventing a tool invocation. */
+  async activate(options: { scope: string; plugin: ExtensionHostPlugin; check: () => Promise<void> }): Promise<() => void> {
+    if (this.quarantined(options.plugin.id)) throw new ExtensionHostError("quarantined", `${options.plugin.id} is quarantined`);
+    const host = this.#host(options.scope, undefined);
+    const release = host.hold();
+    try {
+      await host.activate(options.plugin);
+      await options.check();
+      if (!host.alive) throw new Error("Extension host stopped during activation");
+      return release;
+    } catch (error) {
+      release();
+      await host.deactivate(options.plugin.id).catch(() => {});
+      this.#onLog?.(options.plugin.id, { level: "error", source: "host", text: `App activation failed: ${error instanceof Error ? error.message : String(error)}`.slice(0, HOST_MESSAGE_MAX_CHARS) });
+      throw error;
+    }
+  }
+
+  serveBrowser(service: HostBrowserService): void { this.#browser = service; }
+
+  serveSessions(service: HostSessionService): void { this.#sessions = service; }
+
+  serveModels(service: HostModelService): void { this.#models = service; }
+
+  /** Calls one of a plugin's tools or commands in the host for `scope`, starting it if needed. */
+  async invoke(options: InvokeOptions): Promise<unknown> {
+    if (this.quarantined(options.plugin.id))
+      throw new ExtensionHostError(
+        "quarantined",
+        `${options.plugin.id} stopped its extension host too often and is turned off until it is released`,
+      );
+    try {
+      return await this.#host(options.scope, options.project).invoke(options);
+    } catch (error) {
+      // Cancelled, or not on here, isn't the plugin's failure.
+      const code = error instanceof ExtensionHostError ? error.code : "failed";
+      if (code !== "cancelled" && code !== "unavailable") {
+        const kind = options.command !== undefined ? `Command ${options.command}` : options.projectType !== undefined ? `Project type hook ${options.projectType}` : options.hook !== undefined ? `Hook ${options.hook}` : `Tool ${options.tool}`;
+        this.#onLog?.(options.plugin.id, { level: "error", source: "call", text: `${kind} failed: ${error instanceof Error ? error.message : String(error)}` });
+      }
+      throw error;
+    }
+  }
+
+  quarantined(plugin: string): boolean {
+    return this.#quarantined.has(plugin);
+  }
+
+  /** Lets a quarantined plugin run again, as when the person turns it back on. */
+  release(plugin: string) {
+    this.#quarantined.delete(plugin);
+    this.#crashes.delete(plugin);
+  }
+
+  /** Scopes with a running host. */
+  scopes(): string[] {
+    return [...this.#hosts.keys()];
+  }
+
+  /** Plugins loaded or loading in a scope's host, by id. */
+  active(scope: string): Record<string, ScopePlugin> {
+    const host = this.#hosts.get(scope);
+    return host?.alive ? host.plugins() : {};
+  }
+
+  async status(): Promise<ExtensionHostStatus[]> {
+    return Promise.all(
+      [...this.#hosts.values()].map(async (host) => ({
+        ...host.status(),
+        stats: await host.stats().catch(() => undefined),
+      })),
+    );
+  }
+
+  /** Scopes whose running host imported a plugin's code, which it keeps until it stops. */
+  importers(plugin: string): string[] {
+    return [...this.#hosts]
+      .filter(([, host]) => host.alive && host.imported(plugin))
+      .map(([scope]) => scope);
+  }
+
+  /** Turns a plugin off in one scope's host, as when it is disabled there. */
+  async deactivate(scope: string, plugin: string): Promise<void> {
+    await this.#hosts.get(scope)?.deactivate(plugin);
+  }
+
+  /** What answers plugins' `context.game`, in every host. */
+  serveGame(service: HostGameService): void {
+    this.#game = service;
+  }
+
+  /** Which start of the scope's running host this is, or undefined when none runs. */
+  generation(scope: string): number | undefined {
+    const host = this.#hosts.get(scope);
+    return host?.alive ? host.generation : undefined;
+  }
+
+  /**
+   * Keeps the scope's running host from stopping while idle, until the
+   * returned release is called. Undefined when no host runs. A host that
+   * crashes or is stopped still goes; the hold doesn't carry to the next one.
+   */
+  hold(scope: string): (() => void) | undefined {
+    const host = this.#hosts.get(scope);
+    return host?.alive ? host.hold() : undefined;
+  }
+
+  /** The last lines a scope's host wrote, for diagnostics. */
+  log(scope: string): string[] {
+    return [...(this.#hosts.get(scope)?.log ?? [])];
+  }
+
+  async stop(scope: string): Promise<void> {
+    await this.#hosts.get(scope)?.stop();
+  }
+
+  /** Stops every host; no new ones start afterwards. */
+  async dispose(): Promise<void> {
+    this.#disposed = true;
+    await Promise.all([...this.#hosts.values()].map((host) => host.stop()));
+    this.#hosts.clear();
+  }
+
+  #host(scope: string, project: string | undefined): ExtensionHost {
+    if (this.#disposed)
+      throw new ExtensionHostError("failed", "Extension hosts are shut down");
+    const existing = this.#hosts.get(scope);
+    if (existing?.alive) {
+      if (existing.project !== project)
+        throw new ExtensionHostError(
+          "failed",
+          `The extension host for ${scope} serves another folder`,
+        );
+      return existing;
+    }
+    let host: ExtensionHost;
+    try {
+      host = this.#start(scope, project);
+    } catch (error) {
+      throw new ExtensionHostError(
+        "failed",
+        `The extension host could not start: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    this.#hosts.set(scope, host);
+    return host;
+  }
+
+  #start(scope: string, project: string | undefined): ExtensionHost {
+    this.#generation += 1;
+    return new ExtensionHost(
+      this.#generation,
+      scope,
+      project,
+      this.#entry,
+      this.#options,
+      (exited, plugins, reason) => {
+        if (this.#hosts.get(scope) === exited) this.#hosts.delete(scope);
+        const now = Date.now();
+        for (const plugin of plugins) {
+          const recent = [
+            ...(this.#crashes.get(plugin) ?? []).filter(
+              (time) => now - time < this.#options.crashWindowMs,
+            ),
+            now,
+          ];
+          this.#crashes.set(plugin, recent);
+          this.#onLog?.(plugin, { level: "error", source: "host", text: `Its extension host stopped (${reason}) while it was running` });
+          if (recent.length >= this.#options.crashLimit && !this.#quarantined.has(plugin)) {
+            this.#quarantined.add(plugin);
+            this.#onLog?.(plugin, { level: "error", source: "host", text: `Turned off: it stopped its extension host ${recent.length} times in ${Math.round(this.#options.crashWindowMs / 60_000)} minutes. It stays off until it is turned on again or OhMyGame restarts.` });
+          }
+        }
+      },
+      () => this.#game,
+      () => this.#sessions,
+      () => this.#browser,
+      () => this.#models,
+      (plugin, level, text) => this.#onLog?.(plugin, { level, source: "native", text }),
+    );
+  }
+}

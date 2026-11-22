@@ -1,0 +1,1280 @@
+import { ElectronBrowserDriver } from "./browser-driver.js";
+import { randomBytes } from "node:crypto";
+import { execFile } from "node:child_process";
+import { createReadStream, mkdirSync, readFileSync } from "node:fs";
+import { rmdir } from "node:fs/promises";
+import { Readable } from "node:stream";
+import { createRequire } from "node:module";
+import path from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, nativeTheme, Notification, powerSaveBlocker, session, shell, Tray } from "electron";
+import { clipboardFilePaths, loadClipboardFiles } from "./file-clipboard.js";
+import { installExternalMcpLauncher, markExternalMcpApp } from "./external-mcp-install.js";
+import { DaemonSupervisor } from "./daemon-supervisor.js";
+import { isOAuthAuthorizationUrl, OAuthCallbackFlow } from "./oauth.js";
+import { setGlobalDispatcher } from "undici/index.js";
+import { SYSTEM_PROXY_TARGET } from "../shared/network-settings.js";
+import { createNetworkDispatcher } from "../daemon/proxy.js";
+import { electronProxyConfig, prepareDesktopNetwork, proxyCredentials } from "./network.js";
+import { gameSignInIssuer } from "./game-sign-in.js";
+import { loadEnvironmentFiles } from "../daemon/environment.js";
+import { readUsageData, updateUsageData } from "./usage-data.cjs";
+import { GpuCrashCounter, isGpuCrash, readGpuFallback, setGpuFallback } from "./gpu-fallback.js";
+import { ignoreBrokenStdio } from "./stdio.js";
+import { RotatingLogFile } from "./log-file.js";
+import { createLogRedactor } from "../shared/log-redaction.js";
+import { desktopDiagnosticsArchive } from "./diagnostics-export.js";
+import { recordConsole, recordUncaughtErrors, rendererConsoleLines, runtimeStateLine, updateFailureLine } from "./console-log.js";
+import { createDesktopWindow, fitPlaytestContentSize, isValidPlaytestViewport, waitForRenderer } from "./window.js";
+import { applicationMenuTemplate, isApplicationMenuLabels, windowContextMenuTemplate } from "./application-menu.js";
+import { openInBrowser } from "./open-in-browser.js";
+import { DesktopUpdatePreparationError, DesktopUpdater } from "./updater.js";
+import { DesktopUpdateCheckScheduler } from "./update-check-scheduler.js";
+import { ElectronPlaytestDriver } from "./playtest-driver.js";
+import { GameRecorder, type GameRecordingFile } from "./game-recorder.js";
+import { GAME_RECORDING_MAX_SECONDS, gameRecordingFileName, type GameRecordingSaved, type GameRecordingState } from "../shared/game-recording.js";
+import { WebGamePlayerWindows, type WebGamePlayerTarget } from "./web-game-player.js";
+import { BrowserViews } from "./browser-views.js";
+import { isBrowserMenuLabels, isBrowserUrl, type ProjectBrowser } from "../shared/browser.js";
+import { BackgroundRunning } from "./background-running.js";
+import { RendererCloseRequest } from "./renderer-close.js";
+import { AsyncTaskPool } from "./async-task-pool.js";
+import { AgentNotifications, waitingDotBitmap } from "./agent-notifications.js";
+import { NotificationPermission } from "./notification-permission.js";
+import type { AgentNoticesResponse } from "../shared/agent-notices.js";
+import { parseAgentNotificationPreferences, parseAgentNotificationTarget, type AgentNotificationTarget } from "../shared/agent-notifications.js";
+import { isNodeGraph } from "../shared/playable-graph-validation.js";
+import type { NodeThumbnailResult, PlayableThumbnailSnapshot } from "../shared/playable-player-protocol.js";
+import { PROJECT_FILE_OPEN_MODES, type ProjectFileOpenMode } from "../shared/contracts.js";
+import { isAccountRuntimeId } from "../shared/agent-runtimes.js";
+import type { PlaytestWatchState } from "../shared/playtest.js";
+import type { WebGamePlayerRequest, WebGamePreviewLayout } from "../shared/web-game-player.js";
+import { isPreviewColorFilter } from "../shared/preview-filter.js";
+
+ignoreBrokenStdio();
+
+const moduleDirectory = path.dirname(fileURLToPath(import.meta.url));
+const repositoryRoot = path.resolve(moduleDirectory, "../..");
+loadEnvironmentFiles(repositoryRoot, app.isPackaged ? "production" : "development");
+const developmentRendererUrl = process.env.OHMYGAME_RENDERER_URL ?? "http://127.0.0.1:43120";
+const useBuiltRenderer = app.isPackaged || process.argv.includes("--built-renderer");
+let daemon: DaemonSupervisor | undefined;
+const logDirectory = app.getPath("logs");
+const redactLog = createLogRedactor();
+const mainLog = new RotatingLogFile({ directory: logDirectory, name: "main", redact: redactLog });
+const daemonLog = new RotatingLogFile({ directory: logDirectory, name: "daemon", redact: redactLog });
+recordConsole(mainLog);
+recordUncaughtErrors(mainLog);
+mainLog.line(`GAMEORA ${app.getVersion()} starting on ${process.platform} ${process.arch}`);
+// Windows shows notifications only for the app ID of the installer's Start menu shortcut, the `appId` in electron-builder.yml.
+if (process.platform === "win32") app.setAppUserModelId("com.imalmadhusanka.gameora");
+let mainWindow: BrowserWindow | undefined;
+let backgroundRunning: BackgroundRunning | undefined;
+let backgroundTray: Tray | undefined;
+let menuLabels: Record<string, string> = {};
+
+function refreshTrayMenu(): void {
+  if (!backgroundTray || backgroundTray.isDestroyed()) return;
+  backgroundTray.setContextMenu(Menu.buildFromTemplate([
+    { label: menuLabels.openApp ?? "Open GAMEORA", click: () => { void showMainWindow(); } },
+    { label: menuLabels.quit ?? "Exit", click: () => app.quit() },
+  ]));
+}
+
+async function createBackgroundTray(): Promise<Tray> {
+  // The packaged executable carries the application's icon; no separate asset path is needed.
+  const icon = await app.getFileIcon(process.execPath, { size: "small" });
+  if (icon.isEmpty()) throw new Error("Could not load the background tray icon");
+  const tray = new Tray(icon);
+  try {
+    tray.setToolTip("GAMEORA");
+    tray.on("click", () => { void showMainWindow(); });
+    backgroundTray = tray;
+    refreshTrayMenu();
+    return tray;
+  } catch (cause) {
+    tray.destroy();
+    throw cause;
+  }
+}
+
+async function showMainWindow(): Promise<void> {
+  if (!daemon || !startupComplete || quitting) return;
+  try {
+    if (!mainWindow || mainWindow.isDestroyed()) await openMainWindow();
+    if (mainWindow?.isMinimized()) mainWindow.restore();
+    mainWindow?.show();
+    mainWindow?.focus();
+  } catch (cause) {
+    console.error(cause);
+    dialog.showErrorBox("GAMEORA could not open a window", cause instanceof Error ? cause.message : String(cause));
+  }
+}
+/** The account service published games sign in with, from the daemon's environment. */
+let gameSignIn: string | undefined;
+const playtestWindows = new Map<string, BrowserWindow | Promise<BrowserWindow>>();
+/** A Node that fails to start never reports back; its window gives up after this. */
+const NODE_THUMBNAIL_TIMEOUT_MS = 20_000;
+const CANCELLED_THUMBNAIL: NodeThumbnailResult = { captured: false, error: "The capture was cancelled." };
+const nodeThumbnailCaptures = new AsyncTaskPool(2);
+const nodeThumbnailBatches = new Map<string, { projectId: string; controller: AbortController; requests: number; snapshot?: PlayableThumbnailSnapshot }>();
+/** Hidden Node thumbnail windows by WebContents ID. */
+const nodeThumbnails = new Map<number, { window: BrowserWindow; finish: (result: NodeThumbnailResult) => void; snapshot?: PlayableThumbnailSnapshot }>();
+/** Thumbnail windows run Node code, so they may only capture and report. */
+const NODE_THUMBNAIL_CHANNELS = new Set(["ohmygame:capture-page", "ohmygame:finish-node-thumbnail", "ohmygame:node-thumbnail-snapshot"]);
+
+function handle(channel: string, listener: Parameters<typeof ipcMain.handle>[1]): void {
+  ipcMain.handle(channel, (event, ...args) => {
+    if (nodeThumbnails.has(event.sender.id) && !NODE_THUMBNAIL_CHANNELS.has(channel)) {
+      throw new Error("Invalid thumbnail request");
+    }
+    return listener(event, ...args);
+  });
+}
+const rendererPage = (page: string) => useBuiltRenderer
+  ? pathToFileURL(path.join(moduleDirectory, "../renderer", page)).href
+  : new URL(page, `${developmentRendererUrl}/`).href;
+const gameRecorder = new GameRecorder({
+  hostUrl: rendererPage("game-recorder.html"),
+  preloadPath: path.join(moduleDirectory, "game-recorder-preload.cjs"),
+  save: saveGameRecording,
+  onSaving: (id) => {
+    // Agents' recordings are not announced. A person can stop one that is still starting.
+    if (gameRecordings.has(id) || gameRecordingStarts.has(id)) publishGameRecording({ projectId: id, status: "saving" });
+  },
+});
+const agentPlaytests = new ElectronPlaytestDriver((state) => {
+  mainWindow?.webContents.send("ohmygame:agent-playtest-state", state);
+}, undefined, gameRecorder);
+const webGamePlayers = new WebGamePlayerWindows((state) => {
+  mainWindow?.webContents.send("ohmygame:web-game-player-state", state);
+}, rendererPage("web-game-host.html"), (projectId) => {
+  if (gameRecorder.isRecording(projectId)) gameRecorder.stop(projectId);
+  else void startGameRecording(projectId).catch((cause: unknown) => {
+    publishGameRecording({ projectId, status: "idle", error: cause instanceof Error ? cause.message : String(cause) });
+  });
+});
+const browserViews = new BrowserViews({
+  onState: (state) => mainWindow?.webContents.send("ohmygame:browser-state", state),
+  onCommand: (projectId, command) => mainWindow?.webContents.send("ohmygame:browser-command", projectId, command),
+  openExternal: (url) => void shell.openExternal(url).catch(() => {}),
+});
+const agentBrowser = new ElectronBrowserDriver(browserViews, (projectId) => {
+  mainWindow?.show();
+  mainWindow?.webContents.send("ohmygame:browser-command", projectId, "reveal");
+});
+/** People's recordings, by project; an agent's belong to its playtest session. */
+const gameRecordings = new Map<string, GameRecordingState>();
+const gameRecordingStarts = new Set<string>();
+let quitting = false;
+// Startup opens the main window itself; until then a macOS `activate` (sent when
+// the app is relaunched, e.g. after an update) finds the service still starting.
+let startupComplete = false;
+let quitPending = false;
+let restartPending = false;
+let rendererClose: RendererCloseRequest | undefined;
+let shutdown: Promise<void> | undefined;
+let updater: DesktopUpdater | undefined;
+/** Set when the GPU process kept crashing; software rendering takes its place on the next launch. */
+const gpuFallbackFile = path.join(app.getPath("userData"), "gpu-fallback.json");
+const gpuCrashes = new GpuCrashCounter(gpuFallbackFile);
+if (gpuCrashes.startedWithFallback) app.disableHardwareAcceleration();
+let gpuRestartPending = false;
+app.on("child-process-gone", (_event, details) => {
+  if (!isGpuCrash(details) || gpuRestartPending) return;
+  mainLog.line(`GPU process gone: ${details.reason}${details.exitCode !== undefined ? ` (exit ${details.exitCode})` : ""}`);
+  try {
+    if (!gpuCrashes.recordGpuCrash()) return;
+  } catch (cause) {
+    // The fallback flag could not be saved; relaunching would only repeat the crashes.
+    mainLog.line(`Could not save the software-rendering fallback: ${cause instanceof Error ? cause.message : String(cause)}`);
+    return;
+  }
+  mainLog.line("The GPU process kept crashing; restarting with software rendering.");
+  gpuRestartPending = true;
+  // The crashes happen within seconds of launch, likely before the daemon is
+  // ready, so the relaunch is asked for here instead of the shutdown path.
+  app.relaunch();
+  app.quit();
+});
+let updateChecks: DesktopUpdateCheckScheduler | undefined;
+const oauth = new OAuthCallbackFlow(() => mainWindow?.webContents.send("ohmygame:auth-callback"));
+/** The conversation a clicked notification opens, kept until the main window takes it. */
+let notificationTarget: AgentNotificationTarget | undefined;
+const notificationPermission = new NotificationPermission({
+  platform: process.platform,
+  packaged: app.isPackaged,
+  openExternal: (url) => shell.openExternal(url),
+  log: (message) => console.warn(message),
+});
+const agentNotifications = new AgentNotifications({
+  notices: async (after) => {
+    if (!daemon) return undefined;
+    const { url, token } = daemon.runtime;
+    const response = await fetch(`${url}/agent-notices?after=${after}`, {
+      headers: { authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(5_000),
+    });
+    return response.ok ? await response.json() as AgentNoticesResponse : undefined;
+  },
+  focused: () => Boolean(mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible() && mainWindow.isFocused()),
+  permission: () => notificationPermission.status(),
+  show: (options, onClick) => {
+    if (!Notification.isSupported()) return undefined;
+    const notification = new Notification(options);
+    notification.on("click", onClick);
+    // macOS refuses notifications from an unsigned app, such as Electron in development.
+    notification.on("failed", (_event, error) => console.warn(`Could not show a notification: ${error}`));
+    // Accepted is not shown: the system still drops it when its settings allow no banners.
+    notification.on("show", () => console.log("Notification accepted by the system"));
+    notification.show();
+    return notification;
+  },
+  showWaiting: (count, description) => {
+    waiting = { count, description };
+    if (process.platform === "win32") showWaitingOverlay();
+    else app.setBadgeCount(count);
+  },
+  requestAttention: () => {
+    if (process.platform === "darwin") app.dock?.bounce("informational");
+    else if (mainWindow && !mainWindow.isDestroyed()) mainWindow.flashFrame(true);
+  },
+  log: (message) => console.log(message),
+  open: (target) => {
+    notificationTarget = target;
+    if (!mainWindow || mainWindow.isDestroyed()) {
+      // The new window takes the target once its page has loaded.
+      if (daemon && startupComplete && !quitting) openMainWindow().catch((error) => console.error(error));
+      return;
+    }
+    mainWindow.webContents.send("ohmygame:notification-target");
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.show();
+    mainWindow.focus();
+  },
+});
+
+/** What waits for the user, kept so a new main window gets its taskbar overlay too. */
+let waiting = { count: 0, description: "" };
+let waitingOverlay: Electron.NativeImage | undefined;
+
+/** Windows has no count on taskbar buttons, so a dot on the main window's button marks that something waits. */
+function showWaitingOverlay(): void {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  waitingOverlay ??= nativeImage.createFromBitmap(waitingDotBitmap(), { width: 16, height: 16 });
+  mainWindow.setOverlayIcon(waiting.count ? waitingOverlay : null, waiting.count ? waiting.description : "");
+}
+
+/** Removes the record that tells `ohmygame-mcp` the app is already running. */
+let clearExternalMcpApp: (() => Promise<void>) | undefined;
+
+async function stopServices(): Promise<void> {
+  updateChecks?.stop();
+  agentNotifications.stop();
+  webGamePlayers.close();
+  agentBrowser.close();
+  browserViews.dispose();
+  agentPlaytests.close();
+  gameRecorder.close();
+  await Promise.all([daemon?.stop(), oauth.cancel()]);
+  await clearExternalMcpApp?.().catch(() => undefined);
+  await Promise.all([daemonLog.close(), mainLog.close()]);
+}
+
+function prepareShutdown(forUpdate = false): Promise<void> {
+  shutdown ??= (async () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      try {
+        await rendererClose?.request();
+      } catch (cause) {
+        if (forUpdate) throw new DesktopUpdatePreparationError("save", cause instanceof Error ? cause.message : String(cause));
+        throw cause;
+      }
+    }
+    quitting = true;
+    try {
+      await stopServices();
+    } catch (cause) {
+      console.error("Could not stop desktop services", cause);
+      if (forUpdate) {
+        quitting = false;
+        throw new DesktopUpdatePreparationError("shutdown", cause instanceof Error ? cause.message : String(cause));
+      }
+    }
+  })().catch((cause) => { shutdown = undefined; throw cause; });
+  return shutdown;
+}
+
+ipcMain.on("ohmygame:ready-to-close", (event, id: unknown, error: unknown) => {
+  if (!mainWindow || event.sender !== mainWindow.webContents || typeof id !== "number" ||
+      (error !== undefined && typeof error !== "string")) return;
+  rendererClose?.complete(id, error);
+});
+
+async function openProjectFile(filePath: string, mode: ProjectFileOpenMode): Promise<void> {
+  if (mode === "reveal") {
+    shell.showItemInFolder(filePath);
+    return;
+  }
+  if (mode === "default") {
+    const error = await shell.openPath(filePath);
+    if (error) throw new Error(error);
+    return;
+  }
+  if (process.platform === "darwin") {
+    const application = mode === "vscode" ? "Visual Studio Code" : mode === "zed" ? "Zed" : "TextEdit";
+    await executeFile("/usr/bin/open", ["-a", application, filePath]);
+    return;
+  }
+  if (mode === "text-editor") {
+    if (process.platform !== "win32") throw new Error("A system text editor is not available on this platform");
+    await executeFile("notepad.exe", [filePath]);
+    return;
+  }
+  const target = new URL(`${mode}://file`);
+  target.pathname = filePath.replaceAll("\\", "/");
+  await shell.openExternal(target.toString());
+}
+
+function executeFile(command: string, args: string[]): Promise<void> {
+  return new Promise((resolve, reject) => {
+    execFile(command, args, (error) => error ? reject(error) : resolve());
+  });
+}
+
+handle("ohmygame:open-auth-url", async (_event, url: unknown) => {
+  if (typeof url !== "string" || !isOAuthAuthorizationUrl(url)) throw new Error("Invalid OAuth authorization URL");
+  await shell.openExternal(url);
+});
+handle("ohmygame:take-auth-callback", () => oauth.takeCallback());
+handle("ohmygame:auth-callback-url", () => oauth.callbackUrl());
+handle("ohmygame:cancel-auth", () => oauth.cancel());
+handle("ohmygame:clipboard-files", async (event) => {
+  if (!mainWindow || event.sender !== mainWindow.webContents) throw new Error("Invalid clipboard source");
+  const paths = await clipboardFilePaths(clipboard);
+  const files = await loadClipboardFiles(paths);
+  if (paths.length && !files.length) throw new Error("The copied folder does not contain any files.");
+  return files;
+});
+handle("ohmygame:paste-native", (event) => {
+  if (!mainWindow || event.sender !== mainWindow.webContents) throw new Error("Invalid clipboard source");
+  event.sender.paste();
+});
+handle("ohmygame:set-appearance", (event, appearance: unknown) => {
+  const senderWindow = BrowserWindow.fromWebContents(event.sender);
+  if (!senderWindow || senderWindow.isDestroyed()) throw new Error("Invalid appearance source");
+  if (appearance !== "system" && appearance !== "light" && appearance !== "dark") {
+    throw new Error("Invalid appearance");
+  }
+  nativeTheme.themeSource = appearance;
+});
+if (process.platform === "win32") {
+  handle("ohmygame:window-control", (event, action: unknown) => {
+    if (!mainWindow || mainWindow.isDestroyed() || event.sender !== mainWindow.webContents) {
+      throw new Error("Invalid window control source");
+    }
+    if (action === "minimize") mainWindow.minimize();
+    else if (action === "toggle-maximize") {
+      if (mainWindow.isMaximized()) mainWindow.unmaximize();
+      else mainWindow.maximize();
+    } else if (action === "close") mainWindow.close();
+    else throw new Error("Invalid window control");
+  });
+  handle("ohmygame:window-state", (event) => {
+    if (!mainWindow || mainWindow.isDestroyed() || event.sender !== mainWindow.webContents) {
+      throw new Error("Invalid window state source");
+    }
+    return { maximized: mainWindow.isMaximized() };
+  });
+}
+handle("ohmygame:set-application-menu-labels", (event, labels: unknown) => {
+  // Hidden thumbnail windows run Scene code, so only the main window may name the menus.
+  if (!mainWindow || event.sender !== mainWindow.webContents || !isApplicationMenuLabels(labels)) {
+    throw new Error("Invalid application menu labels");
+  }
+  menuLabels = labels;
+  Menu.setApplicationMenu(Menu.buildFromTemplate(applicationMenuTemplate(labels, process.platform)));
+  refreshTrayMenu();
+});
+handle("ohmygame:browse-plugin-directory", async (event, pluginId: unknown) => {
+  if (!mainWindow || event.sender !== mainWindow.webContents) throw new Error("Invalid browse source");
+  if (!validPluginId(pluginId) || !daemon) throw new Error("Invalid plugin");
+  const response = await fetch(`${daemon.runtime.url}/plugins/${encodeURIComponent(pluginId)}/directory`, {
+    headers: { authorization: `Bearer ${daemon.runtime.token}` },
+  });
+  if (!response.ok) throw new Error("Plugin directory is not available");
+  const result = await response.json() as { path?: unknown };
+  if (typeof result.path !== "string" || !path.isAbsolute(result.path)) throw new Error("Invalid plugin directory");
+  const error = await shell.openPath(result.path);
+  if (error) throw new Error(error);
+});
+handle("ohmygame:browse-account-directory", async (event, runtime: unknown, profileId: unknown) => {
+  if (!mainWindow || event.sender !== mainWindow.webContents) throw new Error("Invalid browse source");
+  if (!isAccountRuntimeId(runtime) || !validRouteId(profileId) || !daemon) throw new Error("Invalid account");
+  const response = await fetch(`${daemon.runtime.url}/agent-runtimes/${runtime}/profiles/${encodeURIComponent(profileId)}/directory`, {
+    headers: { authorization: `Bearer ${daemon.runtime.token}` },
+  });
+  if (!response.ok) throw new Error("Account directory is not available");
+  const result = await response.json() as { path?: unknown };
+  if (typeof result.path !== "string" || !path.isAbsolute(result.path)) throw new Error("Invalid account directory");
+  const error = await shell.openPath(result.path);
+  if (error) throw new Error(error);
+});
+handle("ohmygame:open-project-file", async (event, projectId: unknown, filePath: unknown, mode: unknown = "default") => {
+  if (!mainWindow || event.sender !== mainWindow.webContents) throw new Error("Invalid file open source");
+  if (!validRouteId(projectId) || typeof filePath !== "string" || !filePath || filePath.length > 1_000 ||
+    typeof mode !== "string" || !PROJECT_FILE_OPEN_MODES.includes(mode as ProjectFileOpenMode) || !daemon) {
+    throw new Error("Invalid project file");
+  }
+  const response = await fetch(`${daemon.runtime.url}/projects/${encodeURIComponent(projectId)}/files/location?path=${encodeURIComponent(filePath)}`, {
+    headers: { authorization: `Bearer ${daemon.runtime.token}` },
+  });
+  if (!response.ok) throw new Error("Project file is not available");
+  const result = await response.json() as { path?: unknown };
+  if (typeof result.path !== "string" || !path.isAbsolute(result.path)) throw new Error("Invalid project file path");
+  await openProjectFile(result.path, mode as ProjectFileOpenMode);
+});
+handle("ohmygame:reveal-plugin-skill", async (event, pluginId: unknown, skillId: unknown) => {
+  if (!mainWindow || event.sender !== mainWindow.webContents) throw new Error("Invalid browse source");
+  if (!validPluginId(pluginId) || typeof skillId !== "string" || !skillId || skillId.length > 1_000 || !daemon) {
+    throw new Error("Invalid Plugin Skill");
+  }
+  const response = await fetch(`${daemon.runtime.url}/plugins/${encodeURIComponent(pluginId)}/skill-file?id=${encodeURIComponent(skillId)}`, {
+    headers: { authorization: `Bearer ${daemon.runtime.token}` },
+  });
+  if (!response.ok) throw new Error("Plugin Skill is not available");
+  const result = await response.json() as { path?: unknown };
+  if (typeof result.path !== "string" || !path.isAbsolute(result.path)) throw new Error("Invalid Plugin Skill path");
+  shell.showItemInFolder(result.path);
+});
+// Removes a project from OhMyGame. The daemon moves the files of a project in
+// its own storage aside and says where; they go to the Trash from there, so
+// removing never deletes what the person made.
+handle("ohmygame:remove-project", async (event, projectId: unknown) => {
+  if (!mainWindow || event.sender !== mainWindow.webContents) throw new Error("Invalid project source");
+  if (!validRouteId(projectId) || !daemon) throw new Error("Invalid project");
+  const response = await fetch(`${daemon.runtime.url}/projects/${encodeURIComponent(projectId)}?keep=1`, {
+    method: "DELETE",
+    headers: { authorization: `Bearer ${daemon.runtime.token}` },
+  });
+  if (!response.ok) {
+    const body = await response.json().catch(() => undefined) as { error?: unknown } | undefined;
+    throw new Error(typeof body?.error === "string" ? body.error : "The project could not be removed");
+  }
+  const result = await response.json() as { movedTo?: unknown };
+  if (result.movedTo === undefined) return;
+  if (typeof result.movedTo !== "string" || !path.isAbsolute(result.movedTo)) throw new Error("Invalid removed project folder");
+  try {
+    await shell.trashItem(result.movedTo);
+  } catch {
+    throw new Error(`The project was removed, but its files could not be moved to the Trash. They are in ${result.movedTo}`);
+  }
+  await rmdir(path.dirname(result.movedTo)).catch(() => {});
+});
+handle("ohmygame:read-usage-data", () => readUsageData());
+handle("ohmygame:update-usage-data", (event, enabled: unknown, initialize: unknown) => {
+  if (!mainWindow || mainWindow.isDestroyed() || event.sender !== mainWindow.webContents ||
+      event.senderFrame !== mainWindow.webContents.mainFrame ||
+      typeof enabled !== "boolean" || typeof initialize !== "boolean") {
+    throw new Error("Invalid usage data request");
+  }
+  const saved = updateUsageData(enabled, initialize);
+  for (const opening of playtestWindows.values()) {
+    void Promise.resolve(opening).then((window) => {
+      if (!window.isDestroyed()) window.webContents.send("ohmygame:usage-data-changed", readUsageData());
+    }).catch(() => {});
+  }
+  return saved;
+});
+handle("ohmygame:open-logs-directory", async (event) => {
+  if (!mainWindow || event.sender !== mainWindow.webContents) throw new Error("Invalid logs folder source");
+  mkdirSync(logDirectory, { recursive: true, mode: 0o700 });
+  const error = await shell.openPath(logDirectory);
+  if (error) throw new Error(error);
+});
+handle("ohmygame:export-diagnostics", async (event) => {
+  if (!mainWindow || event.sender !== mainWindow.webContents) throw new Error("Invalid diagnostics source");
+  return desktopDiagnosticsArchive({ logDirectory, logs: [mainLog, daemonLog], service: () => daemon?.state(), redact: redactLog });
+});
+handle("ohmygame:select-plugin-directory", async (event) => {
+  if (!mainWindow || event.sender !== mainWindow.webContents) throw new Error("Invalid directory selection source");
+  const result = await dialog.showOpenDialog(mainWindow, { properties: ["openDirectory"] });
+  return result.canceled ? undefined : result.filePaths[0];
+});
+handle("ohmygame:select-project-directory", async (event) => {
+  if (!mainWindow || event.sender !== mainWindow.webContents) throw new Error("Invalid directory selection source");
+  const result = await dialog.showOpenDialog(mainWindow, {
+    title: "Select project workspace",
+    buttonLabel: "Use this folder",
+    properties: ["openDirectory", "createDirectory"],
+  });
+  return result.canceled ? undefined : result.filePaths[0];
+});
+handle("ohmygame:capture-page", async (event, rectangle: unknown) => {
+  const window = mainWindow && event.sender === mainWindow.webContents
+    ? mainWindow
+    : nodeThumbnails.get(event.sender.id)?.window;
+  if (!window) throw new Error("Invalid capture source");
+  const bounds = captureBounds(rectangle, window.getContentBounds());
+  return window.webContents.capturePage(bounds).then((image) => image.toPNG());
+});
+handle("ohmygame:prepare-node-thumbnails", (event, projectId: unknown, batchId: unknown, value: unknown) => {
+  if (!mainWindow || event.sender !== mainWindow.webContents) throw new Error("Invalid thumbnail source");
+  const snapshot = value as PlayableThumbnailSnapshot | undefined;
+  if (!validRouteId(projectId) || !validRouteId(batchId) || nodeThumbnailBatches.has(batchId)
+    || !snapshot || typeof snapshot.version !== "string" || (snapshot.web !== undefined && snapshot.web !== true)
+    || snapshot.definition?.version !== 1 || typeof snapshot.definition.graphSignature !== "string"
+    || !isNodeGraph(snapshot.definition.graph) || !isSceneHashes(snapshot.definition.hashes)) {
+    throw new Error("Invalid thumbnail snapshot");
+  }
+  nodeThumbnailBatches.set(batchId, { projectId, snapshot, controller: new AbortController(), requests: 0 });
+});
+handle("ohmygame:node-thumbnail-snapshot", (event) => {
+  const thumbnail = nodeThumbnails.get(event.sender.id);
+  if (!thumbnail) throw new Error("Invalid thumbnail source");
+  return thumbnail.snapshot;
+});
+handle("ohmygame:capture-node-thumbnail", (event, projectId: unknown, nodeId: unknown, viewport: unknown, batchId: unknown) => {
+  if (!mainWindow || event.sender !== mainWindow.webContents) throw new Error("Invalid thumbnail source");
+  if (!validRouteId(projectId) || !validRouteId(nodeId) || !isValidPlaytestViewport(viewport) || !validRouteId(batchId)) throw new Error("Invalid thumbnail target");
+  return scheduleNodeThumbnail(projectId, nodeId, viewport, batchId);
+});
+handle("ohmygame:cancel-node-thumbnails", (event, batchId: unknown) => {
+  if (!mainWindow || event.sender !== mainWindow.webContents || !validRouteId(batchId)) throw new Error("Invalid thumbnail cancellation");
+  const batch = nodeThumbnailBatches.get(batchId);
+  batch?.controller.abort();
+  if (batch && !batch.requests) nodeThumbnailBatches.delete(batchId);
+});
+handle("ohmygame:finish-node-thumbnail", (event, captured: unknown, error: unknown) => {
+  nodeThumbnails.get(event.sender.id)?.finish(captured === true
+    ? { captured: true }
+    : { captured: false, error: typeof error === "string" && error ? error.slice(0, 500) : "The capture failed." });
+});
+handle("ohmygame:agent-playtest-state", (event): PlaytestWatchState => {
+  if (!mainWindow || event.sender !== mainWindow.webContents) throw new Error("Invalid Agent playtest source");
+  return agentPlaytests.watchState();
+});
+handle("ohmygame:set-agent-playtest-visible", (event, visible: unknown): PlaytestWatchState => {
+  if (!mainWindow || event.sender !== mainWindow.webContents || typeof visible !== "boolean") {
+    throw new Error("Invalid Agent playtest visibility");
+  }
+  return agentPlaytests.setVisible(visible);
+});
+handle("ohmygame:web-game-player-state", (event, projectId: unknown) => {
+  requirePlayerSource(event.sender, projectId);
+  return webGamePlayers.state(projectId);
+});
+handle("ohmygame:attach-web-game-preview", (event, projectId: unknown, attachment: unknown, url: unknown, layout: unknown) => {
+  requirePlayerSource(event.sender, projectId);
+  if (!validRouteId(attachment) || typeof url !== "string" || url.length > 4_000) throw new Error("Invalid game preview target");
+  return webGamePlayers.attach(projectId, attachment, mainWindow!, url, requirePreviewLayout(layout), () => resolvePlayerTarget(projectId));
+});
+handle("ohmygame:layout-web-game-preview", (event, projectId: unknown, attachment: unknown, layout: unknown) => {
+  requirePlayerSource(event.sender, projectId);
+  if (!validRouteId(attachment)) throw new Error("Invalid game preview attachment");
+  webGamePlayers.layout(projectId, attachment, requirePreviewLayout(layout));
+});
+handle("ohmygame:detach-web-game-preview", (event, projectId: unknown, attachment: unknown) => {
+  requirePlayerSource(event.sender, projectId);
+  if (!validRouteId(attachment)) throw new Error("Invalid game preview attachment");
+  webGamePlayers.detach(projectId, attachment);
+});
+handle("ohmygame:capture-web-game-preview", (event, projectId: unknown) => {
+  requirePlayerSource(event.sender, projectId);
+  return webGamePlayers.capture(projectId);
+});
+handle("ohmygame:clear-browser-data", (event) => {
+  if (!mainWindow || event.sender !== mainWindow.webContents || event.senderFrame !== mainWindow.webContents.mainFrame)
+    throw new Error("Invalid browser data source");
+  return browserViews.clearData();
+});
+handle("ohmygame:attach-browser", (event, projectId: unknown, attachment: unknown, layout: unknown, saved: unknown, labels: unknown) => {
+  requirePlayerSource(event.sender, projectId);
+  if (!validRouteId(attachment) || !isBrowserMenuLabels(labels)) throw new Error("Invalid browser attachment");
+  return browserViews.attach(projectId, attachment, mainWindow!, requirePreviewLayout(layout), requireSavedBrowser(saved), labels);
+});
+handle("ohmygame:layout-browser", (event, projectId: unknown, attachment: unknown, layout: unknown) => {
+  requirePlayerSource(event.sender, projectId);
+  if (!validRouteId(attachment)) throw new Error("Invalid browser attachment");
+  browserViews.layout(projectId, attachment, requirePreviewLayout(layout));
+});
+handle("ohmygame:browser-ready", (event, projectId: unknown, attachment: unknown) => {
+  requirePlayerSource(event.sender, projectId);
+  if (!validRouteId(attachment)) throw new Error("Invalid browser attachment");
+  browserViews.ready(projectId, attachment);
+});
+handle("ohmygame:detach-browser", (event, projectId: unknown, attachment: unknown) => {
+  requirePlayerSource(event.sender, projectId);
+  if (!validRouteId(attachment)) throw new Error("Invalid browser attachment");
+  browserViews.detach(projectId, attachment);
+});
+handle("ohmygame:capture-browser", (event, projectId: unknown) => {
+  requirePlayerSource(event.sender, projectId);
+  return browserViews.capture(projectId);
+});
+handle("ohmygame:browser-open", (event, projectId: unknown, url: unknown) => {
+  requirePlayerSource(event.sender, projectId);
+  if (url !== undefined && typeof url !== "string") throw new Error("Invalid browser address");
+  return browserViews.open(projectId, url);
+});
+handle("ohmygame:browser-tab", (event, projectId: unknown, tabId: unknown, action: unknown, value: unknown) => {
+  requirePlayerSource(event.sender, projectId);
+  if (!validRouteId(tabId)) throw new Error("Invalid browser tab");
+  if (action === "navigate") {
+    if (typeof value !== "string") throw new Error("Invalid browser address");
+    return browserViews.navigate(projectId, tabId, value);
+  }
+  if (action === "select") return browserViews.select(projectId, tabId);
+  if (action === "close") return browserViews.close(projectId, tabId);
+  if (action === "back") return browserViews.back(projectId, tabId);
+  if (action === "forward") return browserViews.forward(projectId, tabId);
+  if (action === "reload") return browserViews.reload(projectId, tabId, value === true);
+  throw new Error("Invalid browser action");
+});
+handle("ohmygame:filter-web-game-player", (event, projectId: unknown, filter: unknown) => {
+  requirePlayerSource(event.sender, projectId);
+  if (filter !== null && !isPreviewColorFilter(filter)) throw new Error("Invalid game filter");
+  webGamePlayers.setFilter(projectId, filter ?? undefined);
+});
+handle("ohmygame:open-web-game-player", (event, projectId: unknown, request: unknown) => {
+  requirePlayerSource(event.sender, projectId);
+  const input = request as Partial<WebGamePlayerRequest> | null;
+  if (!input || typeof input.path !== "string" || input.path.length > 2_000 || !isValidPlaytestViewport(input.viewport)) {
+    throw new Error("Invalid game player target");
+  }
+  return webGamePlayers.open(projectId, input as WebGamePlayerRequest, () => resolvePlayerTarget(projectId));
+});
+handle("ohmygame:close-web-game-player", (event, projectId: unknown) => {
+  requirePlayerSource(event.sender, projectId);
+  webGamePlayers.closeProject(projectId);
+});
+handle("ohmygame:refresh-web-game-player", (event, projectId: unknown, reload: unknown = false) => {
+  requirePlayerSource(event.sender, projectId);
+  if (typeof reload !== "boolean") throw new Error("Invalid game player refresh");
+  return webGamePlayers.refresh(projectId, () => resolvePlayerTarget(projectId), reload);
+});
+handle("ohmygame:start-game-recording", (event, projectId: unknown) => {
+  requirePlayerSource(event.sender, projectId);
+  return startGameRecording(projectId);
+});
+handle("ohmygame:stop-game-recording", (event, projectId: unknown) => {
+  requirePlayerSource(event.sender, projectId);
+  gameRecorder.stop(projectId);
+});
+handle("ohmygame:game-recording-state", (event, projectId: unknown) => {
+  requirePlayerSource(event.sender, projectId);
+  return gameRecordings.get(projectId) ?? { projectId, status: "idle" };
+});
+handle("ohmygame:runtime-state", (event) => {
+  if (!BrowserWindow.fromWebContents(event.sender) || !daemon) throw new Error("Invalid background service source");
+  return daemon.state();
+});
+handle("ohmygame:restart-runtime", (event, options: unknown) => {
+  if (!mainWindow || event.sender !== mainWindow.webContents || !daemon || quitting) throw new Error("Invalid background service source");
+  return daemon.restart({ safeMode: (options as { safeMode?: unknown } | undefined)?.safeMode === true });
+});
+
+async function startGameRecording(projectId: string): Promise<void> {
+  // The button and the shortcut can both ask before the first has started.
+  if (gameRecordingStarts.has(projectId)) return;
+  gameRecordingStarts.add(projectId);
+  let outcome: Promise<GameRecordingSaved>;
+  try {
+    const { contents, title } = await webGamePlayers.recordingTarget(projectId);
+    // The filter is off before the first frame is captured.
+    await webGamePlayers.setRecording(projectId, true);
+    ({ outcome } = await gameRecorder.start(projectId, contents, { title, maxSeconds: GAME_RECORDING_MAX_SECONDS }));
+  } catch (cause) {
+    void webGamePlayers.setRecording(projectId, false);
+    if (gameRecordings.has(projectId)) publishGameRecording({ projectId, status: "idle" });
+    throw cause;
+  } finally {
+    gameRecordingStarts.delete(projectId);
+  }
+  if (gameRecordings.get(projectId)?.status !== "saving") {
+    publishGameRecording({ projectId, status: "recording", startedAt: Date.now(), maxSeconds: GAME_RECORDING_MAX_SECONDS });
+  }
+  void outcome.then(
+    (saved) => publishGameRecording({ projectId, status: "idle", saved }),
+    (cause: unknown) => publishGameRecording({ projectId, status: "idle", error: cause instanceof Error ? cause.message : String(cause) }),
+  ).finally(() => void webGamePlayers.setRecording(projectId, false));
+}
+
+function publishGameRecording(state: GameRecordingState): void {
+  if (state.status === "idle") gameRecordings.delete(state.projectId);
+  else gameRecordings.set(state.projectId, state);
+  mainWindow?.webContents.send("ohmygame:game-recording-state", state);
+}
+
+/** Recordings go to the Library, where the trimmer can cut them down. */
+async function saveGameRecording(file: GameRecordingFile): Promise<GameRecordingSaved> {
+  if (!daemon) throw new Error("The game service is unavailable.");
+  const name = gameRecordingFileName(file.title, new Date(), file.extension);
+  const query = new URLSearchParams({ name, mediaType: file.mediaType, duration: file.duration.toFixed(3), saved: "true" });
+  const response = await fetch(`${daemon.runtime.url}/library/assets/upload?${query}`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${daemon.runtime.token}`, "content-type": "application/octet-stream" },
+    body: Readable.toWeb(createReadStream(file.path)) as ReadableStream,
+    duplex: "half",
+  } as RequestInit);
+  const asset = await response.json().catch(() => undefined) as { id?: string; error?: string; message?: string } | undefined;
+  if (!response.ok || !asset?.id) throw new Error(asset?.message ?? asset?.error ?? "The recording could not be saved to the Library.");
+  mainWindow?.webContents.send("ohmygame:game-recording-saved");
+  return { assetId: asset.id, name, duration: file.duration, bytes: file.bytes };
+}
+
+function requirePlayerSource(sender: Electron.WebContents, projectId: unknown): asserts projectId is string {
+  if (!mainWindow || sender !== mainWindow.webContents || !validRouteId(projectId) || !daemon) {
+    throw new Error("Invalid game player source");
+  }
+}
+
+/** A project's saved tabs, from the panel; only their addresses and titles are used. */
+function requireSavedBrowser(value: unknown): ProjectBrowser {
+  const saved = value as Partial<ProjectBrowser> | null;
+  if (!saved || !Array.isArray(saved.tabs) || saved.tabs.length > 100) throw new Error("Invalid browser tabs");
+  const tabs = saved.tabs.flatMap((tab) => tab && validRouteId(tab.id) && typeof tab.url === "string" && typeof tab.title === "string" && (!tab.url || isBrowserUrl(tab.url))
+    ? [{ id: tab.id, url: tab.url, title: tab.title.slice(0, 500) }] : []);
+  return { tabs, ...(typeof saved.active === "string" ? { active: saved.active } : {}), visits: [] };
+}
+
+function requirePreviewLayout(value: unknown): WebGamePreviewLayout {
+  const layout = value as Partial<WebGamePreviewLayout> | null;
+  const bounds = layout?.bounds;
+  if (!bounds || typeof layout.visible !== "boolean" ||
+      ![bounds.x, bounds.y, bounds.width, bounds.height].every((entry) => Number.isFinite(entry) && entry >= 0 && entry <= 32_768)) {
+    throw new Error("Invalid game preview bounds");
+  }
+  return layout as WebGamePreviewLayout;
+}
+
+async function resolvePlayerTarget(projectId: string): Promise<WebGamePlayerTarget> {
+  if (!daemon) throw new Error("The game service is unavailable.");
+  const headers = { authorization: `Bearer ${daemon.runtime.token}` };
+  const projectUrl = `${daemon.runtime.url}/projects/${encodeURIComponent(projectId)}`;
+  const current = await fetch(projectUrl, { headers });
+  const project = await current.json() as { error?: string; message?: string };
+  if (!current.ok) throw new Error(project.message ?? project.error ?? "The project could not be loaded.");
+  const version = current.headers.get("x-workspace-version") ?? "0";
+  const response = await fetch(`${projectUrl}/preview?reuse=1`, {
+    method: "POST", headers: { ...headers, "x-workspace-version": version },
+  });
+  const result = await response.json() as { url?: string; title?: string; error?: string; message?: string };
+  if (!response.ok || !result.url || !result.title) throw new Error(result.message ?? result.error ?? "The game server could not start.");
+  return { url: result.url, title: result.title };
+}
+
+handle("ohmygame:open-playtest", async (event, projectId: unknown, viewport: unknown) => {
+  if (!mainWindow || event.sender !== mainWindow.webContents) throw new Error("Invalid playtest source");
+  if (!validRouteId(projectId) || !isValidPlaytestViewport(viewport) || !daemon) throw new Error("Invalid playtest target");
+  const size = fitPlaytestContentSize(viewport);
+  const aspectRatio = viewport.width / viewport.height;
+  const current = playtestWindows.get(projectId);
+  if (current) {
+    const existing = await current;
+    if (!existing.isDestroyed()) {
+      existing.setAspectRatio(aspectRatio);
+      existing.setContentSize(size.width, size.height);
+      existing.focus();
+      return;
+    }
+    playtestWindows.delete(projectId);
+  }
+  const opening = createDesktopWindow({
+    runtime: daemon.runtime,
+    preloadPath: path.join(moduleDirectory, "preload.cjs"),
+    rendererUrl: useBuiltRenderer ? undefined : developmentRendererUrl,
+    rendererFile: useBuiltRenderer ? path.join(moduleDirectory, "../renderer/index.html") : undefined,
+    rendererHash: `#/playtest/${encodeURIComponent(projectId)}`,
+    nativeTitleBar: true,
+    contentSize: size,
+    aspectRatio,
+    minWidth: Math.max(1, Math.round(size.width / 2)),
+    minHeight: Math.max(1, Math.round(size.height / 2)),
+  });
+  playtestWindows.set(projectId, opening);
+  try {
+    const playtest = await opening;
+    if (!mainWindow) {
+      playtest.close();
+      return;
+    }
+    playtestWindows.set(projectId, playtest);
+    playtest.once("closed", () => {
+      if (playtestWindows.get(projectId) === playtest) playtestWindows.delete(projectId);
+    });
+  } catch (error) {
+    if (playtestWindows.get(projectId) === opening) playtestWindows.delete(projectId);
+    throw error;
+  }
+});
+handle("ohmygame:open-playable-node", async (event, projectId: unknown, nodeId: unknown) => {
+  if (!validRouteId(projectId) || !validRouteId(nodeId)) throw new Error("Invalid Node target");
+  const playtest = await playtestWindows.get(projectId);
+  if (!playtest || playtest.isDestroyed() || event.sender !== playtest.webContents) throw new Error("Invalid Node source");
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  mainWindow.webContents.send("ohmygame:open-playable-node", projectId, nodeId);
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.focus();
+});
+handle("ohmygame:show-playtest-editor", async (event, projectId: unknown) => {
+  if (!validRouteId(projectId)) throw new Error("Invalid Playtest editor target");
+  const playtest = await playtestWindows.get(projectId);
+  if (!playtest || playtest.isDestroyed() || event.sender !== playtest.webContents) throw new Error("Invalid Playtest editor source");
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  mainWindow.webContents.send("ohmygame:show-playtest-editor", projectId);
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.focus();
+});
+handle("ohmygame:notification-preferences", (event, value: unknown) => {
+  if (!mainWindow || event.sender !== mainWindow.webContents) throw new Error("Invalid notification source");
+  const preferences = parseAgentNotificationPreferences(value);
+  if (!preferences) throw new Error("Invalid notification preferences");
+  agentNotifications.setPreferences(preferences);
+});
+handle("ohmygame:notification-view", (event, value: unknown) => {
+  if (!mainWindow || event.sender !== mainWindow.webContents) throw new Error("Invalid notification source");
+  const view = parseAgentNotificationTarget(value);
+  if (view === undefined) throw new Error("Invalid conversation");
+  agentNotifications.setView(view);
+});
+handle("ohmygame:take-notification-target", (event) => {
+  if (!mainWindow || event.sender !== mainWindow.webContents) throw new Error("Invalid notification source");
+  const target = notificationTarget;
+  notificationTarget = undefined;
+  return target;
+});
+handle("ohmygame:notification-permission", (event) => {
+  if (!mainWindow || event.sender !== mainWindow.webContents) throw new Error("Invalid notification source");
+  return notificationPermission.status();
+});
+handle("ohmygame:request-notification-permission", (event) => {
+  if (!mainWindow || event.sender !== mainWindow.webContents) throw new Error("Invalid notification source");
+  return notificationPermission.request();
+});
+handle("ohmygame:notification-prompt-sent", (event) => {
+  if (!mainWindow || event.sender !== mainWindow.webContents) throw new Error("Invalid notification source");
+  return notificationPermission.requestOncePerLaunch();
+});
+handle("ohmygame:open-notification-settings", (event) => {
+  if (!mainWindow || event.sender !== mainWindow.webContents) throw new Error("Invalid notification source");
+  return notificationPermission.openSettings();
+});
+handle("ohmygame:update-state", () => updater?.state() ?? null);
+handle("ohmygame:check-for-update", () => (updateChecks ? updateChecks.manual() : updater?.check()));
+handle("ohmygame:download-update", () => updater?.download());
+handle("ohmygame:install-update", () => updater?.install());
+// Settings → General: the main window says when an agent is working and the person wants no sleep.
+let keepAwakeBlocker: number | undefined;
+function setKeepAwake(enabled: boolean): void {
+  if (enabled && keepAwakeBlocker === undefined) keepAwakeBlocker = powerSaveBlocker.start("prevent-app-suspension");
+  else if (!enabled && keepAwakeBlocker !== undefined) {
+    powerSaveBlocker.stop(keepAwakeBlocker);
+    keepAwakeBlocker = undefined;
+  }
+}
+handle("ohmygame:set-keep-awake", (event, enabled: unknown) => {
+  if (!mainWindow || event.sender !== mainWindow.webContents) throw new Error("Invalid keep-awake source");
+  setKeepAwake(enabled === true);
+});
+handle("ohmygame:focus-window", (event) => {
+  if (!mainWindow || mainWindow.isDestroyed() || event.sender !== mainWindow.webContents) throw new Error("Invalid focus source");
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.show();
+  mainWindow.focus();
+});
+handle("ohmygame:set-automatic-updates", (event, enabled: unknown) => {
+  if (!mainWindow || event.sender !== mainWindow.webContents) throw new Error("Invalid update source");
+  if (typeof enabled !== "boolean") throw new Error("Invalid automatic update setting");
+  updater?.setAutomatic(enabled);
+});
+handle("ohmygame:restart-app", (event) => {
+  if (!mainWindow || event.sender !== mainWindow.webContents) throw new Error("Invalid restart source");
+  if (quitting) return;
+  restartPending = true;
+  app.quit();
+});
+
+handle("ohmygame:background-running", async (event, enabled?: unknown) => {
+  if (!mainWindow || event.sender !== mainWindow.webContents || event.senderFrame !== mainWindow.webContents.mainFrame)
+    throw new Error("Invalid background-running source");
+  if (process.platform !== "darwin" && process.platform !== "win32") throw new Error("Background running is unavailable on this platform");
+  if (!backgroundRunning) throw new Error("Background running is not ready");
+  if (enabled === undefined) return backgroundRunning.read();
+  if (typeof enabled !== "boolean") throw new Error("Invalid background-running setting");
+  const value = await backgroundRunning.set(enabled);
+  // A setting change that finishes after Close must not leave an unreachable hidden window.
+  if (!value && mainWindow && !mainWindow.isVisible()) await showMainWindow();
+  return value;
+});
+
+// Settings → General: the GPU falls back to software rendering after repeated crashes.
+handle("ohmygame:gpu-fallback", (event, disabled: unknown) => {
+  if (!mainWindow || event.sender !== mainWindow.webContents) throw new Error("Invalid GPU fallback source");
+  if (disabled === undefined) return { disabled: readGpuFallback(gpuFallbackFile) };
+  if (typeof disabled !== "boolean") throw new Error("Invalid GPU fallback setting");
+  setGpuFallback(gpuFallbackFile, disabled);
+  return { disabled: readGpuFallback(gpuFallbackFile) };
+});
+
+// Keep each platform's default when the opt-in is off. Explicit Quit always shuts down.
+app.on("window-all-closed", () => {
+  if (process.platform !== "darwin" && !backgroundRunning?.enabled) app.quit();
+});
+app.on("activate", () => { void showMainWindow(); });
+app.on("second-instance", () => { void showMainWindow(); });
+app.on("will-quit", () => backgroundRunning?.dispose());
+app.on("before-quit", (event) => {
+  if (quitting || !daemon) return;
+  event.preventDefault();
+  if (quitPending) return;
+  quitPending = true;
+  void prepareShutdown().then(() => {
+    if (restartPending) app.relaunch();
+    app.quit();
+  }).catch(() => { quitPending = false; restartPending = false; void showMainWindow(); });
+});
+
+try {
+  await app.whenReady();
+  // English until the main window's renderer sends the app's language.
+  Menu.setApplicationMenu(Menu.buildFromTemplate(applicationMenuTemplate({}, process.platform)));
+  nativeTheme.themeSource = "system";
+  const rendererOrigin = useBuiltRenderer ? "null" : new URL(developmentRendererUrl).origin;
+  const dataDirectory = process.env.OHMYGAME_DATA_DIR ?? path.join(app.getPath("userData"), "data");
+  if (process.platform === "darwin" || process.platform === "win32") {
+    backgroundRunning = new BackgroundRunning(
+      path.join(dataDirectory, "background-running.json"),
+      process.platform === "win32" ? createBackgroundTray : undefined,
+    );
+    await backgroundRunning.initialize().catch((cause) => console.warn("Background running is unavailable", cause));
+  }
+  const systemProxySession = session.fromPartition("ohmygame-system-proxy", { cache: false });
+  await systemProxySession.setProxy({ mode: "system" });
+  const network = await prepareDesktopNetwork({
+    dataDirectory,
+    environment: app.isPackaged ? await packagedEnvironment() : { ...process.env },
+    resolveProxy: (url) => systemProxySession.resolveProxy(url),
+  });
+  gameSignIn = gameSignInIssuer(network.environment);
+  // Main uses the same local bypasses; preserve the original environment for daemon policy resolution.
+  setGlobalDispatcher(createNetworkDispatcher(network.active));
+  const proxyConfig = electronProxyConfig(network.active);
+  const startupSessions = [session.defaultSession, session.fromPartition("electron-updater", { cache: false })];
+  app.on("login", (event, _contents, _request, authInfo, callback) => {
+    if (!authInfo.isProxy) return;
+    const credentials = proxyCredentials(network.active, authInfo.host, authInfo.port);
+    if (!credentials) return;
+    event.preventDefault();
+    callback(credentials.username, credentials.password);
+  });
+  app.on("session-created", (createdSession) => {
+    void createdSession.setProxy(proxyConfig).catch((error) => console.warn("Could not configure session proxy", error));
+  });
+  await Promise.all(startupSessions.map((startupSession) => startupSession.setProxy(proxyConfig)));
+  // A missing launcher only leaves external agents unable to connect; the app still starts.
+  const externalMcpLauncher = await installExternalMcpLauncher({
+    binDirectory: path.join(app.getPath("userData"), "bin"),
+    executable: process.execPath,
+    entry: path.join(moduleDirectory, "external-mcp-main.js"),
+    dataDirectory,
+    ...(app.isPackaged ? {} : { appPath: repositoryRoot }),
+  }).catch((error) => { console.warn("Could not install the OhMyGame MCP launcher", error); return undefined; });
+  clearExternalMcpApp = await markExternalMcpApp(dataDirectory).catch(() => undefined);
+  daemon = new DaemonSupervisor({
+    // `--safe-mode` starts with no plugins running, for a plugin that breaks the app.
+    safeMode: process.argv.includes("--safe-mode"),
+    daemonEntry: path.join(moduleDirectory, "../daemon/server.js"),
+    dataDirectory,
+    token: randomBytes(32).toString("base64url"),
+    allowedOrigins: [rendererOrigin],
+    // A `file://` page sends the origin `null`, but CSP only matches it as `file:`.
+    pluginFrameAncestors: [useBuiltRenderer ? "file:" : rendererOrigin],
+    piAgentDirectory: process.env.PI_CODING_AGENT_DIR ?? path.join(app.getPath("userData"), "pi-agent"),
+    pluginUiDirectory: app.isPackaged ? path.join(process.resourcesPath, "plugin-ui") : undefined,
+    preinstalledPluginsDirectory: app.isPackaged
+      ? path.join(process.resourcesPath, "preinstalled-plugins")
+      : path.join(repositoryRoot, ".runtime", "preinstalled-plugins"),
+    examplesDirectory: app.isPackaged
+      ? path.join(process.resourcesPath, "examples")
+      : path.join(repositoryRoot, ".runtime", "examples"),
+    ...(externalMcpLauncher ? { externalMcpLauncher } : {}),
+    externalSkillDirectory: app.isPackaged
+      ? path.join(process.resourcesPath, "integrations", "skills", "ohmygame-studio")
+      : path.join(repositoryRoot, "integrations", "skills", "ohmygame-studio"),
+    runtimeBin: app.isPackaged
+      ? process.platform === "win32"
+        ? path.join(process.resourcesPath, "runtime", "node")
+        : path.join(process.resourcesPath, "runtime", "node", "bin")
+      : undefined,
+    environment: network.environment,
+    resolveSystemProxy: async () => {
+      // A separate system-configured session keeps detection independent of a manual app proxy.
+      await systemProxySession.forceReloadProxyConfig();
+      return systemProxySession.resolveProxy(SYSTEM_PROXY_TARGET);
+    },
+    development: !useBuiltRenderer,
+    healthTimeoutMs: 60_000,
+    log: daemonLog,
+    logDirectory,
+    handlePlaytestRequest: (request, signal) => agentPlaytests.request(request, signal),
+    handleBrowserRequest: (request, signal) => agentBrowser.request(request, signal),
+    onState: (state) => {
+      mainLog.line(runtimeStateLine(state));
+      if (state.status !== "ready") {
+        webGamePlayers.close();
+        agentPlaytests.close();
+        gameRecorder.close();
+      }
+      for (const window of BrowserWindow.getAllWindows()) {
+        if (!window.isDestroyed()) window.webContents.send("ohmygame:runtime-state", state);
+      }
+    },
+  });
+  await daemon.start();
+  agentNotifications.start();
+  updater = new DesktopUpdater(app.getVersion(), () => prepareShutdown(true));
+
+  if (!useBuiltRenderer) await waitForRenderer(developmentRendererUrl);
+  updater.subscribe((state) => mainWindow?.webContents.send("ohmygame:update-state", state));
+  // The same failure is published again with every other change to the update state.
+  let updateFailure: string | undefined;
+  updater.subscribe((state) => {
+    const failure = updateFailureLine(state);
+    if (failure && failure !== updateFailure) mainLog.line(failure);
+    updateFailure = failure;
+  });
+  await openMainWindow();
+  startupComplete = true;
+  if (app.isPackaged) {
+    updateChecks = new DesktopUpdateCheckScheduler(updater);
+    updateChecks.start();
+  }
+} catch (error) {
+  const message = error instanceof Error ? error.message : String(error);
+  console.error(error);
+  if (app.isReady()) dialog.showErrorBox("GAMEORA could not start", message);
+  await stopServices();
+  app.exit(1);
+}
+
+async function openMainWindow(): Promise<void> {
+  if (!daemon) throw new Error("The daemon is not running");
+  // beforeLoad runs before the first await, so a second activate sees mainWindow already set.
+  await createDesktopWindow({
+    runtime: daemon.runtime,
+    preloadPath: path.join(moduleDirectory, "preload.cjs"),
+    rendererUrl: useBuiltRenderer ? undefined : developmentRendererUrl,
+    rendererFile: useBuiltRenderer ? path.join(moduleDirectory, "../renderer/index.html") : undefined,
+    sidebarVibrancy: true,
+    integratedWindowControls: true,
+    gameSignInIssuer: gameSignIn,
+    beforeLoad: (window) => {
+      mainWindow = window;
+      if (process.platform === "win32") showWaitingOverlay();
+      window.webContents.on("console-message", (details) => {
+        for (const line of rendererConsoleLines(details)) mainLog.line(line);
+      });
+      window.webContents.on("did-start-navigation", (_event, _url, inPlace, mainFrame) => {
+        if (mainFrame && !inPlace) browserViews.dispose();
+      });
+      window.webContents.on("render-process-gone", () => browserViews.dispose());
+      // Electron shows no menu of its own, so text could not be copied or a link's address taken.
+      window.webContents.on("context-menu", (_event, params) => {
+        const items = windowContextMenuTemplate(params, menuLabels, {
+          openLink: (url) => void openInBrowser(url),
+          copy: (text) => clipboard.writeText(text),
+        });
+        if (items.length) Menu.buildFromTemplate(items).popup({ window });
+      });
+      window.on("show", () => {
+        webGamePlayers.synchronize();
+        browserViews.synchronize();
+        updateChecks?.onFocus();
+      });
+      if (process.platform === "win32") {
+        const sendWindowState = () => {
+          if (!window.isDestroyed()) window.webContents.send("ohmygame:window-state", { maximized: window.isMaximized() });
+        };
+        window.on("maximize", sendWindowState);
+        window.on("unmaximize", sendWindowState);
+      }
+      window.on("focus", () => {
+        updateChecks?.onFocus();
+        if (process.platform !== "darwin") window.flashFrame(false);
+        agentNotifications.focusChanged();
+      });
+      window.on("hide", () => { webGamePlayers.synchronize(); browserViews.synchronize(); });
+      window.on("minimize", () => { webGamePlayers.synchronize(); browserViews.synchronize(); });
+      window.on("restore", () => { webGamePlayers.synchronize(); browserViews.synchronize(); });
+      window.on("resize", () => { webGamePlayers.synchronize(); browserViews.synchronize(); });
+      const close = new RendererCloseRequest(
+        (id) => window.webContents.send("ohmygame:prepare-close", id),
+        (id, error) => { if (!window.isDestroyed()) window.webContents.send("ohmygame:cancel-close", id, error); },
+      );
+      rendererClose = close;
+      let allowClose = false;
+      window.on("close", (event) => {
+        if (quitting || allowClose) return;
+        event.preventDefault();
+        if (backgroundRunning?.enabled && !quitPending) {
+          // Hiding keeps the renderer and its workspace alive; do not enter its closing state.
+          window.hide();
+          agentNotifications.focusChanged();
+          return;
+        }
+        void close.request().then(() => {
+          if (quitPending || quitting || allowClose || window.isDestroyed()) return;
+          allowClose = true;
+          window.close();
+        }).catch(() => {});
+      });
+      window.once("closed", () => {
+        if (mainWindow === window) {
+          mainWindow = undefined;
+          rendererClose = undefined;
+          agentNotifications.setView(null);
+          setKeepAwake(false);
+        }
+        webGamePlayers.close();
+        browserViews.dispose();
+        for (const playtest of playtestWindows.values()) {
+          void Promise.resolve(playtest).then((window) => window.close(), () => {});
+        }
+        playtestWindows.clear();
+        for (const batch of nodeThumbnailBatches.values()) batch.controller.abort();
+        for (const thumbnail of nodeThumbnails.values()) thumbnail.finish(CANCELLED_THUMBNAIL);
+      });
+    },
+  });
+}
+
+async function packagedEnvironment(): Promise<NodeJS.ProcessEnv> {
+  const environment = { ...process.env };
+  // esbuild spawns a native binary, which cannot run from inside app.asar.
+  environment.ESBUILD_BINARY_PATH ??= packagedEsbuildBinary();
+  const config = JSON.parse(readFileSync(path.join(process.resourcesPath, "desktop-config.json"), "utf8")) as {
+    cloudApiUrl?: unknown;
+    publishApiUrl?: unknown;
+    gameServiceUrl?: unknown;
+  };
+  // Published games reach rooms, cloud saves and leaderboards on this service.
+  if (!environment.OHMYGAME_GAME_SERVICE_URL && !environment.MULTIPLAYER_PUBLISH_SERVER_URL && typeof config.gameServiceUrl === "string" && config.gameServiceUrl)
+    environment.OHMYGAME_GAME_SERVICE_URL = config.gameServiceUrl;
+  if (!environment.CLOUD_API_URL && !environment.PUBLISH_API_URL) {
+    const cloudApiUrl = typeof config.cloudApiUrl === "string" && config.cloudApiUrl
+      ? config.cloudApiUrl
+      : typeof config.publishApiUrl === "string" && config.publishApiUrl ? config.publishApiUrl : undefined;
+    if (cloudApiUrl) {
+      environment.CLOUD_API_URL = cloudApiUrl;
+    }
+  }
+  return environment;
+}
+
+function captureBounds(value: unknown, content: Electron.Rectangle): Electron.Rectangle {
+  if (!value || typeof value !== "object") throw new Error("Invalid capture bounds");
+  const candidate = value as Partial<Electron.Rectangle>;
+  const numbers = [candidate.x, candidate.y, candidate.width, candidate.height];
+  if (!numbers.every((number) => typeof number === "number" && Number.isFinite(number))) {
+    throw new Error("Invalid capture bounds");
+  }
+  const bounds = {
+    x: Math.max(0, Math.round(candidate.x!)),
+    y: Math.max(0, Math.round(candidate.y!)),
+    width: Math.round(candidate.width!),
+    height: Math.round(candidate.height!),
+  };
+  if (bounds.width < 1 || bounds.height < 1 || bounds.width > 4096 || bounds.height > 4096 ||
+      bounds.x + bounds.width > content.width || bounds.y + bounds.height > content.height) {
+    throw new Error("Invalid capture bounds");
+  }
+  return bounds;
+}
+
+async function scheduleNodeThumbnail(projectId: string, nodeId: string, viewport: { width: number; height: number }, batchId: string): Promise<NodeThumbnailResult> {
+  let batch = nodeThumbnailBatches.get(batchId);
+  if (!batch) {
+    batch = { projectId, controller: new AbortController(), requests: 0 };
+    nodeThumbnailBatches.set(batchId, batch);
+  } else if (batch.projectId !== projectId) throw new Error("Invalid thumbnail batch");
+  batch.requests += 1;
+  const signal = batch.controller.signal;
+  return nodeThumbnailCaptures.run(
+    () => captureNodeThumbnail(projectId, nodeId, viewport, signal, batch.snapshot), signal,
+  ).catch((cause: unknown): NodeThumbnailResult => signal.aborted
+    ? CANCELLED_THUMBNAIL
+    : { captured: false, error: cause instanceof Error ? cause.message : String(cause) }).then((result) => {
+    // A cancelled capture says nothing about the Node; a failed one is kept for bug reports.
+    if (!result.captured && !signal.aborted) console.warn(`Node thumbnail "${nodeId}" was not captured: ${result.error}`);
+    return result;
+  }).finally(() => {
+    batch.requests -= 1;
+    if (!batch.requests) nodeThumbnailBatches.delete(batchId);
+  });
+}
+
+/**
+ * Runs one Node in a hidden window. The page stores its own screenshot, with
+ * the hash of what it ran, and then reports whether that worked, or why not.
+ */
+async function captureNodeThumbnail(projectId: string, nodeId: string, viewport: { width: number; height: number }, signal: AbortSignal, snapshot?: PlayableThumbnailSnapshot): Promise<NodeThumbnailResult> {
+  if (!daemon || !mainWindow || signal.aborted) return CANCELLED_THUMBNAIL;
+  let finish!: (result: NodeThumbnailResult) => void;
+  const finished = new Promise<NodeThumbnailResult>((resolve) => { finish = resolve; });
+  const cancel = () => finish(CANCELLED_THUMBNAIL);
+  signal.addEventListener("abort", cancel, { once: true });
+  const timer = setTimeout(() => finish({ captured: false, error: `The Scene did not finish within ${NODE_THUMBNAIL_TIMEOUT_MS / 1000} seconds.` }), NODE_THUMBNAIL_TIMEOUT_MS);
+  let thumbnailWindow: BrowserWindow | undefined;
+  try {
+    const opening = createDesktopWindow({
+      runtime: daemon.runtime,
+      preloadPath: path.join(moduleDirectory, "preload.cjs"),
+      rendererUrl: useBuiltRenderer ? undefined : developmentRendererUrl,
+      rendererFile: useBuiltRenderer ? path.join(moduleDirectory, "../renderer/index.html") : undefined,
+      rendererHash: `#/thumbnail/${encodeURIComponent(projectId)}/${encodeURIComponent(nodeId)}`,
+      contentSize: fitPlaytestContentSize(viewport),
+      minWidth: 1,
+      minHeight: 1,
+      hidden: true,
+      beforeLoad: (window) => {
+        thumbnailWindow = window;
+        const id = window.webContents.id;
+        nodeThumbnails.set(id, { window, finish, snapshot });
+        window.once("closed", () => { nodeThumbnails.delete(id); finish({ captured: false, error: "The capture window closed." }); });
+      },
+    });
+    return await Promise.race([opening.then(() => finished), finished]);
+  } catch (cause) {
+    return { captured: false, error: cause instanceof Error ? cause.message : String(cause) };
+  } finally {
+    signal.removeEventListener("abort", cancel);
+    clearTimeout(timer);
+    if (thumbnailWindow && !thumbnailWindow.isDestroyed()) thumbnailWindow.destroy();
+  }
+}
+
+/** Each Scene's content hash, by Node ID, as the editor's build reports them. */
+function isSceneHashes(value: unknown): value is Record<string, string> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    && Object.values(value).every((hash) => typeof hash === "string" && /^[0-9a-f]{8,64}$/.test(hash));
+}
+
+/** `publisher/name`, encoded into the route. */
+function validPluginId(value: unknown): value is string {
+  return typeof value === "string" && /^[^/]{1,200}\/[^/]{1,200}$/.test(value);
+}
+
+function validRouteId(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= 200 && !value.includes("/");
+}
+
+function packagedEsbuildBinary(): string {
+  // Resolve the platform package from esbuild's own directory, as esbuild does, because packaging
+  // may nest it when another dependency brings a different esbuild version.
+  const esbuildPackage = createRequire(import.meta.url).resolve("esbuild/package.json");
+  const platformPackage = createRequire(esbuildPackage).resolve(`@esbuild/${process.platform}-${process.arch}/package.json`);
+  const packageDirectory = path.dirname(platformPackage)
+    .replace(`${path.sep}app.asar${path.sep}`, `${path.sep}app.asar.unpacked${path.sep}`);
+  return path.join(packageDirectory, process.platform === "win32" ? "esbuild.exe" : path.join("bin", "esbuild"));
+}

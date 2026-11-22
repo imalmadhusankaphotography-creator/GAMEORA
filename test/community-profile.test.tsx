@@ -1,0 +1,781 @@
+// @vitest-environment happy-dom
+import { act } from "react";
+import { createRoot } from "react-dom/client";
+import path from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { ProjectState } from "../src/shared/contracts.js";
+import type { CommunityProfile } from "../src/shared/publish-v1.js";
+
+const mocks = vi.hoisted(() => ({
+  auth: {
+    state: { status: "signed-in", user: { id: "creator", name: "creator" } },
+    requestAccessToken: vi.fn(async () => "token"),
+    currentAccessToken: vi.fn(async () => undefined),
+  },
+  own: vi.fn(),
+  projects: vi.fn<() => Promise<ProjectState[]>>(),
+  public: vi.fn(),
+  unpublish: vi.fn(),
+  update: vi.fn(),
+  cover: vi.fn(),
+  like: vi.fn(),
+  publish: vi.fn(),
+  games: vi.fn(),
+  detail: vi.fn(),
+}));
+vi.doMock(path.resolve("src/renderer/auth.tsx"), () => ({
+  useAuth: () => mocks.auth,
+  useOptionalAuth: () => mocks.auth,
+  localDebug: false,
+}));
+vi.doMock(path.resolve("src/renderer/runtime-connection.ts"), () => ({
+  useReadyRuntimeGeneration: () => 1,
+}));
+vi.doMock(path.resolve("src/renderer/page-frame.tsx"), () => ({
+  PageFrame: ({ children }: { children: React.ReactNode }) => <>{children}</>,
+}));
+vi.doMock(path.resolve("src/renderer/api.ts"), () => ({
+  waitForRuntime: async () => undefined,
+  getMyCommunityGames: mocks.own,
+  getCommunityProfile: mocks.public,
+  listProjects: mocks.projects,
+  getExploreGameCover: mocks.cover,
+  unpublishCommunityGame: mocks.unpublish,
+  updateCommunityGame: mocks.update,
+  publishProject: mocks.publish,
+  getProjectCover: async () => undefined,
+  getProjectCoverState: async () => ({ mode: "auto" }),
+  ApiError: class extends Error {},
+  setCommunityLike: mocks.like,
+  listExploreGames: mocks.games,
+  getExploreGame: mocks.detail,
+  getCommunityComments: async () => ({ comments: [] }),
+  addCommunityComment: async () => { throw new Error("not used"); },
+  deleteCommunityComment: async () => undefined,
+}));
+const { DesktopWindowFrame } = await import("../src/renderer/desktop-window-frame.js");
+const { CommunityProfilePage } =
+  await import("../src/renderer/community-profile.js");
+const { GamesPage, GamePlayer, COMMUNITY_REFRESH_AFTER_MS } = await import("../src/renderer/games.js");
+const { resetCommunityCache } = await import("../src/renderer/community-cache.js");
+
+const profile: CommunityProfile = {
+  author: { id: "creator", displayName: "Creator" },
+  totalLikes: 2,
+  games: ["listed", "unlisted"].map((status) => ({
+    id: status,
+    title: status === "listed" ? "Public game" : "Hidden game",
+    description: "Description",
+    author: { id: "creator", displayName: "Creator" },
+    listingStatus: status as "listed" | "unlisted",
+    deploymentId: `deployment-${status}`,
+    coverUrl: `https://play.example/${status}/cover.webp`,
+    playUrl: `https://play.example/${status}`,
+    publishedAt: "2026-10-01T00:00:00Z",
+    updatedAt: "2026-10-01T00:00:00Z",
+    stats: { viewCount: 3, likeCount: 1 },
+  })),
+};
+let root: ReturnType<typeof createRoot>;
+let container: HTMLDivElement;
+beforeEach(() => {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  vi.stubGlobal("IntersectionObserver", undefined);
+  vi.clearAllMocks();
+  resetCommunityCache();
+  mocks.auth.state = { status: "signed-in", user: { id: "creator", name: "creator" } };
+  mocks.own.mockResolvedValue(structuredClone(profile));
+  mocks.public.mockResolvedValue({
+    ...profile,
+    totalLikes: 1,
+    games: [profile.games[0]],
+  });
+  mocks.projects.mockResolvedValue([]);
+  window.location.hash = "#/community/games/listed";
+  mocks.cover.mockResolvedValue(undefined);
+  mocks.unpublish.mockResolvedValue(undefined);
+  mocks.update.mockImplementation(async (_id, _token, metadata) => metadata);
+  mocks.like.mockResolvedValue({ viewCount: 3, likeCount: 2, liked: true });
+  // Games opened from the list start playing its playUrl at once.
+  mocks.games.mockResolvedValue(
+    profile.games.map((game) => ({ ...game, playUrl: "about:blank" })),
+  );
+  mocks.detail.mockResolvedValue({
+    ...profile.games[0],
+    playUrl: "about:blank",
+  });
+  container = document.createElement("div");
+  document.body.appendChild(container);
+  root = createRoot(container);
+});
+afterEach(async () => {
+  await act(async () => root.unmount());
+  container.remove();
+  vi.restoreAllMocks();
+  vi.unstubAllGlobals();
+});
+async function render(onOpenGame = vi.fn()) {
+  await act(async () =>
+    root.render(
+      <CommunityProfilePage
+        authorId="creator"
+        onNavigate={() => undefined}
+        onBack={() => undefined}
+        onOpenGame={onOpenGame}
+      />,
+    ),
+  );
+}
+async function click(label: string) {
+  const button = container.querySelector<HTMLButtonElement>(
+    `button[aria-label="${label}"]`,
+  );
+  expect(button).not.toBeNull();
+  await act(async () => button!.click());
+}
+async function sortByLikes() {
+  const button = [
+    ...container.querySelectorAll<HTMLButtonElement>(
+      ".community-filters .ui-filter-chip",
+    ),
+  ].find((element) => element.textContent === "Most liked")!;
+  expect(button).toBeDefined();
+  await act(async () => button.click());
+  expect(button.getAttribute("aria-pressed")).toBe("true");
+}
+function displayedGames() {
+  return [...container.querySelectorAll(".community-card-title")].map(
+    (element) => element.textContent,
+  );
+}
+
+async function renderPlayer(gameId = "listed") {
+  await act(async () =>
+    root.render(
+      <DesktopWindowFrame>
+        <GamePlayer
+          gameId={gameId}
+          onBack={() => undefined}
+          onNavigate={() => undefined}
+          onOhMyGame={() => undefined}
+        />
+      </DesktopWindowFrame>,
+    ),
+  );
+}
+async function chooseAction(label: string) {
+  await click("More game actions");
+  // The menu is a popover on document.body.
+  const item = [
+    ...document.querySelectorAll<HTMLButtonElement>('[role="menuitem"]'),
+  ].find((element) => element.textContent?.includes(label));
+  expect(item).toBeDefined();
+  await act(async () => item!.click());
+}
+async function chooseUnpublish() {
+  await chooseAction("Unpublish");
+}
+async function submitEditor() {
+  await act(async () =>
+    container
+      .querySelector("form")!
+      .dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })),
+  );
+}
+const localProject: ProjectState = {
+  id: "local-project",
+  name: "Local project",
+  type: "web-game",
+  workspacePath: "/tmp/local-project",
+  updatedAt: profile.games[0].publishedAt,
+  preview: { status: "waiting" },
+  publication: {
+    gameId: "listed",
+    deploymentId: "deployment-listed",
+    playUrl: profile.games[0].playUrl,
+    publishedAt: profile.games[0].publishedAt,
+  },
+};
+
+describe("game detail management", () => {
+  it("opens owner profile cards as games, without management UI or local project reads", async () => {
+    const open = vi.fn();
+    await render(open);
+    expect(displayedGames()).toEqual(["Hidden game", "Public game"]);
+    expect(container.querySelector(".community-card-actions")).toBeNull();
+    expect(container.textContent).not.toContain(
+      "Unpublishing stops deployment",
+    );
+    expect(mocks.projects).not.toHaveBeenCalled();
+    await click("Play Public game");
+    expect(open).toHaveBeenCalledWith("listed");
+  });
+
+  it("shows owner controls before related games, view metrics or iframe finish loading", async () => {
+    mocks.games.mockReturnValue(new Promise(() => {}));
+    mocks.detail
+      .mockResolvedValueOnce({ ...profile.games[0], playUrl: "about:blank" })
+      .mockReturnValueOnce(new Promise(() => {}));
+    await renderPlayer();
+    expect(
+      container.querySelector('[aria-label="More game actions"]'),
+    ).not.toBeNull();
+    expect(container.querySelector("iframe")).not.toBeNull();
+    expect(mocks.projects).not.toHaveBeenCalled();
+    expect(mocks.own).not.toHaveBeenCalled();
+    expect(mocks.public).not.toHaveBeenCalled();
+    expect(mocks.detail).toHaveBeenCalledTimes(2);
+    expect(mocks.games).toHaveBeenCalledWith("token", {
+      limit: 10,
+      excludeGameId: "listed",
+    });
+    await chooseAction("Edit game");
+    expect(mocks.projects).toHaveBeenCalledTimes(1);
+  });
+
+  it("hides management from other users and signed-out visitors", async () => {
+    mocks.auth.state = { status: "signed-in", user: { id: "viewer", name: "viewer" } };
+    await renderPlayer();
+    expect(container.querySelector("iframe")).not.toBeNull();
+    expect(
+      container.querySelector('[aria-label="More game actions"]'),
+    ).toBeNull();
+    mocks.auth.state = { status: "signed-out", user: { id: "viewer", name: "viewer" } };
+    await renderPlayer();
+    expect(
+      container.querySelector('[aria-label="More game actions"]'),
+    ).toBeNull();
+    expect(mocks.projects).not.toHaveBeenCalled();
+  });
+
+  it("edits metadata without a local project or restarting the iframe", async () => {
+    mocks.projects.mockRejectedValueOnce(
+      new Error("Local project read failed"),
+    );
+    await renderPlayer();
+    const frame = container.querySelector("iframe");
+    await chooseAction("Edit game");
+    expect(document.activeElement).toBe(container.querySelector("input"));
+    expect(container.textContent).not.toContain("Open project");
+    expect(container.textContent).not.toContain("Publish update");
+    mocks.update.mockResolvedValueOnce({
+      title: "Saved game",
+      description: "Saved description",
+    });
+    await submitEditor();
+    expect(mocks.update).toHaveBeenCalledWith("listed", "token", {
+      title: "Public game",
+      description: "Description",
+    });
+    expect(container.querySelector("h1")?.textContent).toBe("Saved game");
+    expect(
+      container.querySelector(".community-game-description")?.textContent,
+    ).toContain("Saved description");
+    expect(container.querySelector("iframe")).toBe(frame);
+    expect(mocks.detail).toHaveBeenCalledTimes(2);
+    expect(container.querySelector('[role="dialog"]')).toBeNull();
+  });
+
+  it("adds local shortcuts when delayed matching completes and reloads only a newly published deployment", async () => {
+    let resolve!: (projects: ProjectState[]) => void;
+    mocks.projects.mockReturnValueOnce(
+      new Promise<ProjectState[]>((done) => {
+        resolve = done;
+      }),
+    );
+    await renderPlayer();
+    const frame = container.querySelector("iframe");
+    await chooseAction("Edit game");
+    expect(container.textContent).not.toContain("Open project");
+    await act(async () => resolve([localProject]));
+    expect(
+      container.querySelector('a[href="#/projects/local-project"]'),
+    ).not.toBeNull();
+    const publish = [...container.querySelectorAll("button")].find((button) =>
+      button.textContent?.includes("Publish update"),
+    )!;
+    await act(async () => {
+      const title = container.querySelector("input")!;
+      const description = container.querySelector("textarea")!;
+      Object.getOwnPropertyDescriptor(
+        HTMLInputElement.prototype,
+        "value",
+      )!.set!.call(title, "  Unsaved new title  ");
+      title.dispatchEvent(new Event("input", { bubbles: true }));
+      Object.getOwnPropertyDescriptor(
+        HTMLTextAreaElement.prototype,
+        "value",
+      )!.set!.call(description, "  Unsaved new description  ");
+      description.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await act(async () => publish.click());
+    expect(
+      container.querySelector<HTMLInputElement>("input:not([type])")?.value,
+    ).toBe("Unsaved new title");
+    expect(container.querySelector("textarea")?.value).toBe(
+      "Unsaved new description",
+    );
+    mocks.publish.mockResolvedValueOnce({
+      game: {
+        id: "listed",
+        title: "Updated game",
+        description: "Updated description",
+        playUrl: "about:blank",
+      },
+      deployment: {
+        id: "new-deployment",
+        publishedAt: "2026-10-14T00:00:00Z",
+        coverUrl: "https://play.example/new-cover.webp",
+      },
+    });
+    await submitEditor();
+    expect(mocks.publish).toHaveBeenCalledWith("local-project", "token", {
+      title: "Unsaved new title",
+      description: "Unsaved new description",
+    });
+    expect(container.querySelector("iframe")).not.toBe(frame);
+    expect(container.querySelector("h1")?.textContent).toBe("Updated game");
+    expect(mocks.cover).toHaveBeenCalledWith(
+      "listed",
+      "new-deployment",
+      "token",
+    );
+    expect(container.textContent).toContain("Game published");
+  });
+
+  it("supports editing and unpublishing a legacy hidden cloud work", async () => {
+    mocks.detail.mockResolvedValueOnce({
+      ...profile.games[1],
+      playUrl: "about:blank",
+    });
+    await renderPlayer("unlisted");
+    expect(
+      container.querySelector('button[aria-label="Like Hidden game"]'),
+    ).toBeNull();
+    await chooseAction("Edit game");
+    await submitEditor();
+    expect(mocks.update).toHaveBeenCalledWith("unlisted", "token", {
+      title: "Hidden game",
+      description: "Description",
+    });
+    await chooseUnpublish();
+    await click("Confirm unpublish");
+    expect(mocks.unpublish).toHaveBeenCalledWith("unlisted", "token");
+    expect(window.location.hash).toBe("#/community/creators/creator");
+    expect(container.querySelector("iframe")).toBeNull();
+  });
+
+  it("keeps the Windows controls available inside the native confirmation and after Cancel", async () => {
+    const minimize = vi.fn(async () => {});
+    const desktop = { platform: "win32", windowControls: {
+      minimize, state: async () => ({ maximized: false }), onState: () => () => {},
+    } };
+    vi.stubGlobal("ohMyGameDesktop", desktop);
+    await renderPlayer();
+    await chooseUnpublish();
+    const selector = '.desktop-window-controls button[aria-label="Minimize"]';
+    const button = container.querySelector<HTMLButtonElement>(`dialog[open] ${selector}`);
+    expect(button).toBeTruthy();
+    await act(async () => button!.click());
+    expect(minimize).toHaveBeenCalledOnce();
+    expect(mocks.unpublish).not.toHaveBeenCalled();
+    await click("Cancel unpublish");
+    expect(container.querySelectorAll(selector)).toHaveLength(1);
+    expect(container.querySelector("dialog[open]")).toBeNull();
+  });
+
+  it("retains the game when unpublishing is cancelled or fails, and restores focus", async () => {
+    await renderPlayer();
+    await chooseUnpublish();
+    expect(
+      container.querySelector('[role="alertdialog"]')?.textContent,
+    ).toContain("local project files are kept");
+    expect(document.activeElement?.textContent).toBe("Cancel");
+    await click("Cancel unpublish");
+    expect(mocks.unpublish).not.toHaveBeenCalled();
+    expect(document.activeElement?.getAttribute("aria-label")).toBe(
+      "More game actions",
+    );
+    mocks.unpublish.mockRejectedValueOnce(new Error("Service unavailable"));
+    await chooseUnpublish();
+    await click("Confirm unpublish");
+    expect(container.querySelector("iframe")).not.toBeNull();
+    expect(
+      container.querySelector('[role="alertdialog"]')?.textContent,
+    ).toContain("Service unavailable");
+  });
+
+  it("cannot restore the player when a metrics read finishes after unpublish", async () => {
+    let resolve!: (game: CommunityProfile["games"][number]) => void;
+    mocks.detail
+      .mockResolvedValueOnce({ ...profile.games[0], playUrl: "about:blank" })
+      .mockReturnValueOnce(
+        new Promise((done) => {
+          resolve = done;
+        }),
+      );
+    await renderPlayer();
+    await chooseUnpublish();
+    await click("Confirm unpublish");
+    await act(async () => resolve({ ...profile.games[0], stats: { viewCount: 4, likeCount: 2 } }));
+    expect(container.querySelector("iframe")).toBeNull();
+    expect(window.location.hash).toBe("#/community/creators/creator");
+  });
+
+  it("discards a late management completion after changing games", async () => {
+    let resolve!: (value: { title: string; description: string }) => void;
+    mocks.update.mockReturnValueOnce(
+      new Promise((done) => {
+        resolve = done;
+      }),
+    );
+    await renderPlayer();
+    await chooseAction("Edit game");
+    await submitEditor();
+    mocks.detail.mockResolvedValueOnce({
+      ...profile.games[1],
+      playUrl: "about:blank",
+    });
+    await renderPlayer("unlisted");
+    await act(async () =>
+      resolve({ title: "Old saved title", description: "Old description" }),
+    );
+    expect(container.querySelector("h1")?.textContent).toBe("Hidden game");
+    expect(container.querySelector('[role="dialog"]')).toBeNull();
+  });
+
+  it("discards a late unpublish error after sign-out", async () => {
+    let reject!: (error: Error) => void;
+    mocks.unpublish.mockReturnValueOnce(
+      new Promise((_resolve, fail) => {
+        reject = fail;
+      }),
+    );
+    await renderPlayer();
+    await chooseUnpublish();
+    await click("Confirm unpublish");
+    mocks.auth.state = { status: "signed-out", user: { id: "creator", name: "creator" } };
+    await renderPlayer();
+    await act(async () => reject(new Error("Old account error")));
+    expect(container.textContent).not.toContain("Old account error");
+    expect(
+      container.querySelector('[aria-label="More game actions"]'),
+    ).toBeNull();
+    expect(container.querySelector('[role="alertdialog"]')).toBeNull();
+  });
+});
+
+describe("creator profile", () => {
+  it("discards an authenticated private load after sign-out", async () => {
+    let resolve!: (value: CommunityProfile) => void;
+    mocks.own.mockReturnValue(
+      new Promise<CommunityProfile>((done) => {
+        resolve = done;
+      }),
+    );
+    await render();
+    mocks.auth.state = { status: "signed-out", user: { id: "creator", name: "creator" } };
+    await render();
+    await act(async () => resolve(profile));
+    expect(mocks.public).toHaveBeenCalledWith("creator", undefined);
+    expect(container.textContent).toContain("Public game");
+    expect(container.textContent).not.toContain("Hidden game");
+    expect(
+      container.querySelector('[aria-label="Edit Public game"]'),
+    ).toBeNull();
+  });
+
+  it("updates the public profile total and sort order from a card like", async () => {
+    mocks.auth.state = { status: "signed-in", user: { id: "viewer", name: "viewer" } };
+    mocks.public.mockResolvedValue({
+      ...profile,
+      games: [
+        profile.games[0],
+        {
+          ...profile.games[0],
+          id: "other",
+          title: "Other game",
+          publishedAt: "2026-10-02T00:00:00Z",
+        },
+      ],
+    });
+    await render();
+    await sortByLikes();
+    expect(displayedGames()).toEqual(["Other game", "Public game"]);
+    await click("Like Public game");
+    expect(mocks.like).toHaveBeenCalledWith("listed", "token", true);
+    expect(
+      container.querySelector(".community-profile-summary")?.textContent,
+    ).toContain("3 likes");
+    expect(displayedGames()).toEqual(["Public game", "Other game"]);
+    expect(
+      container
+        .querySelector('[aria-label="Unlike Public game"]')
+        ?.getAttribute("aria-pressed"),
+    ).toBe("true");
+  });
+
+  it("keeps a completed like when an older profile refresh returns", async () => {
+    mocks.auth.state = { status: "signed-in", user: { id: "viewer", name: "viewer" } };
+    await render();
+    let resolve!: (value: CommunityProfile) => void;
+    mocks.public.mockReturnValueOnce(
+      new Promise<CommunityProfile>((done) => {
+        resolve = done;
+      }),
+    );
+    await click("Refresh");
+    await click("Like Public game");
+    await act(async () =>
+      resolve({ ...profile, totalLikes: 1, games: [profile.games[0]] }),
+    );
+    expect(
+      container.querySelector(".community-profile-summary")?.textContent,
+    ).toContain("2 likes");
+    expect(
+      container.querySelector('[aria-label="Unlike Public game"]'),
+    ).not.toBeNull();
+  });
+
+  it("likes public profile cards anonymously without opening sign-in", async () => {
+    mocks.auth.state = { status: "signed-out", user: { id: "viewer", name: "viewer" } };
+    await render();
+    await click("Like Public game");
+    expect(mocks.like).toHaveBeenCalledWith("listed", undefined, true);
+    expect(mocks.auth.requestAccessToken).not.toHaveBeenCalled();
+    expect(
+      container.querySelector(".community-profile-summary")?.textContent,
+    ).toContain("2 likes");
+    expect(
+      container.querySelector('[aria-label="Unlike Public game"]'),
+    ).not.toBeNull();
+  });
+});
+
+describe("Community card interactions", () => {
+  async function renderGames() {
+    await act(async () =>
+      root.render(
+        <GamesPage onNavigate={() => undefined} onOhMyGame={() => undefined} />,
+      ),
+    );
+  }
+
+  // The window comes back after `elapsed` ms.
+  async function returnAfter(elapsed: number) {
+    const now = Date.now();
+    vi.spyOn(Date, "now").mockReturnValue(now + elapsed);
+    await act(async () => window.dispatchEvent(new Event("focus")));
+  }
+
+  it("leads the header with search and My games, and has no refresh button", async () => {
+    await renderGames();
+    const head = container.querySelector(".community-page-head")!;
+    expect([...head.querySelectorAll("button")].map((button) => button.textContent)).toEqual(["My games"]);
+    expect(head.querySelector('[aria-label="Refresh"]')).toBeNull();
+  });
+
+  it("reloads the list when the window comes back after a minute, not sooner", async () => {
+    await renderGames();
+    expect(mocks.games).toHaveBeenCalledTimes(1);
+    await returnAfter(COMMUNITY_REFRESH_AFTER_MS - 1000);
+    expect(mocks.games).toHaveBeenCalledTimes(1);
+    mocks.games.mockResolvedValueOnce([profile.games[1]]);
+    await returnAfter(COMMUNITY_REFRESH_AFTER_MS);
+    expect(mocks.games).toHaveBeenCalledTimes(2);
+    expect(displayedGames()).toEqual(["Hidden game"]);
+  });
+
+  it("keeps the grid when a background reload fails", async () => {
+    await renderGames();
+    mocks.games.mockRejectedValueOnce(new Error("offline"));
+    await returnAfter(COMMUNITY_REFRESH_AFTER_MS);
+    expect(mocks.games).toHaveBeenCalledTimes(2);
+    expect(displayedGames()).toHaveLength(2);
+    expect(container.querySelector('[role="alert"]')).toBeNull();
+  });
+
+  it("reorders the list when a card's like count changes", async () => {
+    await renderGames();
+    await sortByLikes();
+    expect(displayedGames()).toEqual(["Hidden game", "Public game"]);
+    await click("Like Public game");
+    expect(displayedGames()).toEqual(["Public game", "Hidden game"]);
+  });
+
+  it("preserves an anonymous like against a delayed list refresh", async () => {
+    mocks.auth.state = { status: "signed-out", user: { id: "viewer", name: "viewer" } };
+    await renderGames();
+    let resolveLoad!: (value: CommunityProfile["games"]) => void;
+    let resolveLike!: (value: {
+      viewCount: number;
+      likeCount: number;
+      liked: boolean;
+    }) => void;
+    mocks.games.mockReturnValueOnce(
+      new Promise<CommunityProfile["games"]>((done) => {
+        resolveLoad = done;
+      }),
+    );
+    mocks.like.mockReturnValueOnce(
+      new Promise((done) => {
+        resolveLike = done;
+      }),
+    );
+    await returnAfter(COMMUNITY_REFRESH_AFTER_MS);
+    await click("Like Public game");
+    expect(mocks.like).toHaveBeenCalledWith("listed", undefined, true);
+    await act(async () =>
+      resolveLike({ viewCount: 3, likeCount: 2, liked: true }),
+    );
+    await act(async () => resolveLoad(profile.games));
+    expect(
+      container
+        .querySelector('[aria-label="Unlike Public game"]')
+        ?.getAttribute("aria-pressed"),
+    ).toBe("true");
+  });
+
+  it("keeps a newer view count when a delayed like response arrives", async () => {
+    let resolveLike!: (value: { viewCount: number; likeCount: number; liked: boolean }) => void;
+    mocks.like.mockReturnValueOnce(new Promise(done => { resolveLike = done; }));
+    await renderPlayer();
+    await click("Like Public game");
+    mocks.detail.mockResolvedValueOnce({ ...profile.games[0], stats: { viewCount: 5, likeCount: 1 } });
+    await act(async () => container.querySelector("iframe")!.dispatchEvent(new Event("load")));
+    await act(async () => resolveLike({ viewCount: 3, likeCount: 2, liked: true }));
+    expect(container.querySelector('.community-game-actions [aria-label="5 views"]')).not.toBeNull();
+    expect(container.querySelector('[aria-label="Unlike Public game"]')?.textContent).toBe("2");
+  });
+
+  it("keeps newer likes when a delayed view count response arrives", async () => {
+    let resolve!: (value: CommunityProfile["games"][number]) => void;
+    mocks.detail
+      .mockResolvedValueOnce({ ...profile.games[0], playUrl: "about:blank" })
+      .mockReturnValueOnce(
+        new Promise((done) => {
+          resolve = done;
+        }),
+      );
+    await act(async () =>
+      root.render(
+        <GamePlayer
+          gameId="listed"
+          onBack={() => undefined}
+          onNavigate={() => undefined}
+          onOhMyGame={() => undefined}
+        />,
+      ),
+    );
+    await click("Like Public game");
+    await act(async () =>
+      resolve({ ...profile.games[0], stats: { viewCount: 4, likeCount: 1, liked: false } }),
+    );
+    const toolbar = container.querySelector(".community-game-actions")!;
+    expect(
+      toolbar.querySelector('[aria-label="4 views"]'),
+    ).not.toBeNull();
+    expect(
+      toolbar.querySelector('[aria-label="Unlike Public game"]')?.textContent,
+    ).toBe("2");
+  });
+});
+
+describe("Community loading", () => {
+  async function renderGames() {
+    await act(async () =>
+      root.render(
+        <GamesPage onNavigate={() => undefined} onOhMyGame={() => undefined} />,
+      ),
+    );
+  }
+  const pending = () => new Promise<never>(() => {});
+
+  it("shows card shapes while the first list loads", async () => {
+    mocks.games.mockReturnValueOnce(pending());
+    await renderGames();
+    const skeleton = container.querySelector('[aria-busy="true"][aria-label="Loading games"]');
+    expect(skeleton?.querySelectorAll(".community-card-skeleton").length).toBeGreaterThan(0);
+    expect(container.querySelector(".community-state")).toBeNull();
+  });
+
+  it("shows the list seen before at once, with its filters, and refreshes it behind", async () => {
+    mocks.auth.state = { status: "signed-in", user: { id: "viewer", name: "viewer" } };
+    await renderGames();
+    await click("Like Public game");
+    await sortByLikes();
+    await act(async () => root.render(<></>));
+    mocks.games.mockReturnValueOnce(pending());
+    await renderGames();
+    expect(container.querySelector(".community-card-skeleton")).toBeNull();
+    expect(displayedGames()).toEqual(["Public game", "Hidden game"]);
+    expect(container.querySelector('[aria-label="Unlike Public game"]')).not.toBeNull();
+    expect(mocks.games).toHaveBeenCalledTimes(2);
+  });
+
+  it("opens a game from the list with its details and player before its own read returns", async () => {
+    await renderGames();
+    mocks.detail.mockReturnValueOnce(pending());
+    mocks.games.mockReturnValueOnce(pending());
+    await renderPlayer();
+    expect(container.querySelector("h1")?.textContent).toBe("Public game");
+    expect(container.querySelector(".community-game-byline")?.textContent).toContain("Creator");
+    expect(container.querySelector("iframe")?.getAttribute("src")).toBe("about:blank");
+    expect(container.querySelector('[aria-label="More game actions"]')).not.toBeNull();
+    expect(displayedGames()).toEqual(["Hidden game"]);
+  });
+
+  it("keeps the loading screen over the player until the game's page loads", async () => {
+    let resolve!: (game: CommunityProfile["games"][number]) => void;
+    mocks.detail.mockReturnValueOnce(new Promise((done) => { resolve = done; }));
+    await renderPlayer();
+    const player = container.querySelector(".community-player")!;
+    expect(container.querySelector("iframe")).toBeNull();
+    expect(player.getAttribute("aria-busy")).toBe("true");
+    expect(player.querySelector(".community-loader")).not.toBeNull();
+    expect(container.querySelector('[aria-label="Loading game"]')).not.toBeNull();
+    await act(async () => resolve({ ...profile.games[0], playUrl: "about:blank" }));
+    expect(container.querySelector("h1")?.textContent).toBe("Public game");
+    await act(async () => container.querySelector("iframe")!.dispatchEvent(new Event("load")));
+    expect(player.getAttribute("aria-busy")).toBe("false");
+  });
+
+  it("keeps a kept profile's total in step with a like made on the game page", async () => {
+    mocks.auth.state = { status: "signed-in", user: { id: "viewer", name: "viewer" } };
+    await render();
+    mocks.detail.mockResolvedValueOnce({ ...profile.games[0], playUrl: "about:blank", stats: { viewCount: 3, likeCount: 5 } });
+    await renderPlayer();
+    mocks.like.mockResolvedValueOnce({ viewCount: 3, likeCount: 6, liked: true });
+    await click("Like Public game");
+    await act(async () => root.render(<></>));
+    mocks.public.mockReturnValueOnce(pending());
+    await render();
+    expect(container.querySelector(".community-profile-summary")?.textContent).toContain("6 likes");
+  });
+
+  it("returns to as many cards as were shown, so the scroll position can come back", async () => {
+    mocks.games.mockResolvedValue(Array.from({ length: 60 }, (_, index) => ({
+      ...profile.games[0], id: `game-${index}`, title: `Game ${index}`, playUrl: "about:blank",
+    })));
+    await renderGames();
+    expect(displayedGames()).toHaveLength(48);
+    const more = [...container.querySelectorAll("button")].find((button) => button.textContent === "Show more")!;
+    await act(async () => more.click());
+    expect(displayedGames()).toHaveLength(60);
+    await act(async () => root.render(<></>));
+    mocks.games.mockReturnValueOnce(pending());
+    await renderGames();
+    expect(displayedGames()).toHaveLength(60);
+  });
+
+  it("keeps an owner's hidden works out of a signed-out window", async () => {
+    await render();
+    expect(displayedGames()).toContain("Hidden game");
+    await act(async () => root.render(<></>));
+    mocks.auth.state = { status: "signed-out", user: { id: "creator", name: "creator" } };
+    mocks.public.mockReturnValueOnce(pending());
+    await render();
+    expect(container.textContent).not.toContain("Hidden game");
+    expect(container.querySelector('[aria-label="Loading profile"]')).not.toBeNull();
+  });
+});

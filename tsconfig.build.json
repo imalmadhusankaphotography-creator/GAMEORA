@@ -1,0 +1,11 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "outDir": "dist",
+    "rootDir": "src",
+    "declaration": true,
+    "sourceMap": true,
+    "customConditions": []
+  },
+  "include": ["src/daemon/**/*.ts", "src/desktop/**/*.ts", "src/desktop/**/*.cts", "src/shared/**/*.ts", "src/story-web/**/*.ts", "src/types/**/*.d.ts"]
+}

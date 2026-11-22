@@ -1,0 +1,198 @@
+import type { ProjectType } from "../shared/contracts.js";
+import { PLUGIN_CONTRIBUTIONS, type PluginContribution } from "../shared/plugins.js";
+import { isProjectType } from "../shared/project-runtime.js";
+
+export type SidebarPage =
+  | "home"
+  | "projects"
+  | "library"
+  | "plugins"
+  | "community";
+
+export type SettingsSection = "general" | "account" | "billing" | "appearance" | "notifications" | "providers" | "agents" | "web-search" | "network" | "connections" | "mcp-server" | "about";
+export type AppNavigationTarget = SidebarPage | "settings";
+export type ProjectSort = "updated" | "name";
+export interface ProjectListFilters {
+  projectType?: ProjectType;
+  query?: string;
+  sort?: ProjectSort;
+}
+type SidebarRoutePage = Exclude<SidebarPage, "community" | "projects" | "plugins">;
+
+export const DEFAULT_SETTINGS_SECTION: SettingsSection = "general";
+
+const SIDEBAR_PAGES = new Set<SidebarRoutePage>([
+  "home", "library",
+]);
+
+export type AppRoute =
+  | { page: SidebarRoutePage }
+  | ({ page: "projects" } & ProjectListFilters)
+  | { page: "community" }
+  | { page: "community-profile"; authorId: string }
+  /** `adds` opens the marketplace filtered to plugins that add that. */
+  | { page: "plugins"; pluginId?: string; adds?: PluginContribution; tab?: PluginsTab }
+  | { page: "settings"; section: SettingsSection; agent?: string }
+  | { page: "plugin-builder"; sessionId: string; conversationId?: string }
+  | { page: "game"; gameId: string }
+  | { page: "playtest"; projectId: string }
+  | { page: "thumbnail"; projectId: string; nodeId: string }
+  | { page: "project"; projectId: string; conversationId?: string; view?: "design" };
+
+export function parseAppRoute(hash: string): AppRoute {
+  if (hash === "#/" || hash === "") return { page: "home" };
+  const builderMatch = /^#\/plugins\/builder\/([0-9a-f-]{36})(?:\/conversations\/([^/]+))?$/.exec(hash);
+  if (builderMatch?.[1]) return { page: "plugin-builder", sessionId: builderMatch[1], ...(builderMatch[2] ? { conversationId: decodeURIComponent(builderMatch[2]) } : {}) };
+  const browseMatch = /^#\/plugins\?adds=([a-zA-Z]+)$/.exec(hash);
+  if (browseMatch?.[1] && (PLUGIN_CONTRIBUTIONS as readonly string[]).includes(browseMatch[1])) {
+    return { page: "plugins", adds: browseMatch[1] as PluginContribution };
+  }
+  const tabMatch = /^#\/plugins\?tab=(installed|discover|mine)$/.exec(hash);
+  if (tabMatch?.[1]) return { page: "plugins", tab: tabMatch[1] as PluginsTab };
+  const pluginMatch = /^#\/(?:settings\/)?plugins(?:\/([^/]+))?$/.exec(hash);
+  if (pluginMatch) {
+    try {
+      return { page: "plugins", ...(pluginMatch[1] ? { pluginId: decodeURIComponent(pluginMatch[1]) } : {}) };
+    } catch {
+      return { page: "plugins" };
+    }
+  }
+  const settingsMatch = /^#\/settings(?:\/(general|account|billing|appearance|notifications|providers|agents|web-search|network|connections|mcp-server|about))?$/.exec(hash);
+  if (settingsMatch) return { page: "settings", section: (settingsMatch[1] as SettingsSection | undefined) ?? DEFAULT_SETTINGS_SECTION };
+  // Every agent, OhMyGame's own included, has its own settings page.
+  const agentMatch = /^#\/settings\/agents\/([a-z0-9.-]+)$/.exec(hash);
+  if (agentMatch?.[1]) return { page: "settings", section: "agents", agent: agentMatch[1] };
+  const communityMatch = /^#\/community(?:\/games)?$/.exec(hash);
+  if (communityMatch) return { page: "community" };
+  const profileMatch = /^#\/community\/creators\/([^/]+)$/.exec(hash);
+  if (profileMatch?.[1]) {
+    try { return { page: "community-profile", authorId: decodeURIComponent(profileMatch[1]) }; }
+    catch { return { page: "home" }; }
+  }
+  const projectsMatch = /^#\/projects(?:\?([^#]*))?$/.exec(hash);
+  if (projectsMatch) {
+    const params = new URLSearchParams(projectsMatch[1]);
+    const projectType = params.get("type");
+    const query = params.get("q");
+    const sort = params.get("sort");
+    return {
+      page: "projects",
+      ...(isProjectType(projectType) ? { projectType } : {}),
+      ...(query ? { query } : {}),
+      ...(sort === "name" ? { sort } : {}),
+    };
+  }
+  const sidebarMatch = /^#\/([^/]+)$/.exec(hash);
+  if (sidebarMatch?.[1] && SIDEBAR_PAGES.has(sidebarMatch[1] as SidebarRoutePage)) {
+    return { page: sidebarMatch[1] as SidebarRoutePage };
+  }
+  const gameMatch = /^#\/community\/games\/([^/]+)$/.exec(hash);
+  if (gameMatch?.[1]) {
+    try {
+      return { page: "game", gameId: decodeURIComponent(gameMatch[1]) };
+    } catch {
+      return { page: "home" };
+    }
+  }
+  const playtestMatch = /^#\/playtest\/([^/]+)$/.exec(hash);
+  if (playtestMatch?.[1]) {
+    try {
+      return { page: "playtest", projectId: decodeURIComponent(playtestMatch[1]) };
+    } catch {
+      return { page: "home" };
+    }
+  }
+  const thumbnailMatch = /^#\/thumbnail\/([^/]+)\/([^/]+)$/.exec(hash);
+  if (thumbnailMatch?.[1] && thumbnailMatch[2]) {
+    try {
+      return {
+        page: "thumbnail",
+        projectId: decodeURIComponent(thumbnailMatch[1]),
+        nodeId: decodeURIComponent(thumbnailMatch[2]),
+      };
+    } catch {
+      return { page: "home" };
+    }
+  }
+  const designMatch = /^#\/projects\/([^/]+)(?:\/conversations\/([^/]+))?\/design$/.exec(hash);
+  const conversationMatch = /^#\/projects\/([^/]+)\/conversations\/([^/]+)$/.exec(hash);
+  const projectMatch = /^#\/projects\/([^/]+)$/.exec(hash);
+  const match = designMatch ?? conversationMatch ?? projectMatch;
+  if (!match?.[1]) return { page: "home" };
+  try {
+    const encodedConversationId = designMatch?.[2] ?? conversationMatch?.[2];
+    return {
+      page: "project",
+      projectId: decodeURIComponent(match[1]),
+      ...(encodedConversationId ? { conversationId: decodeURIComponent(encodedConversationId) } : {}),
+      ...(designMatch ? { view: "design" as const } : {}),
+    };
+  } catch {
+    return { page: "home" };
+  }
+}
+
+export function sidebarHash(page: SidebarPage): string {
+  if (page === "home") return "#/";
+  return page === "community" ? communityHash() : `#/${page}`;
+}
+
+export function settingsHash(section: SettingsSection, agent?: string): string {
+  return agent && section === "agents" ? `#/settings/agents/${agent}` : `#/settings/${section}`;
+}
+
+export function projectsHash({ projectType, query, sort }: ProjectListFilters = {}): string {
+  const params = new URLSearchParams();
+  if (projectType) params.set("type", projectType);
+  if (query) params.set("q", query);
+  if (sort === "name") params.set("sort", sort);
+  return `#/projects${params.size ? `?${params}` : ""}`;
+}
+
+export function pluginHash(pluginId?: string): string {
+  return `#/plugins${pluginId ? `/${encodeURIComponent(pluginId)}` : ""}`;
+}
+
+/** The Plugins page's tabs: what others made, what there is to get, and what is the person's own. */
+export type PluginsTab = "installed" | "discover" | "mine";
+
+export function pluginsTabHash(tab: PluginsTab): string {
+  return `#/plugins?tab=${tab}`;
+}
+
+/** The marketplace, showing the plugins that add `adds`. */
+export function pluginBrowseHash(adds: PluginContribution): string {
+  return `#/plugins?adds=${adds}`;
+}
+
+export function pluginBuilderHash(sessionId: string, conversationId?: string): string {
+  return `#/plugins/builder/${encodeURIComponent(sessionId)}${conversationId ? `/conversations/${encodeURIComponent(conversationId)}` : ""}`;
+}
+
+export function projectHash(projectId: string, view?: "design"): string {
+  return `#/projects/${encodeURIComponent(projectId)}${view ? "/design" : ""}`;
+}
+
+export function createdProjectView(type: ProjectType | undefined): "design" | undefined {
+  return type === "general" ? "design" : undefined;
+}
+
+export function conversationHash(projectId: string, conversationId: string, view?: "design"): string {
+  return `${projectHash(projectId)}/conversations/${encodeURIComponent(conversationId)}${view ? "/design" : ""}`;
+}
+
+export function gameHash(gameId: string): string {
+  return `#/community/games/${encodeURIComponent(gameId)}`;
+}
+
+export function communityHash(): string {
+  return "#/community/games";
+}
+
+export function playtestHash(projectId: string): string {
+  return `#/playtest/${encodeURIComponent(projectId)}`;
+}
+
+export function communityProfileHash(authorId: string): string {
+  return `#/community/creators/${encodeURIComponent(authorId)}`;
+}

@@ -1,0 +1,224 @@
+/* the plugin workspace: a project's frame around the chat and the plugin */
+.plugin-builder-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  min-height: 0;
+  padding: var(--space-6);
+  overflow-y: auto;
+  border-radius: var(--radius-lg);
+  background: var(--color-surface);
+  box-shadow: var(--shadow-card);
+}
+
+.plugin-builder-working {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin: 0;
+  color: var(--color-text-secondary);
+  font-size: var(--text-sm);
+}
+
+/* the Overview panel: the plugin as its page will read */
+.plugin-builder-panel {
+  height: 100%;
+  padding: var(--space-6);
+  overflow-y: auto;
+}
+
+/* With no draft yet, the start prompt sits in the middle, as an empty panel's
+   does; below an error it follows the error instead of overflowing the panel. */
+.plugin-builder-panel > .ui-empty:only-child {
+  min-height: 100%;
+  justify-content: center;
+}
+
+.plugin-builder-starters {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: var(--space-2);
+}
+
+.plugin-builder-error {
+  margin: 0;
+  padding: var(--space-3);
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--color-danger) 7%, transparent);
+  color: var(--color-danger);
+  font-size: var(--text-sm);
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
+.plugin-builder-status-failed {
+  color: var(--color-danger);
+}
+
+/* an AI workspace in the rail: its plugin's icon fills the tile, as a project's cover does */
+.plugin-builder-rail-item {
+  display: grid;
+  place-items: center;
+  color: var(--color-text-secondary);
+}
+
+.plugin-builder-rail-item .plugin-icon-image {
+  width: 100%;
+  height: 100%;
+}
+
+.plugin-builder-overview {
+  max-width: 720px;
+  margin: 0 auto;
+  padding-top: var(--space-3);
+}
+
+.plugin-builder-icon-button {
+  flex: none;
+  padding: 0;
+  border: 0;
+  border-radius: 9px;
+  background: transparent;
+  cursor: pointer;
+}
+
+.plugin-builder-icon-button:hover .plugin-tile {
+  background: var(--color-selected);
+}
+
+.plugin-builder-link {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--color-text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.plugin-builder-link:hover {
+  text-decoration: underline;
+}
+
+.plugin-builder-config {
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.plugin-builder-check-result {
+  margin-left: var(--space-2);
+  color: var(--color-text-tertiary);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-regular);
+}
+
+.plugin-builder-check-result.is-failed {
+  color: var(--color-danger);
+}
+
+.plugin-builder-checks pre {
+  overflow-x: auto;
+  font-size: var(--text-xs);
+}
+
+.plugin-builder-check {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: 32px;
+  font-size: var(--text-md);
+}
+
+.plugin-builder-check > svg {
+  flex: none;
+  color: var(--color-text-tertiary);
+}
+
+.plugin-builder-check.is-passed > svg {
+  color: var(--color-success);
+}
+
+.plugin-builder-check.has-error > svg {
+  color: var(--color-danger);
+}
+
+.plugin-builder-check strong {
+  overflow: hidden;
+  font-weight: var(--weight-medium);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.plugin-builder-check small {
+  flex: 1;
+  min-width: 0;
+  color: var(--color-text-tertiary);
+  font-size: var(--text-sm);
+}
+
+.plugin-icon-picker { display: grid; gap: var(--space-3); }
+.plugin-icon-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(76px, 1fr)); gap: var(--space-2); max-height: 280px; overflow-y: auto; }
+.plugin-icon-tile { display: grid; justify-items: center; gap: 6px; min-width: 0; padding: 10px 4px 8px; border: 1px solid transparent; border-radius: var(--radius-md); background: var(--color-hover); color: var(--color-text-secondary); font: inherit; cursor: pointer; }
+.plugin-icon-tile:hover:not(:disabled):not(.is-disabled) { background: var(--color-selected); }
+.plugin-icon-tile[aria-pressed="true"] { border-color: var(--color-ink); color: var(--color-text); background: color-mix(in srgb, var(--color-ink) 8%, transparent); }
+.plugin-icon-tile:disabled, .plugin-icon-tile.is-disabled { cursor: default; opacity: 0.6; }
+.plugin-icon-upload { border-style: dashed; border-color: var(--color-border); background: transparent; }
+.plugin-icon-tile-image { display: grid; place-items: center; width: 36px; height: 36px; }
+.plugin-icon-tile-image .plugin-icon-image { width: 32px; height: 32px; object-fit: contain; }
+.plugin-icon-tile-name { max-width: 100%; overflow: hidden; font-size: var(--text-xs); text-overflow: ellipsis; white-space: nowrap; }
+.plugin-icon-help { margin: 0; color: var(--color-text-secondary); font-size: var(--text-xs); line-height: 1.6; }
+.plugin-icon-default { margin-right: auto; }
+
+
+
+/* Trying the draft's code: what goes in, and what comes back */
+.plugin-builder-run {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.plugin-builder-run-input,
+.plugin-builder-run-output {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+}
+
+.plugin-builder-run-output {
+  max-height: 240px;
+  margin: 0;
+  padding: var(--space-2) var(--space-3);
+  overflow: auto;
+  border-radius: var(--radius-md);
+  background: var(--color-surface-raised);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* An update's files: what it adds, changes and removes */
+.plugin-builder-update-files {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-size: var(--text-sm);
+}
+
+.plugin-builder-update-files li {
+  display: flex;
+  gap: var(--space-2);
+  align-items: baseline;
+}
+
+.plugin-builder-update-mark {
+  flex: none;
+  width: 1ch;
+  color: var(--color-text-tertiary);
+  font-family: var(--font-mono);
+}

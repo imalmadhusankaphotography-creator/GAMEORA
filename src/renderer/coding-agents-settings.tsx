@@ -1,0 +1,648 @@
+import { useEffect, useState, type FormEvent, type ReactNode } from "react";
+import {
+  ChevronRight,
+  ExternalLink,
+  LoaderCircle,
+  Plug,
+  RefreshCw,
+  Terminal,
+} from "./icons.js";
+import {
+  agentPermissionModes,
+  fullAccessPermissionMode,
+  isAccountRuntimeId,
+  isBuiltInAgentRuntimeId,
+} from "../shared/agent-runtimes.js";
+import type {
+  AgentPermissionMode,
+  AgentRuntimeDiagnostic,
+  AgentRuntimeId,
+  AgentRuntimeStatus,
+  BuiltInAgentRuntimeId,
+} from "../shared/agent-runtimes.js";
+import type { AgentModel } from "../shared/contracts.js";
+import {
+  listAgentRuntimes,
+  loginAgentRuntime,
+  MODELS_CHANGED_EVENT,
+  notifyAgentModelsChanged,
+  recheckAgentRuntime,
+  updateAgentRuntime,
+} from "./api.js";
+import { PROVIDER_ICONS } from "./provider-icons.js";
+import { CommandText } from "./command-text.js";
+import { ExternalLinkFallback, useExternalLink } from "./external-link.js";
+import { Badge, Button, Dialog, Field, IconButton, Input, RadioGroup, Switch } from "./ui/index.js";
+import { SettingsDetailHead, SettingsGroup, SettingsNote, SettingsRow } from "./settings-parts.js";
+import { AgentUsageDetails, AgentUsageInline } from "./agent-usage.js";
+import { t } from "./i18n.js";
+import { AgentAccountProfiles } from "./agent-account-profiles.js";
+import { pluginHash, pluginsTabHash } from "./routes.js";
+import { usePluginIcon } from "./plugin-mark-icon.js";
+
+type PermissionModeKey =
+  | "claudeDefault"
+  | "claudeAcceptEdits"
+  | "claudeAuto"
+  | "claudeBypass"
+  | "codexWorkspace"
+  | "codexFullAccess"
+  | "openCodeRules"
+  | "openCodeAllow"
+  | "pluginRules"
+  | "pluginAllow";
+
+/** Each agent's own permission modes, by the names their CLIs give them. */
+const PERMISSION_MODE_KEYS: Record<
+  BuiltInAgentRuntimeId,
+  Partial<Record<AgentPermissionMode, PermissionModeKey>>
+> = {
+  "claude-code-cli": {
+    default: "claudeDefault",
+    acceptEdits: "claudeAcceptEdits",
+    auto: "claudeAuto",
+    bypassPermissions: "claudeBypass",
+  },
+  "codex-cli": {
+    ":workspace": "codexWorkspace",
+    ":danger-full-access": "codexFullAccess",
+  },
+  "opencode-cli": { default: "openCodeRules", allow: "openCodeAllow" },
+};
+
+/** Agents from plugins ask as their own rules say, or are allowed everything. */
+const PLUGIN_PERMISSION_MODE_KEYS: Partial<Record<AgentPermissionMode, PermissionModeKey>> = {
+  default: "pluginRules",
+  allow: "pluginAllow",
+};
+
+function permissionOptions(
+  agent: AgentRuntimeStatus,
+): { value: AgentPermissionMode; label: string; description: string }[] {
+  const keys = isBuiltInAgentRuntimeId(agent.id)
+    ? PERMISSION_MODE_KEYS[agent.id]
+    : PLUGIN_PERMISSION_MODE_KEYS;
+  return agentPermissionModes(agent.id).map((value) => ({
+    value,
+    label: t(`codingAgents.permissionMode.${keys[value]!}`),
+    description: t(`codingAgents.permissionModeHint.${keys[value]!}`, { name: agent.name }),
+  }));
+}
+
+/**
+ * The coding agent CLIs in Agents: those found on this computer, each with
+ * its sign-in and a switch that offers its models in the model picker.
+ */
+export function CodingAgentsGroup({
+  models,
+  defaultAgent,
+  onOpen,
+  actions,
+}: {
+  /** Model probes can also report fresh account limits; reload status when they finish. */
+  models?: readonly AgentModel[];
+  /** The agent whose model new conversations start with, if it is a CLI. */
+  defaultAgent?: AgentRuntimeId;
+  onOpen: (id: AgentRuntimeId) => void;
+  actions?: ReactNode;
+}) {
+  const [agents, setAgents] = useState<AgentRuntimeStatus[]>();
+  const [turningOn, setTurningOn] = useState<AgentRuntimeStatus>();
+  const [error, setError] = useState<string>();
+  const [pending, setPending] = useState<Set<AgentRuntimeId>>(new Set());
+  useEffect(() => {
+    let active = true;
+    const load = () =>
+      void listAgentRuntimes()
+        .then((loaded) => {
+          if (active) {
+            setAgents(loaded);
+            setError(undefined);
+          }
+        })
+        .catch((cause) => {
+          if (active) setError(errorMessage(cause));
+        });
+    load();
+    window.addEventListener(MODELS_CHANGED_EVENT, load);
+    window.addEventListener("focus", load);
+    return () => {
+      active = false;
+      window.removeEventListener(MODELS_CHANGED_EVENT, load);
+      window.removeEventListener("focus", load);
+    };
+  }, [models]);
+  async function toggle(
+    agent: AgentRuntimeStatus,
+    enabled: boolean,
+  ): Promise<void> {
+    setPending((current) => new Set(current).add(agent.id));
+    setAgents((current) =>
+      current?.map((item) =>
+        item.id === agent.id ? { ...item, enabled } : item,
+      ),
+    );
+    try {
+      const saved = await updateAgentRuntime(agent.id, { enabled });
+      setAgents((current) =>
+        current?.map((item) => (item.id === agent.id ? saved : item)),
+      );
+      notifyAgentModelsChanged();
+    } catch (cause) {
+      setAgents((current) =>
+        current?.map((item) => (item.id === agent.id ? agent : item)),
+      );
+      setError(errorMessage(cause));
+    } finally {
+      setPending((current) => {
+        const next = new Set(current);
+        next.delete(agent.id);
+        return next;
+      });
+    }
+  }
+  return (
+    <SettingsGroup
+      className="coding-agents-group"
+      title={t("codingAgents.title")}
+      description={t("settings.agents.codingHint")}
+      actions={actions}
+    >
+      {!agents && !error ? (
+        <div className="settings-loading-row">
+          <LoaderCircle className="spin" size={16} />
+          {t("codingAgents.checking")}
+        </div>
+      ) : null}
+      {turningOn ? <PluginAgentTurnOn agent={turningOn} onClose={() => setTurningOn(undefined)} onConfirm={() => { setTurningOn(undefined); void toggle(turningOn, true); }} /> : null}
+      {(agents ?? []).map((agent) => {
+        const action = agent.installed
+          ? t("codingAgents.manage", { name: agent.name })
+          : t("codingAgents.setUp", { name: agent.name });
+        return (
+          <SettingsRow
+            key={agent.id}
+            className="settings-agent-row"
+            icon={<AgentMark id={agent.id} iconRevision={agent.iconRevision} />}
+            title={
+              <>
+                {agent.name}
+                {agent.id === defaultAgent ? (
+                  <Badge tone="outline">{t("agents.default")}</Badge>
+                ) : null}
+                {agent.installed && olderThanTested(agent) ? (
+                  <span title={t("codingAgents.updateAvailableHint", { version: agent.testedVersion })}>
+                    <Badge tone="outline">{t("codingAgents.updateAvailable")}</Badge>
+                  </span>
+                ) : null}
+              </>
+            }
+            description={agentSummary(agent)}
+            onClick={() => onOpen(agent.id)}
+          >
+            {agent.installed && agent.enabled && agent.limits?.length ? (
+              <AgentUsageInline limits={agent.limits} compact />
+            ) : null}
+            {agent.installed ? (
+              <Switch
+                label={t("codingAgents.enable", { name: agent.name })}
+                checked={agent.enabled}
+                disabled={pending.has(agent.id)}
+                onChange={(enabled) => {
+                  if (enabled && agent.plugin) setTurningOn(agent);
+                  else void toggle(agent, enabled);
+                }}
+              />
+            ) : (
+              <Button size="sm" icon={<ExternalLink size={14} />} onClick={() => onOpen(agent.id)}>
+                {t("codingAgents.installGuide")}
+              </Button>
+            )}
+            <IconButton size="sm" label={action} onClick={() => onOpen(agent.id)}>
+              <ChevronRight size={16} />
+            </IconButton>
+          </SettingsRow>
+        );
+      })}
+      {agents ? (
+        <SettingsRow
+          className="settings-agent-row"
+          icon={<Plug size={18} />}
+          title={t("codingAgents.more")}
+          description={t("codingAgents.moreHint")}
+        >
+          <Button size="sm" onClick={() => { window.location.hash = pluginsTabHash("discover"); }}>
+            {t("codingAgents.browsePlugins")}
+          </Button>
+        </SettingsRow>
+      ) : null}
+      {error ? (
+        <div className="settings-pad">
+          <SettingsNote tone="danger">{error}</SettingsNote>
+        </div>
+      ) : null}
+    </SettingsGroup>
+  );
+}
+
+export function CodingAgentDetail({
+  id,
+  onBack,
+}: {
+  id: AgentRuntimeId;
+  onBack: () => void;
+}) {
+  const [agent, setAgent] = useState<AgentRuntimeStatus>();
+  const [error, setError] = useState<string>();
+  const [busy, setBusy] = useState<"recheck" | "login" | "save">();
+  const [login, setLogin] = useState<{ url?: string; command?: string }>();
+  const [binaryPath, setBinaryPath] = useState("");
+  const link = useExternalLink();
+  useEffect(() => {
+    let active = true;
+    void listAgentRuntimes()
+      .then((agents) => {
+        const found = agents.find((item) => item.id === id);
+        if (!active || !found) return;
+        setAgent(found);
+        setBinaryPath(found.configuredBinaryPath ?? "");
+      })
+      .catch((cause) => {
+        if (active) setError(errorMessage(cause));
+      });
+    return () => {
+      active = false;
+    };
+  }, [id]);
+  async function run(
+    kind: "recheck" | "login" | "save",
+    work: () => Promise<void>,
+  ): Promise<void> {
+    if (busy) return;
+    setBusy(kind);
+    setError(undefined);
+    try {
+      await work();
+    } catch (cause) {
+      setError(errorMessage(cause));
+    } finally {
+      setBusy(undefined);
+    }
+  }
+  const recheck = () =>
+    run("recheck", async () => {
+      const status = await recheckAgentRuntime(id);
+      setAgent(status);
+      setBinaryPath(status.configuredBinaryPath ?? "");
+      notifyAgentModelsChanged();
+    });
+  const signIn = (profileId: string) =>
+    run("login", async () => {
+      const started = await loginAgentRuntime(id, profileId);
+      setLogin(started);
+      if (started.url) await link.open(started.url);
+    });
+  const [turningOn, setTurningOn] = useState(false);
+  const update = (change: Parameters<typeof updateAgentRuntime>[1]) =>
+    run("save", async () => {
+      const status = await updateAgentRuntime(id, change);
+      setAgent(status);
+      setBinaryPath(status.configuredBinaryPath ?? "");
+      notifyAgentModelsChanged();
+    });
+  function savePath(event: FormEvent): void {
+    event.preventDefault();
+    void update({ binaryPath: binaryPath.trim() });
+  }
+  const back = t("settings.agents.back");
+  if (!agent) {
+    return (
+      <>
+        <SettingsDetailHead mark={<AgentMark id={id} />} title={t("settings.nav.agents")} onBack={onBack} backLabel={back} />
+        {error ? (
+          <SettingsNote tone="danger">{error}</SettingsNote>
+        ) : (
+          <div className="settings-loading-row">
+            <LoaderCircle className="spin" size={16} />
+            {t("codingAgents.checking")}
+          </div>
+        )}
+      </>
+    );
+  }
+  const problems = agent.diagnostics;
+  return (
+    <div className="settings-form coding-agent-detail">
+      {turningOn ? <PluginAgentTurnOn agent={agent} onClose={() => setTurningOn(false)} onConfirm={() => { setTurningOn(false); void update({ enabled: true }); }} /> : null}
+      <SettingsDetailHead
+        mark={<AgentMark id={agent.id} iconRevision={agent.iconRevision} />}
+        title={agent.name}
+        description={agentSummary(agent)}
+        onBack={onBack}
+        backLabel={back}
+      >
+        {agent.installed ? (
+          <Switch
+            label={t("codingAgents.enable", { name: agent.name })}
+            checked={agent.enabled}
+            disabled={busy !== undefined}
+            onChange={(enabled) => {
+              if (enabled && agent.plugin) setTurningOn(true);
+              else void update({ enabled });
+            }}
+          />
+        ) : null}
+      </SettingsDetailHead>
+      <SettingsGroup title={t("codingAgents.status")}>
+        <SettingsRow
+          title={t("settings.agents.version")}
+          description={agent.version ? `v${agent.version}` : t("codingAgents.versionUnknown")}
+        >
+          <IconButton
+            size="sm"
+            label={t("codingAgents.recheck")}
+            disabled={busy !== undefined}
+            onClick={() => void recheck()}
+          >
+            <RefreshCw size={15} className={busy === "recheck" ? "spin" : undefined} />
+          </IconButton>
+        </SettingsRow>
+        {agent.installed && agent.id === "opencode-cli" ? (
+          <SettingsRow title={t("codingAgents.account")} description={t("codingAgents.openCodeAccounts")} />
+        ) : null}
+        {agent.plugin ? (
+          <SettingsRow title={t("codingAgents.plugin")} description={t("codingAgents.pluginHint", { name: agent.name })}>
+            <Button size="sm" onClick={() => { window.location.hash = pluginHash(agent.plugin); }}>
+              {t("providers.plugin.open")}
+            </Button>
+          </SettingsRow>
+        ) : null}
+        {agent.launch ? (
+          <SettingsRow title={t("codingAgents.launch")} description={<code className="coding-agent-launch">{agent.launch}</code>} />
+        ) : null}
+        {problems.length ? (
+          <div className="settings-pad settings-form" aria-label={t("codingAgents.diagnostics")} role="group">
+            {problems.map((diagnostic) => (
+              <Diagnostic key={diagnostic.code} agent={agent} diagnostic={diagnostic} />
+            ))}
+          </div>
+        ) : null}
+      </SettingsGroup>
+      {isAccountRuntimeId(agent.id) ? <AgentAccountProfiles key={agent.id} runtime={agent.id} defaultProfileId={agent.defaultProfileId ?? "system"} onDefault={(defaultProfileId) => update({ defaultProfileId })} onLogin={signIn} onChanged={async () => {
+        setAgent((await listAgentRuntimes()).find((item) => item.id === id));
+        notifyAgentModelsChanged();
+      }} disabled={busy !== undefined} /> : null}
+      {login ? <LoginHint login={login} onOpen={link.open} failed={link.failedUrl === login.url} /> : null}
+      <ExternalLinkFallback url={link.failedUrl} />
+      {agent.installed && agent.id !== "opencode-cli" && !agent.plugin ? (
+        // OpenCode bills each model provider; its account has no quota of its own.
+        <SettingsGroup title={t("agentUsage.title")}>
+          <div className="settings-pad">
+            {agent.limits?.length ? (
+              <AgentUsageDetails limits={agent.limits} />
+            ) : (
+              <p className="settings-muted">{t("agentUsage.empty", { name: agent.name })}</p>
+            )}
+          </div>
+        </SettingsGroup>
+      ) : null}
+      <SettingsGroup title={t("codingAgents.configuration")} description={agent.installed ? t("codingAgents.cliConfigHint", { name: agent.name }) : undefined}>
+        {agent.installed ? (
+          <div className="settings-pad settings-form">
+            <RadioGroup
+              label={t("codingAgents.permissions")}
+              value={agent.permissionMode}
+              onChange={(permissionMode) => void update({ permissionMode })}
+              options={permissionOptions(agent)}
+            />
+            {agent.permissionMode === fullAccessPermissionMode(agent.id) ? (
+              <SettingsNote role="status">{t("settings.agents.permissionFullNote")}</SettingsNote>
+            ) : null}
+            <p className="settings-muted">{t("codingAgents.permissionModesHint", { name: agent.name })}</p>
+          </div>
+        ) : null}
+        {agent.installed && !agent.plugin ? (
+          // Agents from plugins report no usage limits to wait for.
+          <SettingsRow title={t("codingAgents.autoContinue")} description={t("codingAgents.autoContinueHint", { name: agent.name })}>
+            <Switch label={t("codingAgents.autoContinue")} checked={agent.autoContinue} onChange={(autoContinue) => void update({ autoContinue })} />
+          </SettingsRow>
+        ) : null}
+        {agent.installed && agent.identifyAsOhMyGame !== undefined ? (
+          <SettingsRow title={t("codingAgents.identifyAsOhMyGame")} description={t("codingAgents.identifyAsOhMyGameHint")}>
+            <Switch label={t("codingAgents.identifyAsOhMyGame")} checked={agent.identifyAsOhMyGame} onChange={(identifyAsOhMyGame) => void update({ identifyAsOhMyGame })} />
+          </SettingsRow>
+        ) : null}
+        <form className="settings-pad" onSubmit={savePath}>
+          <Field
+            label={t("codingAgents.executable")}
+            hint={
+              <>
+                {t("codingAgents.executableHint")}
+                {agent.binaryPath ? (
+                  <span className="coding-agent-executable-path">
+                    {" "}
+                    {agent.binarySource
+                      ? `${t(`codingAgents.binarySource.${agent.binarySource}`)}: `
+                      : ""}
+                    <code>{agent.binaryPath}</code>
+                  </span>
+                ) : null}
+              </>
+            }
+          >
+            {(props) => (
+              <div className="settings-inline">
+                <Input
+                  {...props}
+                  value={binaryPath}
+                  placeholder={t("codingAgents.executablePlaceholder")}
+                  spellCheck={false}
+                  onChange={(event) => setBinaryPath(event.target.value)}
+                />
+                <Button
+                  type="submit"
+                  disabled={busy !== undefined || binaryPath.trim() === (agent.configuredBinaryPath ?? "")}
+                >
+                  {t("common.save")}
+                </Button>
+              </div>
+            )}
+          </Field>
+        </form>
+      </SettingsGroup>
+      {error ? <SettingsNote tone="danger">{error}</SettingsNote> : null}
+    </div>
+  );
+}
+
+/** Turning on a plugin's agent starts what the plugin wrote, so the person reads it first. */
+function PluginAgentTurnOn({ agent, onClose, onConfirm }: { agent: AgentRuntimeStatus; onClose: () => void; onConfirm: () => void }) {
+  return (
+    <Dialog
+      open
+      size="sm"
+      onClose={onClose}
+      title={t("codingAgents.turnOnTitle", { name: agent.name })}
+      description={t("codingAgents.turnOnDescription", { plugin: agent.plugin ?? "" })}
+      footer={<>
+        <Button onClick={onClose}>{t("common.cancel")}</Button>
+        <Button variant="primary" onClick={onConfirm}>{t("codingAgents.turnOn")}</Button>
+      </>}
+    >
+      <code className="coding-agent-launch">{agent.launch}</code>
+    </Dialog>
+  );
+}
+
+function LoginHint({ login, onOpen, failed }: { login: { url?: string; command?: string }; onOpen: (url: string) => Promise<void>; failed: boolean }) {
+  // A sign-in page that could not open is offered to copy instead.
+  if (login.url && failed) return null;
+  if (login.url) {
+    return (
+      <SettingsNote role="status">
+        {t("codingAgents.loginOpened")}{" "}
+        <button
+          type="button"
+          className="coding-agent-link"
+          onClick={() => void onOpen(login.url!)}
+        >
+          {t("codingAgents.openAgain")}
+        </button>
+      </SettingsNote>
+    );
+  }
+  return login.command ? (
+    <SettingsNote role="status">
+      <p>{t("codingAgents.loginCommand")}</p>
+      <CommandText command={login.command} />
+    </SettingsNote>
+  ) : null;
+}
+
+function Diagnostic({
+  agent,
+  diagnostic,
+}: {
+  agent: AgentRuntimeStatus;
+  diagnostic: AgentRuntimeDiagnostic;
+}) {
+  const text = diagnosticText(agent, diagnostic);
+  const blocking =
+    diagnostic.code === "not-installed" ||
+    diagnostic.code === "runtime-incompatible";
+  const link = useExternalLink();
+  return (
+    <>
+      <div
+        className={`settings-note coding-agent-diagnostic${blocking ? " is-danger" : ""} is-${diagnostic.code}`}
+        role={blocking ? "alert" : "status"}
+      >
+        <Terminal size={14} aria-hidden="true" />
+        <span>
+          {text}
+          {diagnostic.command && diagnostic.code === "not-installed" ? (
+            <>
+              {" "}
+              <button
+                type="button"
+                className="coding-agent-link"
+                onClick={() => void link.open(diagnostic.command!)}
+              >
+                {t("codingAgents.installGuide")}
+              </button>
+            </>
+          ) : null}
+          {diagnostic.command && diagnostic.code === "signed-out" ? (
+            <>
+              {" "}
+              <CommandText command={diagnostic.command} />
+            </>
+          ) : null}
+        </span>
+      </div>
+      <ExternalLinkFallback url={link.failedUrl} />
+    </>
+  );
+}
+
+/** An agent's logo: built in, the plugin's own, or a terminal. `iconRevision` is set when its plugin brings one. */
+export function AgentMark({ id, iconRevision }: { id: AgentRuntimeId; iconRevision?: string }) {
+  const pluginIcon = usePluginIcon(iconRevision ? id : undefined, iconRevision);
+  const icon = PROVIDER_ICONS[id] ?? (pluginIcon ? { src: pluginIcon, tone: "color" as const } : undefined);
+  return (
+    <span className={`settings-mark${icon ? ` is-${icon.tone}` : ""}`} aria-hidden="true">
+      {/* A plugin's icon loading keeps the space empty, rather than flashing the terminal. */}
+      {icon ? <img src={icon.src} alt="" /> : pluginIcon === undefined ? null : <Terminal size={18} />}
+    </span>
+  );
+}
+
+/** An installed CLI older than the version OhMyGame was tested with can be updated. */
+function olderThanTested(agent: AgentRuntimeStatus): boolean {
+  if (!agent.version || !agent.testedVersion) return false;
+  const parse = (version: string) => (/^v?(\d+)\.(\d+)\.(\d+)/.exec(version.trim()) ?? []).slice(1, 4).map(Number);
+  const installed = parse(agent.version);
+  const tested = parse(agent.testedVersion);
+  if (installed.length < 3 || tested.length < 3) return false;
+  for (let index = 0; index < 3; index += 1) {
+    if (installed[index]! !== tested[index]!) return installed[index]! < tested[index]!;
+  }
+  return false;
+}
+
+function agentSummary(agent: AgentRuntimeStatus): string {
+  if (!agent.installed)
+    return t(
+      agent.diagnostics.some((item) => item.code === "invalid-executable")
+        ? "codingAgents.invalidExecutable"
+        : "codingAgents.notFound",
+    );
+  const version = agent.version
+    ? `v${agent.version}`
+    : t("codingAgents.versionUnknown");
+  if (
+    agent.diagnostics.some(
+      (diagnostic) => diagnostic.code === "runtime-incompatible",
+    )
+  )
+    return t("codingAgents.needsUpdate", { version });
+  if (agent.diagnostics.some((item) => item.code === "probe-failed"))
+    return t("codingAgents.checkFailed", { version });
+  if (agent.auth.status === "signed-out")
+    return t("codingAgents.installedSignedOut", { version });
+  return t("codingAgents.installed", { version });
+}
+
+function diagnosticText(
+  agent: AgentRuntimeStatus,
+  diagnostic: AgentRuntimeDiagnostic,
+): string {
+  switch (diagnostic.code) {
+    case "not-installed":
+      return t("codingAgents.diagnostic.notInstalled", { name: agent.name });
+    case "invalid-executable":
+      return t("codingAgents.diagnostic.invalidExecutable");
+    case "runtime-incompatible":
+      return t(
+        diagnostic.capability
+          ? "codingAgents.diagnostic.capabilityMissing"
+          : "codingAgents.diagnostic.runtimeIncompatible",
+        {
+          name: agent.name,
+          capability: diagnostic.capability,
+        },
+      );
+    case "signed-out":
+      return t("codingAgents.diagnostic.signedOut", { name: agent.name });
+    case "models-unavailable":
+      return t("codingAgents.diagnostic.modelsUnavailable", {
+        name: agent.name,
+      });
+    default:
+      return t("codingAgents.diagnostic.probeFailed", { name: agent.name });
+  }
+}
+
+function errorMessage(cause: unknown): string {
+  return cause instanceof Error ? cause.message : String(cause);
+}

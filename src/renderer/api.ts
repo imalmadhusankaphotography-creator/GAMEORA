@@ -1,0 +1,2305 @@
+import { mediaMigrationError } from "./media-migration-errors.js";
+import type { AgentInstructionsView, ConversationInstructions } from "../shared/agent-instructions.js";
+import type { BrowserSettings, DesktopBrowserBridge, PluginBrowserShortcut, ProjectBrowser, SavedBrowserTab } from "../shared/browser.js";
+import { notifyAgentModelsChanged } from "./model-settings-events.js";
+import type { PluginMediaKind, PluginMediaModelList, PluginSave3DModel } from "../shared/plugin-manifest.js";
+export { MODELS_CHANGED_EVENT, notifyAgentModelsChanged } from "./model-settings-events.js";
+import type { GameTuningScalar, GameTuningState } from "../shared/game-tuning.js";
+import { diagnosticsFileName } from "../shared/diagnostics.js";
+import type { StoryLibraryMediaResult, StoryUpgradeResult, StoryUpgradeStatus } from "../shared/story-web.js";
+import { PROJECT_ARCHIVE_CONTENT_TYPE } from "../shared/project-archive.js";
+import type { CommunityCommentPage, CommunityGameStats, CommunityGamesQuery, CommunityProfile, CreateCommunityCommentResult, GameNameAvailability } from "../shared/publish-v1.js";
+import { runtimeConnection, subscribeRuntimeConnection } from "./runtime-connection.js";
+import { assertWorkspaceVersion, observeWorkspaceVersion, workspaceVersion, type WorkspaceRequestInit } from "./workspace-version.js";
+import { forgetLastProject } from "./general-preferences.js";
+import { syncPluginTheme } from "./appearance.js";
+import type { DesktopRuntimeService } from "../shared/desktop-runtime.js";
+import type { UsageStats } from "../shared/usage-stats.js";
+import type { AgentNotificationPermission, AgentNotificationPreferences, AgentNotificationTarget } from "../shared/agent-notifications.js";
+import {
+  RUNTIME_EVENT_TYPES,
+  type AgentContextUsage,
+  type AnswerQuestionnaireRequest,
+  type AgentModelCatalog,
+  type AgentModelRef,
+  type AgentReasoningLevel,
+  type CheckpointChangeItem,
+  type CheckpointFileView,
+  type CheckpointUndoRequest,
+  type CheckpointUndoResponse,
+  type ConversationAgentSettings,
+  type ConversationCapabilities,
+  type CreateLibraryImageRequest,
+  type LibraryAsset,
+  type LibraryAssetDerivation,
+  type LibraryAssetPurpose,
+  type LibraryAssetSummary,
+  type LibraryUploadMediaType,
+  type LibrarySource,
+  type LibrarySourceItem,
+  type LibrarySourceResults,
+  type LibrarySourceSearchRequest,
+  type MediaModelDefaults,
+  type MediaModelUsage,
+  type ImageModel,
+  type ImageModelCatalog,
+  type ModelAuthEvent,
+  type ModelAuthMethod,
+  type ModelProviderEndpointSettings,
+  type OpenAIImageConnectionSettings,
+  type SaveOpenAIImageConnectionRequest,
+  type DiscoverOpenAIImageModelsRequest,
+  type DiscoveredOpenAIImageModels,
+  type ResponsesTransportSettings,
+  type ResponsesTransportMode,
+  type ProviderModelSettings,
+  type Model3DDefinition,
+  type CustomProviderModel,
+  type CustomProviderDetails,
+  type SaveCustomProviderRequest,
+  type DiscoverProviderModelsRequest,
+  type DiscoveredProviderModels,
+  type ProviderSummary,
+  type CreateProjectRequest,
+  type CommunityGame,
+  type ConversationDetail,
+  type ConversationSummary,
+  type ProjectRunSettings,
+  type ProjectFileOpenMode,
+  type ProjectActivitySnapshot,
+  type ProjectAppearance,
+  type ProjectCoverMode,
+  type ProjectCoverState,
+  type ProjectState,
+  type UpdateAgentDefaultsRequest,
+  type PublishProjectRequest,
+  type PublishResult,
+  type RuntimeEvent,
+  type RunToolRequest,
+  type ToolId,
+  type ToolJob,
+  type ToolJobContext,
+  type VideoModel,
+  type PromptImage,
+  type PromptAttachment,
+  type PluginMention,
+  type PromptMode,
+  type PromptContext,
+  type PromptReference,
+  type PromptResponse,
+  type WorkspaceFile,
+  type WorkspaceFileContent,
+  type MediaModelCatalog,
+  type Model3DModel,
+  type Model3DAnimationAction,
+  ScheduleMessageRequest,
+} from "../shared/contracts.js";
+import type { AccountRuntimeId, AccountProfileIds, AgentAccountProfile, AgentAccountProfileStatus, AgentRuntimeId, AgentRuntimeLoginResponse, AgentRuntimeStatus, AnswerApprovalRequest, ApprovalDecision, UpdateAgentAccountProfileRequest, UpdateAgentRuntimeRequest } from "../shared/agent-runtimes.js";
+import type { AudioModelCatalog, AudioVoicePage } from "../shared/audio.js";
+import type { DesktopUpdateState } from "../shared/desktop-update.js";
+import type { WorkspaceGitChanges, WorkspaceGitFileView } from "../shared/workspace-git.js";
+import type { ExampleSummary } from "../shared/examples.js";
+import type { PlaytestWatchState } from "../shared/playtest.js";
+import type { NodeRuntimeResponse, NodeThumbnailResult, PlayableThumbnailSnapshot } from "../shared/playable-player-protocol.js";
+import type { NodeCodebaseDetail, NodeCodebaseUpdate } from "../shared/playable-codebase.js";
+import type { PlayableAddedNode, PlayablePresetSummary, PlayableProjectValidationResult as PlayableProjectValidation, PlayableThumbnailManifest } from "../shared/playable-editor.js";
+import type { PluginLogView, PluginSkillContent, PluginSourceUpdate, PluginUninstallPreview } from "../shared/plugins.js";
+import type { UpdateWebSearchSettings, WebSearchSettings } from "../shared/web-search.js";
+import type { ExternalAgentSettings, UpdateExternalAgentSettings } from "../shared/external-mcp.js";
+import type { DesktopClipboardFile } from "../shared/file-transfer.js";
+import type { WebGamePlayerBridge } from "../shared/web-game-player.js";
+import type { NetworkConnectionTest, NetworkSettings, NetworkSettingsState } from "../shared/network-settings.js";
+import { composerDrafts } from "./composer-drafts.js";
+import type { OnboardingState, UpdateOnboardingRequest } from "../shared/onboarding.js";
+import { language, t } from "./i18n.js";
+
+const API_BASE = "/api";
+
+export function getOnboardingState(): Promise<OnboardingState> {
+  return request("/settings/onboarding");
+}
+
+export function updateOnboardingState(state: UpdateOnboardingRequest): Promise<OnboardingState> {
+  return request("/settings/onboarding", { method: "PUT", body: JSON.stringify(state) });
+}
+
+export function getNetworkSettings(): Promise<NetworkSettingsState> {
+  return request("/settings/network");
+}
+
+export function updateNetworkSettings(settings: NetworkSettings): Promise<NetworkSettingsState> {
+  return request("/settings/network", { method: "PUT", body: JSON.stringify(settings) });
+}
+
+export function detectNetworkProxy(): Promise<NetworkSettingsState> {
+  return request("/settings/network/detect", { method: "POST" });
+}
+
+export function testNetworkConnection(settings: NetworkSettings): Promise<NetworkConnectionTest> {
+  return request("/settings/network/test", { method: "POST", body: JSON.stringify(settings) });
+}
+
+interface DesktopRuntime {
+  daemonUrl: string;
+  token: string;
+}
+
+declare global {
+  interface Window {
+    ohMyGameDesktop?: {
+      platform: string;
+      runtime: DesktopRuntime;
+      runtimeService?: DesktopRuntimeService;
+      openExternal: (url: string) => Promise<void>;
+      /** Names an https page the Library is about to embed, which then stays on its own site. */
+      allowLibraryEmbed?: (url: string) => Promise<void>;
+      setAppearance: (appearance: "system" | "light" | "dark") => Promise<void>;
+      readUsageData?: () => Promise<boolean>;
+      onUsageDataChanged?: (listener: (enabled: boolean) => void) => void;
+      updateUsageData?: (enabled: boolean, initialize: boolean) => Promise<boolean>;
+      backgroundRunning?: {
+        get: () => Promise<boolean>;
+        set: (enabled: boolean) => Promise<boolean>;
+      };
+      /** Software rendering after repeated GPU process crashes (Settings → General). */
+      gpuFallback?: {
+        get: () => Promise<{ disabled: boolean }>;
+        /** Sets whether hardware acceleration stays off; it returns on the next launch. */
+        set: (disabled: boolean) => Promise<{ disabled: boolean }>;
+      };
+      restartApp?: () => Promise<void>;
+      /** Holds off system sleep while an agent works (Settings → General). */
+      setKeepAwake?: (enabled: boolean) => Promise<void>;
+      /** Brings the main window forward, for a notification the person clicked. */
+      focusWindow?: () => Promise<void>;
+      onPrepareClose?: (listener: () => Promise<void>) => () => void;
+      onCancelClose?: (listener: (error: string) => void) => () => void;
+      windowMenu?: {
+        /** Names the application menu's items, in the app's language. */
+        setLabels: (labels: Record<string, string>) => Promise<void>;
+      };
+      /** The window's controls, drawn in the renderer on Windows. */
+      windowControls?: {
+        minimize: () => Promise<void>;
+        toggleMaximize: () => Promise<void>;
+        close: () => Promise<void>;
+        state: () => Promise<{ maximized: boolean }>;
+        onState: (listener: (state: { maximized: boolean }) => void) => () => void;
+      };
+      openProjectFile: (projectId: string, filePath: string, mode?: ProjectFileOpenMode) => Promise<void>;
+      browsePluginDirectory: (pluginId: string) => Promise<void>;
+      browseAccountDirectory?: (runtime: AccountRuntimeId, profileId: string) => Promise<void>;
+      revealPluginSkill: (pluginId: string, skillId: string) => Promise<void>;
+      selectPluginDirectory: () => Promise<string | undefined>;
+      selectProjectDirectory: () => Promise<string | undefined>;
+      /** Older desktop builds do not write log files. */
+      openLogsDirectory?: () => Promise<void>;
+      removeProject?: (projectId: string) => Promise<void>;
+      /** Builds the diagnostics ZIP without the background service, for when it is not running. */
+      exportDiagnostics?: () => Promise<Uint8Array<ArrayBuffer>>;
+      clipboard: {
+        files: () => Promise<DesktopClipboardFile[]>;
+        paste: () => Promise<void>;
+      };
+      capturePage: (bounds: { x: number; y: number; width: number; height: number }) => Promise<Uint8Array>;
+      /** Captures a Node's thumbnail in a hidden window, or says why it could not. */
+      captureNodeThumbnail?: (projectId: string, nodeId: string, viewport: { width: number; height: number }, batchId: string) => Promise<NodeThumbnailResult>;
+      /** Shares the editor build once, instead of compiling again for each capture. */
+      prepareNodeThumbnails?: (projectId: string, batchId: string, snapshot: PlayableThumbnailSnapshot) => Promise<void>;
+      /** Only a hidden thumbnail window can read its assigned snapshot. */
+      nodeThumbnailSnapshot?: () => Promise<PlayableThumbnailSnapshot | undefined>;
+      /** Cancels active and queued captures in a batch. */
+      cancelNodeThumbnails?: (batchId: string) => Promise<void>;
+      /** Called by the hidden thumbnail window once its capture is stored or failed. */
+      finishNodeThumbnail?: (captured: boolean, error?: string) => Promise<void>;
+      openPlaytest: (projectId: string, viewport: { width: number; height: number }) => Promise<void>;
+      webGamePlayer?: WebGamePlayerBridge;
+      /** The Browser panel's pages; absent outside the desktop app. */
+      browser?: DesktopBrowserBridge;
+      /** Called from a Playtest window: shows the Node in the main window's editor. */
+      openPlayableNode?: (projectId: string, nodeId: string) => Promise<void>;
+      /** Called in the main window when a Playtest asks to open a Node. */
+      onOpenPlayableNode?: (listener: (projectId: string, nodeId: string) => void) => () => void;
+      /** Called from a Playtest window that cannot play: brings the project's editor forward. */
+      showPlaytestEditor?: (projectId: string) => Promise<void>;
+      /** Called in the main window when a Playtest asks for its project's editor. */
+      onShowPlaytestEditor?: (listener: (projectId: string) => void) => () => void;
+      agentPlaytests?: {
+        state: () => Promise<PlaytestWatchState>;
+        setVisible: (visible: boolean) => Promise<PlaytestWatchState>;
+        onState: (listener: (state: PlaytestWatchState) => void) => () => void;
+      };
+      /** Older desktop builds do not show notifications. */
+      notifications?: {
+        setPreferences: (preferences: AgentNotificationPreferences) => Promise<void>;
+        /** The conversation the window shows, so its notifications are not shown while it is in front. */
+        setView: (view: AgentNotificationTarget | null) => Promise<void>;
+        /** The conversation a clicked notification opens, once. */
+        takeTarget: () => Promise<AgentNotificationTarget | undefined>;
+        onTarget: (listener: () => void) => () => void;
+        permission: () => Promise<AgentNotificationPermission>;
+        /** Shows the system prompt if the user has not decided yet. */
+        requestPermission: () => Promise<AgentNotificationPermission>;
+        /** Asks for permission on the first prompt of each launch. */
+        promptSent: () => Promise<AgentNotificationPermission>;
+        openSettings: () => Promise<void>;
+      };
+      updates: {
+        state: () => Promise<DesktopUpdateState | null>;
+        check: () => Promise<void>;
+        download: () => Promise<void>;
+        install: () => Promise<void>;
+        /** Downloads found releases by itself and installs them on quit. */
+        setAutomatic?: (enabled: boolean) => Promise<void>;
+        onState: (listener: (state: DesktopUpdateState) => void) => () => void;
+      };
+      auth: {
+        callbackUrl: () => Promise<string>;
+        cancel: () => Promise<void>;
+        openUrl: (url: string) => Promise<void>;
+        takeCallback: () => Promise<string | undefined>;
+        onCallback: (listener: () => void) => () => void;
+      };
+    };
+  }
+}
+
+export async function createProject(input: CreateProjectRequest = {}): Promise<ProjectState> {
+  return request("/projects", { method: "POST", body: JSON.stringify(input) });
+}
+
+/** The type a folder chosen to open names, as the new-project dialog lists types; none when it doesn't say. */
+export async function getProjectFolderType(workspacePath: string): Promise<{ type?: string }> {
+  return request("/projects/folder-type", { method: "POST", body: JSON.stringify({ workspacePath }) });
+}
+
+export async function listProjects(): Promise<ProjectState[]> {
+  return request("/projects");
+}
+
+/** Follows project activity, reconnecting after a service restart; each connection starts with the current snapshot. */
+export async function streamProjectActivity(signal: AbortSignal, onSnapshot: (snapshot: ProjectActivitySnapshot) => void): Promise<void> {
+  return streamSnapshots("/projects/activity/events", signal, onSnapshot);
+}
+
+export async function streamSnapshots<T>(path: string, signal: AbortSignal, onSnapshot: (value: T) => void): Promise<void> {
+  while (!signal.aborted) {
+    const connection = new AbortController();
+    const unsubscribe = subscribeRuntimeConnection(() => connection.abort());
+    const connectionSignal = AbortSignal.any([signal, connection.signal]);
+    try {
+      if (runtimeConnection().status !== "ready") throw new Error(t("api.serviceUnavailable"));
+      const response = await fetch(apiUrl(path), {
+        headers: { accept: "text/event-stream", ...runtimeHeaders() },
+        signal: connectionSignal,
+      });
+      if (!response.ok || !response.body) throw new ApiError(`Snapshot stream failed with ${response.status}`, response.status);
+      await readEventBlocks(response.body, (block) => {
+        const data = eventData(block);
+        if (data) onSnapshot(JSON.parse(data) as T);
+      }, connectionSignal);
+    } catch {
+      // Keep the last state during a temporary runtime disconnect.
+    } finally {
+      unsubscribe();
+    }
+    if (signal.aborted) return;
+    await reconnectDelay(signal);
+  }
+}
+
+export async function listExamples(): Promise<ExampleSummary[]> {
+  return request("/examples");
+}
+
+export async function playExample(exampleId: string): Promise<{ url: string }> {
+  return request(`/examples/${encodeURIComponent(exampleId)}/play`, { method: "POST" });
+}
+
+export async function getExampleCover(exampleId: string): Promise<Blob | undefined> {
+  const response = await fetch(apiUrl(`/examples/${encodeURIComponent(exampleId)}/cover`), { headers: runtimeHeaders() });
+  if (response.status === 404) return undefined;
+  if (!response.ok) throw await responseError(response);
+  return response.blob();
+}
+
+export async function renameProject(projectId: string, name: string): Promise<ProjectState> {
+  return request(`/projects/${projectId}`, { method: "PATCH", body: JSON.stringify({ name }) });
+}
+
+export async function updateProjectStartupDirectory(projectId: string, startupDirectory: string): Promise<ProjectState> {
+  return request(`/projects/${projectId}/settings/startup-directory`, {
+    method: "PUT",
+    body: JSON.stringify({ startupDirectory }),
+  });
+}
+
+export async function updateProjectRunSettings(projectId: string, input: ProjectRunSettings): Promise<ProjectState> {
+  return request(`/projects/${projectId}/settings/run`, {
+    method: "PUT",
+    body: JSON.stringify(input),
+  });
+}
+
+export async function duplicateProject(projectId: string): Promise<ProjectState> {
+  return request(`/projects/${projectId}/duplicate`, { method: "POST" });
+}
+
+/** Downloads the project as an archive that imports as a new project. */
+export async function exportProject(projectId: string, version?: string): Promise<Blob> {
+  const response = await fetch(apiUrl(`/projects/${encodeURIComponent(projectId)}/export`), {
+    method: "POST",
+    headers: projectRuntimeHeaders(projectId, version),
+  });
+  if (!response.ok) throw await responseError(response);
+  return response.blob();
+}
+
+/**
+ * The name for a project file from earlier versions: its file name without
+ * `.zip` and the "(project)" suffix the story export adds in either language.
+ */
+export function archiveProjectName(fileName: string): string {
+  let name = fileName.replace(/\.zip$/i, "");
+  for (const lng of ["en", "zh-CN"]) {
+    const suffix = ` (${t("storySettings.projectFileSuffix", { lng })})`;
+    if (name.endsWith(suffix)) {
+      name = name.slice(0, -suffix.length);
+      break;
+    }
+  }
+  return name.slice(0, 255);
+}
+
+/** Creates a new project from an archive, streaming the file to the runtime. */
+export async function importProject(file: File): Promise<ProjectState> {
+  // Names a project file from earlier versions, which has no manifest.
+  const query = new URLSearchParams({ name: archiveProjectName(file.name) });
+  const response = await fetch(apiUrl(`/projects/import?${query}`), {
+    method: "POST",
+    headers: { "content-type": PROJECT_ARCHIVE_CONTENT_TYPE, ...runtimeHeaders() },
+    body: file,
+  });
+  if (!response.ok) throw await responseError(response);
+  return response.json() as Promise<ProjectState>;
+}
+
+/** Electron prefixes errors from the main process with the channel; the reason follows. */
+function ipcError(cause: unknown): Error {
+  const message = cause instanceof Error ? cause.message : String(cause);
+  return new Error(message.replace(/^Error invoking remote method '[^']+': (?:Error: )?/, ""));
+}
+
+/** Whether removing a project keeps its files: the desktop app puts OhMyGame's own copies in the Trash. */
+export function projectRemovalKeepsFiles(): boolean {
+  return typeof window !== "undefined" && typeof window.ohMyGameDesktop?.removeProject === "function";
+}
+
+/**
+ * Takes a project out of OhMyGame. In the desktop app nothing is deleted: a
+ * folder the person chose stays, and a project in OhMyGame's storage goes to
+ * the Trash. Elsewhere a project in OhMyGame's storage is deleted.
+ */
+export async function deleteProject(projectId: string): Promise<void> {
+  const remove = window.ohMyGameDesktop?.removeProject;
+  if (remove) await remove(projectId).catch((cause: unknown) => { throw ipcError(cause); });
+  else await request(`/projects/${projectId}`, { method: "DELETE" });
+  composerDrafts.deleteProject(projectId);
+  forgetLastProject(projectId);
+}
+
+/** Conversations list coding agents' models too; canvas text and other one-off generation use OhMyGame's own models only. */
+export async function listModels(options: { agentRuntimes?: boolean; accountProfiles?: AccountProfileIds; background?: boolean } = {}): Promise<AgentModelCatalog> {
+  if (!options.agentRuntimes) return request("/models");
+  const query = new URLSearchParams({ runtimes: "1" });
+  if (options.background) query.set("background", "1");
+  if (options.accountProfiles) query.set("profiles", JSON.stringify(options.accountProfiles));
+  return request(`/models?${query}`);
+}
+
+export async function listAgentRuntimes(recheck = false): Promise<AgentRuntimeStatus[]> {
+  return request(`/agent-runtimes${recheck ? "?recheck=1" : ""}`);
+}
+
+export async function skipLimitResume(projectId: string, conversationId: string): Promise<void> {
+  await request(`/projects/${projectId}/conversations/${conversationId}/limit-resume/skip`, { method: "POST" });
+}
+
+export async function scheduleMessage(projectId: string, conversationId: string, change: ScheduleMessageRequest): Promise<void> {
+  await request(`/projects/${projectId}/conversations/${conversationId}/scheduled-messages`, { method: "POST", body: JSON.stringify(change) });
+}
+
+export async function removeScheduledMessage(projectId: string, conversationId: string, messageId: string): Promise<void> {
+  await request(`/projects/${projectId}/conversations/${conversationId}/scheduled-messages/${messageId}`, { method: "DELETE" });
+}
+
+export async function updateAgentRuntime(id: AgentRuntimeId, change: UpdateAgentRuntimeRequest): Promise<AgentRuntimeStatus> {
+  return request(`/agent-runtimes/${id}`, { method: "PATCH", body: JSON.stringify(change) });
+}
+
+export async function recheckAgentRuntime(id: AgentRuntimeId): Promise<AgentRuntimeStatus> {
+  return request(`/agent-runtimes/${id}/recheck`, { method: "POST" });
+}
+
+export async function loginAgentRuntime(id: AgentRuntimeId, profileId?: string): Promise<AgentRuntimeLoginResponse> {
+  return request(`/agent-runtimes/${id}/login${profileId ? `?profileId=${encodeURIComponent(profileId)}` : ""}`, { method: "POST" });
+}
+
+export function listAccountProfiles(runtime: AccountRuntimeId, recheck = false): Promise<AgentAccountProfileStatus[]> {
+  return request(`/agent-runtimes/${runtime}/profiles${recheck ? "?recheck=1" : ""}`);
+}
+
+export function addAccountProfile(runtime: AccountRuntimeId, name: string, configDirectory?: string): Promise<AgentAccountProfile> {
+  return request(`/agent-runtimes/${runtime}/profiles`, { method: "POST", body: JSON.stringify({ name, ...(configDirectory ? { configDirectory } : {}) }) });
+}
+
+export function updateAccountProfile(runtime: AccountRuntimeId, profileId: string, change: UpdateAgentAccountProfileRequest): Promise<AgentAccountProfile> {
+  return request(`/agent-runtimes/${runtime}/profiles/${encodeURIComponent(profileId)}`, { method: "PATCH", body: JSON.stringify(change) });
+}
+
+export function moveAccountProfile(runtime: AccountRuntimeId, profileId: string, direction: -1 | 1): Promise<void> {
+  return request(`/agent-runtimes/${runtime}/profiles/${encodeURIComponent(profileId)}/move`, { method: "POST", body: JSON.stringify({ direction }) });
+}
+
+export function deleteAccountProfile(runtime: AccountRuntimeId, profileId: string): Promise<void> {
+  return request(`/agent-runtimes/${runtime}/profiles/${encodeURIComponent(profileId)}`, { method: "DELETE" });
+}
+
+/** A model comes back when the chosen account does not offer the chat's model and the chat moved to one it does. */
+export function setConversationAccountProfile(projectId: string, conversationId: string, runtime: AccountRuntimeId, profileId: string): Promise<{ profileId: string; model?: AgentModelRef; nativeReasoningLevel?: string }> {
+  return request(`/projects/${projectId}/conversations/${conversationId}/account-profile`, { method: "PUT", body: JSON.stringify({ runtime, profileId }) });
+}
+
+export async function recheckCodexImages(): Promise<ProviderSummary> {
+  return request("/settings/models/providers/codex-cli/images/recheck", { method: "POST" });
+}
+
+export async function answerApproval(projectId: string, conversationId: string, requestId: string, decision: ApprovalDecision): Promise<void> {
+  await request(`/projects/${projectId}/conversations/${conversationId}/approvals/${encodeURIComponent(requestId)}`, {
+    method: "POST",
+    body: JSON.stringify({ decision } satisfies AnswerApprovalRequest),
+  });
+}
+
+export async function updateAgentDefaults(input: UpdateAgentDefaultsRequest): Promise<void> {
+  await request("/models/default", {
+    method: "PUT",
+    body: JSON.stringify({ model: modelRef(input.model), reasoningLevel: input.reasoningLevel, ...(input.nativeReasoningLevel ? { nativeReasoningLevel: input.nativeReasoningLevel } : {}) }),
+  });
+}
+
+export async function syncCloudSession(session: { accessToken: string; userId: string } | null): Promise<void> {
+  await request("/cloud/session", { method: "PUT", body: JSON.stringify(session) });
+  notifyAgentModelsChanged();
+}
+export async function getCloudQuotas(): Promise<import("../shared/cloud-models.js").CloudQuotaSnapshot | null> { return request("/cloud/quotas"); }
+
+export async function listProviders(): Promise<ProviderSummary[]> {
+  return request(`/settings/providers?locale=${encodeURIComponent(language)}`);
+}
+
+export async function setProviderEnabled(providerId: string, enabled: boolean): Promise<ProviderSummary> {
+  const result = await request<ProviderSummary>(`/settings/models/providers/${encodeURIComponent(providerId)}/enabled`, { method: "PATCH", body: JSON.stringify({ enabled }) });
+  notifyAgentModelsChanged();
+  return result;
+}
+
+export async function getOpenAIImageSettings(): Promise<OpenAIImageConnectionSettings> {
+  return request("/settings/models/providers/openai/images");
+}
+
+export async function saveOpenAIImageSettings(settings: SaveOpenAIImageConnectionRequest): Promise<OpenAIImageConnectionSettings> {
+  const saved = await request<OpenAIImageConnectionSettings>("/settings/models/providers/openai/images", { method: "PUT", body: JSON.stringify(settings) });
+  notifyAgentModelsChanged();
+  return saved;
+}
+
+export async function discoverOpenAIImageModels(settings: DiscoverOpenAIImageModelsRequest, signal?: AbortSignal): Promise<DiscoveredOpenAIImageModels> {
+  return request("/settings/models/providers/openai/images/discover", { method: "POST", body: JSON.stringify(settings), signal });
+}
+
+export async function removeOpenAIImageSettings(): Promise<OpenAIImageConnectionSettings> {
+  const saved = await request<OpenAIImageConnectionSettings>("/settings/models/providers/openai/images", { method: "DELETE" });
+  notifyAgentModelsChanged();
+  return saved;
+}
+
+export async function getCustomProvider(providerId: string): Promise<CustomProviderDetails> {
+  return request(`/settings/models/providers/${encodeURIComponent(providerId)}/custom`);
+}
+
+export async function discoverCustomProviderModels(settings: DiscoverProviderModelsRequest, signal?: AbortSignal): Promise<DiscoveredProviderModels> {
+  return request("/settings/models/providers/discover", { method: "POST", body: JSON.stringify(settings), signal });
+}
+
+export async function saveCustomProvider(settings: SaveCustomProviderRequest, providerId?: string): Promise<CustomProviderDetails> {
+  const result = await request<CustomProviderDetails>(providerId ? `/settings/models/providers/${encodeURIComponent(providerId)}/custom` : "/settings/models/providers/custom", { method: providerId ? "PUT" : "POST", body: JSON.stringify(settings) });
+  notifyAgentModelsChanged();
+  return result;
+}
+
+export async function removeProvider(providerId: string): Promise<void> {
+  await request(`/settings/models/providers/${encodeURIComponent(providerId)}`, { method: "DELETE" });
+  notifyAgentModelsChanged();
+}
+
+export async function refreshProviderModels(providerId: string): Promise<ProviderModelSettings> {
+  const result = await request<ProviderModelSettings>(`/settings/models/providers/${encodeURIComponent(providerId)}/models/refresh`, { method: "POST" });
+  notifyAgentModelsChanged();
+  return result;
+}
+
+/** A plugin provider's media models of a kind, in Settings. */
+export async function getPluginMediaModels(providerId: string, kind: PluginMediaKind): Promise<PluginMediaModelList> {
+  return request(`/plugin-media-providers/${encodeURIComponent(providerId)}/models/${encodeURIComponent(kind)}`);
+}
+
+/** Lists the vendor's models of a kind through the plugin's adapter. */
+export async function listPluginMediaModels(providerId: string, kind: PluginMediaKind): Promise<PluginMediaModelList> {
+  return request(`/plugin-media-providers/${encodeURIComponent(providerId)}/models/${encodeURIComponent(kind)}/list`, { method: "POST" });
+}
+
+export async function setPluginMediaModelsShown(providerId: string, kind: PluginMediaKind, ids: string[], shown: boolean): Promise<PluginMediaModelList> {
+  const result = await request<PluginMediaModelList>(`/plugin-media-providers/${encodeURIComponent(providerId)}/models/${encodeURIComponent(kind)}`, { method: "PUT", body: JSON.stringify({ ids, shown }) });
+  notifyAgentModelsChanged();
+  return result;
+}
+
+export async function savePluginModel3D(providerId: string, edit: PluginSave3DModel): Promise<PluginMediaModelList> {
+  const result = await request<PluginMediaModelList>(`/plugin-media-providers/${encodeURIComponent(providerId)}/models/3d/definitions`, { method: "POST", body: JSON.stringify(edit) });
+  notifyAgentModelsChanged();
+  return result;
+}
+
+export async function removePluginModel3D(providerId: string, modelId: string, revision: string, reset = false): Promise<PluginMediaModelList> {
+  const result = await request<PluginMediaModelList>(`/plugin-media-providers/${encodeURIComponent(providerId)}/models/3d/definitions/${encodeURIComponent(modelId)}`, { method: "DELETE", body: JSON.stringify({ revision, reset }) });
+  notifyAgentModelsChanged();
+  return result;
+}
+
+export async function getProviderModels(providerId: string): Promise<ProviderModelSettings> {
+  return request(`/settings/models/providers/${encodeURIComponent(providerId)}/models`);
+}
+
+export async function setProviderModelVisibility(providerId: string, ids: string[], visible: boolean): Promise<ProviderModelSettings> {
+  const result = await request<ProviderModelSettings>(`/settings/models/providers/${encodeURIComponent(providerId)}/models/visibility`, { method: "PUT", body: JSON.stringify({ ids, visible }) });
+  notifyAgentModelsChanged();
+  return result;
+}
+
+export async function addCustomProviderModel(providerId: string, model: CustomProviderModel | Model3DDefinition): Promise<ProviderModelSettings> {
+  const result = await request<ProviderModelSettings>(`/settings/models/providers/${encodeURIComponent(providerId)}/models/custom`, { method: "POST", body: JSON.stringify(model) });
+  notifyAgentModelsChanged();
+  return result;
+}
+
+export async function updateProviderModel3D(providerId: string, model: Model3DDefinition): Promise<ProviderModelSettings> {
+  const result = await request<ProviderModelSettings>(`/settings/models/providers/${encodeURIComponent(providerId)}/models/${encodeURIComponent(model.id)}`, { method: "PUT", body: JSON.stringify(model) });
+  notifyAgentModelsChanged();
+  return result;
+}
+
+export async function resetProviderModel3D(providerId: string, modelId: string): Promise<ProviderModelSettings> {
+  const result = await request<ProviderModelSettings>(`/settings/models/providers/${encodeURIComponent(providerId)}/models/${encodeURIComponent(modelId)}/overrides`, { method: "DELETE" });
+  notifyAgentModelsChanged();
+  return result;
+}
+
+export async function removeCustomProviderModel(providerId: string, modelId: string): Promise<ProviderModelSettings> {
+  const result = await request<ProviderModelSettings>(`/settings/models/providers/${encodeURIComponent(providerId)}/models/custom/${encodeURIComponent(modelId)}`, { method: "DELETE" });
+  notifyAgentModelsChanged();
+  return result;
+}
+
+export async function getOpenAIEndpointSettings(): Promise<ModelProviderEndpointSettings> {
+  return request("/settings/models/providers/openai/endpoint");
+}
+
+export async function getResponsesTransport(provider: string): Promise<ResponsesTransportSettings> {
+  return request(`/settings/models/providers/${encodeURIComponent(provider)}/transport`);
+}
+export async function updateResponsesTransport(provider: string, mode: ResponsesTransportMode): Promise<ResponsesTransportSettings> {
+  return request(`/settings/models/providers/${encodeURIComponent(provider)}/transport`, { method: "PUT", body: JSON.stringify({ mode }) });
+}
+
+export async function updateOpenAIEndpointSettings(baseUrl: string): Promise<ModelProviderEndpointSettings> {
+  return request("/settings/models/providers/openai/endpoint", {
+    method: "PUT",
+    body: JSON.stringify({ baseUrl }),
+  });
+}
+
+export async function updateModel3DProviderApiKey(providerId: string, apiKey: string): Promise<{ configured: boolean }> {
+  const result = await request<{ configured: boolean }>(`/settings/models/providers/${encodeURIComponent(providerId)}`, { method: "PUT", body: JSON.stringify({ apiKey }) });
+  notifyAgentModelsChanged();
+  return result;
+}
+export async function updateSeedanceApiKey(providerId: string, apiKey: string): Promise<{ configured: boolean }> {
+  return request(`/settings/models/providers/${encodeURIComponent(providerId)}/seedance-key`, {
+    method: "PUT",
+    body: JSON.stringify({ apiKey }),
+  });
+}
+
+export async function updateMinimaxApiKey(providerId: string, apiKey: string): Promise<{ configured: boolean }> {
+  return request(`/settings/models/providers/${encodeURIComponent(providerId)}/minimax-key`, {
+    method: "PUT",
+    body: JSON.stringify({ apiKey }),
+  });
+}
+
+export async function updateVolcengineTtsApiKey(apiKey: string): Promise<{ configured: boolean; defaultVoiceId?: string }> {
+  const result = await request<{ configured: boolean; defaultVoiceId?: string }>("/settings/models/providers/volcengine-tts", {
+    method: "PUT",
+    body: JSON.stringify({ apiKey }),
+  });
+  notifyAgentModelsChanged();
+  return result;
+}
+export async function updateElevenLabsSettings(apiKey: string): Promise<{ configured: boolean }> {
+  const result = await request<{ configured: boolean }>("/settings/models/providers/elevenlabs", { method: "PUT", body: JSON.stringify({ apiKey }) });
+  notifyAgentModelsChanged();
+  return result;
+}
+export async function removeElevenLabsSettings(): Promise<void> {
+  await request("/settings/models/providers/elevenlabs/credential", { method: "DELETE" });
+  notifyAgentModelsChanged();
+}
+/** One page of the voices an audio provider lists from its account. */
+export async function listAudioVoices(provider: string, query: { search?: string; pageToken?: string } = {}): Promise<AudioVoicePage> {
+  const params = new URLSearchParams();
+  if (query.search?.trim()) params.set("search", query.search.trim());
+  if (query.pageToken) params.set("pageToken", query.pageToken);
+  return request(`/audio-providers/${encodeURIComponent(provider)}/voices${params.size ? `?${params}` : ""}`);
+}
+
+export async function saveVolcengineTtsDefaultVoiceId(defaultVoiceId: string | null): Promise<{ configured: boolean; defaultVoiceId?: string }> {
+  return request<{ configured: boolean; defaultVoiceId?: string }>("/settings/models/providers/volcengine-tts", {
+    method: "PUT",
+    body: JSON.stringify(defaultVoiceId ? { defaultVoiceId } : { defaultVoiceId: null }),
+  });
+}
+
+export interface VolcengineTtsPreviewInput {
+  /** The Doubao Speech model to test; speech synthesis when unset. Seed Audio reads the text as a description. */
+  model?: "seed-tts-2.0" | "seed-audio-1.0";
+  text: string;
+  voiceId?: string;
+  language?: string;
+  style?: string;
+  speed?: number;
+}
+
+export async function previewVolcengineTtsSpeech(input: VolcengineTtsPreviewInput): Promise<Blob> {
+  const response = await fetch(apiUrl("/settings/models/providers/volcengine-tts/preview"), {
+    method: "POST",
+    headers: { "content-type": "application/json", ...runtimeHeaders() },
+    body: JSON.stringify(input),
+  });
+  if (!response.ok) throw await responseError(response);
+  return response.blob();
+}
+
+export async function startModelProviderLogin(providerId: string, method: ModelAuthMethod): Promise<string> {
+  const result = await request<{ operationId: string }>(`/settings/models/providers/${encodeURIComponent(providerId)}/login`, {
+    method: "POST",
+    body: JSON.stringify({ method }),
+  });
+  return result.operationId;
+}
+
+export async function respondToModelAuth(operationId: string, promptId: string, value: string): Promise<void> {
+  await request(`/settings/model-auth/${encodeURIComponent(operationId)}/respond`, {
+    method: "POST",
+    body: JSON.stringify({ promptId, value }),
+  });
+}
+
+export async function cancelModelAuth(operationId: string): Promise<void> {
+  await request(`/settings/model-auth/${encodeURIComponent(operationId)}`, { method: "DELETE" });
+}
+
+export function subscribeToModelAuth(
+  operationId: string,
+  handlers: { onEvent: (event: ModelAuthEvent) => void; onError: () => void },
+): () => void {
+  const controller = new AbortController();
+  void streamModelAuthEvents(operationId, controller.signal, handlers);
+  return () => controller.abort();
+}
+
+export async function listImageModels(): Promise<ImageModel[]> {
+  return request("/image-models");
+}
+
+export async function listVideoModels(): Promise<VideoModel[]> {
+  return request("/video-models");
+}
+
+/** Image models grouped by connected provider, with the reason a provider has none. */
+export async function listImageModelCatalog(): Promise<ImageModelCatalog> {
+  return request("/image-models/catalog");
+}
+
+export async function setDefaultMediaModel(usage: MediaModelUsage, model?: AgentModelRef): Promise<void> {
+  const endpoint = usage === "image" ? "/image-models/default" : usage === "video" ? "/video-models/default" : usage === "3d" ? "/model3d-models/default" : `/audio-models/${usage}/default`;
+  await request(endpoint, model ? { method: "PUT", body: JSON.stringify(model) } : { method: "DELETE" });
+  notifyAgentModelsChanged();
+}
+
+export async function updateProjectMediaModelDefaults(projectId: string, defaults: MediaModelDefaults): Promise<ProjectState> {
+  return request(`/projects/${encodeURIComponent(projectId)}/settings/generation-models`, { method: "PUT", body: JSON.stringify(defaults) });
+}
+
+export async function listVideoModelCatalog(): Promise<MediaModelCatalog<VideoModel>> {
+  return request("/video-models/catalog");
+}
+
+export async function listAudioModelCatalog(): Promise<AudioModelCatalog> {
+  return request("/audio-models/catalog");
+}
+
+export async function listModel3DCatalog(): Promise<MediaModelCatalog<Model3DModel>> {
+  return request("/model3d-models/catalog");
+}
+
+/** Preset moves for rigged humanoids; empty until a 3D provider is set up. */
+export async function listModel3DAnimations(model?: AgentModelRef, options?: import("../shared/contracts.js").Model3DOptions): Promise<Model3DAnimationAction[]> {
+  const query = new URLSearchParams({ ...(model ? { provider: model.provider, id: model.id } : {}),
+    ...(options?.rigModel ? { rigModel: options.rigModel } : {}), ...(options?.rigType ? { rigType: options.rigType } : {}) });
+  return request(`/model3d-animations?${query}`);
+}
+export async function listModel3DOperations(): Promise<Model3DModel[]> { return request("/model3d-operations"); }
+export async function model3DBalance(model: AgentModelRef): Promise<import("../shared/contracts.js").Model3DBalance> {
+  return request(`/model3d-balance?${new URLSearchParams({ provider: model.provider, id: model.id })}`);
+}
+
+/** Settings › Agents › Instructions: the person's own instructions and OhMyGame's for each kind of project. */
+export async function getAgentInstructions(): Promise<AgentInstructionsView> {
+  return request("/settings/agent-instructions");
+}
+
+export async function setAgentInstructions(custom: string): Promise<AgentInstructionsView> {
+  return request("/settings/agent-instructions", { method: "PUT", body: JSON.stringify({ custom }) });
+}
+
+/** The browser settings every project shares, and why the saved ones can't be used if they can't. */
+export async function getBrowserSettings(): Promise<BrowserSettings & { problem?: string }> {
+  return request("/settings/browser");
+}
+
+export async function setBrowserSettings(settings: BrowserSettings): Promise<BrowserSettings> {
+  return request("/settings/browser", { method: "PUT", body: JSON.stringify(settings) });
+}
+
+/** A project's saved tabs and the sites visited in it. */
+export async function getProjectBrowser(projectId: string): Promise<ProjectBrowser & { problem?: string }> {
+  return request(`/projects/${encodeURIComponent(projectId)}/browser`);
+}
+
+export async function saveBrowserTabs(projectId: string, tabs: SavedBrowserTab[], active: string | undefined): Promise<void> {
+  await request(`/projects/${encodeURIComponent(projectId)}/browser/tabs`, { method: "PUT", body: JSON.stringify({ tabs, active }) });
+}
+
+/** The sites a project's plugins put on the new-tab page. */
+export async function getPluginBrowserShortcuts(projectId: string): Promise<PluginBrowserShortcut[]> {
+  return request(`/projects/${encodeURIComponent(projectId)}/plugin-browser-shortcuts?locale=${encodeURIComponent(language)}`);
+}
+
+/** Counts a page opening one of its installed plugin's panels toward the plugin's limit, or refuses it. */
+export async function authorizePluginPanelOpen(projectId: string, plugin: string, panel: string): Promise<void> {
+  await request(`/projects/${encodeURIComponent(projectId)}/plugin-panel-open`, { method: "POST", body: JSON.stringify({ plugin, panel }) });
+}
+
+export async function authorizePluginBrowserOpen(projectId: string, plugin: string): Promise<void> {
+  await request(`/projects/${encodeURIComponent(projectId)}/plugin-browser-open`, { method: "POST", body: JSON.stringify({ plugin }) });
+}
+
+export async function recordBrowserVisit(projectId: string, url: string, title: string): Promise<void> {
+  await request(`/projects/${encodeURIComponent(projectId)}/browser/visits`, { method: "POST", body: JSON.stringify({ url, title }) });
+}
+
+export async function clearBrowserVisits(projectId: string): Promise<void> {
+  await request(`/projects/${encodeURIComponent(projectId)}/browser/visits/all`, { method: "DELETE" });
+}
+
+export async function forgetBrowserVisit(projectId: string, url: string): Promise<void> {
+  await request(`/projects/${encodeURIComponent(projectId)}/browser/visits`, { method: "DELETE", body: JSON.stringify({ url }) });
+}
+
+/** What a conversation's agent is told, as its model last received it. */
+export async function getConversationInstructions(projectId: string, conversationId: string): Promise<ConversationInstructions> {
+  return request(`/projects/${encodeURIComponent(projectId)}/conversations/${encodeURIComponent(conversationId)}/instructions`);
+}
+
+export async function getWebSearchSettings(): Promise<WebSearchSettings> {
+  return request("/settings/web-search");
+}
+
+export async function updateWebSearchSettings(input: UpdateWebSearchSettings): Promise<WebSearchSettings> {
+  return request("/settings/web-search", { method: "PUT", body: JSON.stringify(input) });
+}
+
+/** Settings → General → Project location; no location means OhMyGame's own storage. */
+export async function getProjectLocation(): Promise<{ location?: string; storage?: string }> {
+  return request("/settings/project-location");
+}
+
+export async function setProjectLocation(location: string | undefined): Promise<{ location?: string; storage?: string }> {
+  return request("/settings/project-location", { method: "PUT", body: JSON.stringify({ location: location ?? null }) });
+}
+
+export async function getExternalAgentSettings(): Promise<ExternalAgentSettings> {
+  return request("/settings/external-agents");
+}
+
+export async function updateExternalAgentSettings(input: UpdateExternalAgentSettings): Promise<ExternalAgentSettings> {
+  return request("/settings/external-agents", { method: "PUT", body: JSON.stringify(input) });
+}
+
+export async function listExploreGames(accessToken?: string, options: CommunityGamesQuery = {}): Promise<CommunityGame[]> {
+  const query = new URLSearchParams({ metrics: "true" });
+  if (options.limit !== undefined) query.set("limit", String(options.limit));
+  if (options.excludeGameId) query.set("excludeGameId", options.excludeGameId);
+  return request(`/community/games?${query}`, { headers: communityHeaders(accessToken) });
+}
+
+export async function getExploreGame(gameId: string, accessToken?: string): Promise<CommunityGame> {
+  return request(`/community/games/${encodeURIComponent(gameId)}?metrics=true`, { headers: communityHeaders(accessToken) });
+}
+
+export async function getExploreGameCover(gameId: string, deploymentId: string, accessToken?: string): Promise<Blob | undefined> {
+  const response = await fetch(apiUrl(
+    `/community/games/${encodeURIComponent(gameId)}/deployments/${encodeURIComponent(deploymentId)}/cover`,
+  ), { headers: { ...runtimeHeaders(), ...communityHeaders(accessToken) } });
+  if (response.status === 404) return undefined;
+  if (!response.ok) throw await responseError(response);
+  return response.blob();
+}
+
+export function getCommunityProfile(authorId: string, accessToken?: string): Promise<CommunityProfile> {
+  return request(`/community/authors/${encodeURIComponent(authorId)}`, { headers: communityHeaders(accessToken) });
+}
+
+export function getMyCommunityGames(accessToken: string): Promise<CommunityProfile> {
+  return request("/community/me/games", { headers: communityHeaders(accessToken) });
+}
+
+export function setCommunityLike(gameId: string, accessToken: string | undefined, liked: boolean): Promise<CommunityGameStats> {
+  return request(`/community/games/${encodeURIComponent(gameId)}/like`, { method: "PUT", body: JSON.stringify({ accessToken, liked }) });
+}
+
+export function getCommunityComments(gameId: string, cursor?: string): Promise<CommunityCommentPage> {
+  const query = cursor ? `?${new URLSearchParams({ cursor })}` : "";
+  return request(`/community/games/${encodeURIComponent(gameId)}/comments${query}`);
+}
+
+export function addCommunityComment(gameId: string, accessToken: string, body: string): Promise<CreateCommunityCommentResult> {
+  return request(`/community/games/${encodeURIComponent(gameId)}/comments`, { method: "POST", body: JSON.stringify({ accessToken, body }) });
+}
+
+export function deleteCommunityComment(commentId: string, accessToken: string): Promise<void> {
+  return request(`/community/comments/${encodeURIComponent(commentId)}`, { method: "DELETE", body: JSON.stringify({ accessToken }) });
+}
+
+export function unpublishCommunityGame(gameId: string, accessToken: string): Promise<void> {
+  return request(`/community/games/${encodeURIComponent(gameId)}`, { method: "DELETE", body: JSON.stringify({ accessToken }) });
+}
+
+export function updateCommunityGame(gameId: string, accessToken: string, metadata: { title: string; description: string }): Promise<Pick<CommunityGame, "title" | "description">> {
+  return request(`/community/games/${encodeURIComponent(gameId)}`, { method: "PUT", body: JSON.stringify({ accessToken, ...metadata }) });
+}
+
+/** Renames a published game's page; the projects that published it learn the new address. */
+export function setCommunityGameName(gameId: string, accessToken: string, name: string): Promise<{ name?: string; pageUrl?: string }> {
+  return request(`/community/games/${encodeURIComponent(gameId)}/name`, { method: "PUT", body: JSON.stringify({ accessToken, name }) });
+}
+
+export function communityGameNameAvailability(name: string, gameId: string, accessToken: string): Promise<GameNameAvailability> {
+  return request(`/community/game-names/${encodeURIComponent(name)}?${new URLSearchParams({ gameId })}`, { headers: communityHeaders(accessToken) });
+}
+
+function communityHeaders(accessToken?: string): Record<string, string> {
+  return accessToken ? { "x-publish-access-token": accessToken } : {};
+}
+
+export async function getProjectPlugins(projectId: string): Promise<import("../shared/plugins.js").ProjectPluginsView> {
+  return request(`/projects/${encodeURIComponent(projectId)}/plugins?locale=${encodeURIComponent(language)}`);
+}
+
+/** A project type from GET /project-types: a core one, or `publisher/name:type` from a plugin. */
+export interface AvailableProjectType {
+  id: string;
+  title: string;
+  description?: string;
+  plugin?: { id: string; version: string };
+  /** What the type's plugin asks for that the person hasn't allowed yet. */
+  asks?: string[];
+}
+
+export async function listProjectTypes(): Promise<AvailableProjectType[]> {
+  return request(`/project-types?locale=${encodeURIComponent(language)}`);
+}
+
+/** Turns a plugin on in a project, at a version or its newest, or off. `id` is `publisher/name`. */
+export async function setProjectPlugin(projectId: string, id: string, on: boolean, version?: string): Promise<void> {
+  await request(`/projects/${encodeURIComponent(projectId)}/plugins/${pluginPath(id)}`, { method: "PUT", body: JSON.stringify(version ? { on, version } : { on }) });
+}
+
+/**
+ * Turns a plugin on in a project and allows it for its folder, keeping the
+ * version the project already uses. Says why it can't run there:
+ * `not-offered` when it doesn't suit the project, or the status it is left
+ * in; undefined once it runs.
+ */
+export async function turnOnProjectPlugin(projectId: string, id: string): Promise<"not-offered" | Exclude<import("../shared/plugins.js").ProjectPluginItem["status"], "active" | undefined> | undefined> {
+  const item = (await getProjectPlugins(projectId)).plugins.find((plugin) => plugin.id === id);
+  if (!item) return "not-offered";
+  if (item.status === "active") return undefined;
+  if (item.used && item.status !== "needs-approval") return item.status;
+  await setProjectPlugin(projectId, id, true, item.used && item.used !== item.version ? item.used : undefined);
+  return undefined;
+}
+
+/** Installed plugins, one row per version. */
+/** Themes of the plugins the person has on, for Settings › Appearance. */
+export async function listPluginThemes(): Promise<import("../shared/plugins.js").PluginTheme[]> {
+  return request(`/plugin-themes?locale=${encodeURIComponent(language)}`);
+}
+
+export async function listStorePlugins(): Promise<import("../shared/plugins.js").StorePlugin[]> {
+  return request(`/plugin-store/plugins?locale=${encodeURIComponent(language)}`);
+}
+
+/**
+ * Turns a plugin on or off in every project it suits, which allows what it
+ * asks for; projects that set it themselves keep that. Its themes and model
+ * providers follow it.
+ */
+export async function setStorePluginEveryProject(id: string, on: boolean): Promise<void> {
+  await request(`/plugin-store/${pluginPath(id)}/every-project`, { method: "PUT", body: JSON.stringify({ on }) });
+  // Its model providers come and go with it.
+  notifyAgentModelsChanged();
+  void syncPluginTheme(listPluginThemes, on ? undefined : id);
+}
+
+/** Starts a plugin again after it stopped from crashing too often. */
+export async function restartStorePlugin(id: string): Promise<void> {
+  await request(`/plugin-store/${pluginPath(id)}/restart`, { method: "POST" });
+}
+
+/** Copies a plugin made in the Plugin Builder into `<folder>/<name>`, as a package to publish under `publisher`. */
+export async function exportStorePlugin(id: string, publisher: string, folder: string): Promise<{ folder: string }> {
+  return request(`/plugin-store/${pluginPath(id)}/export`, { method: "POST", body: JSON.stringify({ publisher, folder }) });
+}
+
+/** A plugin's log since the app started, credentials redacted, and whether it is quarantined. */
+export function readPluginLog(id: string): Promise<PluginLogView> {
+  return request(`/plugin-store/${pluginPath(id)}/log`);
+}
+
+/** Adds a panel's uncaught error to its plugin's log. */
+export async function reportPluginPanelError(id: string, text: string): Promise<void> {
+  await request(`/plugin-store/${pluginPath(id)}/log`, { method: "POST", body: JSON.stringify({ text: text.slice(0, 4000) }) });
+}
+
+/** Whether the service started in safe mode, with no plugin running. */
+export function readPluginStatus(): Promise<{ safeMode: boolean }> {
+  return request("/plugin-store/status");
+}
+
+/** Newer packages where installed plugins came from; checked at startup and when the Plugins page opens. */
+export function readPluginUpdates(): Promise<PluginSourceUpdate[]> {
+  return request("/plugin-store/updates");
+}
+
+/** The projects using each installed version of a plugin. */
+export function readPluginUsage(id: string): Promise<Record<string, string[]>> {
+  return request(`/plugin-store/${pluginPath(id)}/usage`);
+}
+
+export function readPluginUninstall(id: string, version: string): Promise<PluginUninstallPreview> {
+  return request(`/plugin-store/${pluginPath(id)}/${encodeURIComponent(version)}/uninstall`);
+}
+
+/** Uninstalls a version; `keepData` keeps the last version's settings and data for a later install. */
+export async function uninstallStorePlugin(id: string, version: string, options: { keepData?: boolean } = {}): Promise<void> {
+  await request(`/plugin-store/${pluginPath(id)}/${encodeURIComponent(version)}${options.keepData ? "?keepData=true" : ""}`, { method: "DELETE" });
+  void syncPluginTheme(listPluginThemes, id);
+}
+
+export async function readStorePluginConfiguration(id: string): Promise<import("../shared/plugins.js").StorePluginConfiguration> {
+  return request(`/plugin-store/${pluginPath(id)}/configuration`);
+}
+
+export function readPluginSettingsStatus(id: string, signal?: AbortSignal): Promise<import("../shared/plugin-settings.js").PluginSettingsStatus> {
+  return request(`/plugin-store/${pluginPath(id)}/settings-status?locale=${encodeURIComponent(language)}`, { signal });
+}
+
+export function runPluginSettingsAction(id: string, command: string): Promise<import("../shared/plugin-settings.js").PluginSettingsStatus> {
+  return request(`/plugin-store/${pluginPath(id)}/settings-actions/${encodeURIComponent(command)}?locale=${encodeURIComponent(language)}`, { method: "POST" });
+}
+
+export function testPluginMcpServer(id: string, server: string): Promise<import("../shared/plugins.js").PluginMcpResult> {
+  return request(`/plugin-store/${pluginPath(id)}/mcp-servers/${encodeURIComponent(server)}/test?locale=${encodeURIComponent(language)}`, { method: "POST" });
+}
+
+/** Saves some settings; `null` puts one back to its default. */
+export async function saveStorePluginConfiguration(id: string, changes: Record<string, string | boolean | null>): Promise<import("../shared/plugins.js").StorePluginConfiguration> {
+  return request(`/plugin-store/${pluginPath(id)}/configuration`, { method: "PUT", body: JSON.stringify(changes) });
+}
+
+function pluginPath(id: string): string {
+  return id.split("/").map(encodeURIComponent).join("/");
+}
+
+export async function getHomeComposerCapabilities(): Promise<ConversationCapabilities> {
+  return request(`/composer/capabilities?locale=${encodeURIComponent(language)}`);
+}
+
+/** Reads a package without adding it, for the person to review. */
+/** The market's plugins, in the app's language. It never fails the page: no index just lists nothing. */
+export async function readPluginMarket(): Promise<import("../shared/plugins.js").PluginMarketListing> {
+  return request(`/plugin-market?locale=${encodeURIComponent(language)}`);
+}
+/** Where Discover reads from: the main index and any others. */
+export async function getPluginMarketSettings(): Promise<import("../shared/plugins.js").PluginMarketSettings> {
+  return request("/settings/plugin-market");
+}
+export async function setPluginMarketSettings(settings: { index: string; extra: string[] }): Promise<import("../shared/plugins.js").PluginMarketSettings> {
+  return request("/settings/plugin-market", { method: "PUT", body: JSON.stringify(settings) });
+}
+
+export async function inspectAddedPlugin(source: import("../shared/plugins.js").PluginAddSource): Promise<import("../shared/plugins.js").PluginAddPreview> {
+  return request(`/plugin-sources/inspect?locale=${encodeURIComponent(language)}`, { method: "POST", body: JSON.stringify({ source }) });
+}
+
+export async function addPlugin(source: import("../shared/plugins.js").PluginAddSource, digest: string): Promise<{ id: string; version: string }> {
+  const added = await request<{ id: string; version: string }>("/plugin-sources/install", { method: "POST", body: JSON.stringify({ source, digest }) });
+  void syncPluginTheme(listPluginThemes);
+  return added;
+}
+
+export async function inspectPluginFile(file: Blob): Promise<import("../shared/plugins.js").PluginAddPreview> {
+  return uploadPluginPackage(`/plugin-sources/file/inspect?locale=${encodeURIComponent(language)}`, file);
+}
+
+export async function addPluginFile(file: Blob, digest: string): Promise<{ id: string; version: string }> {
+  const added = await uploadPluginPackage<{ id: string; version: string }>(`/plugin-sources/file/install?digest=${encodeURIComponent(digest)}`, file);
+  void syncPluginTheme(listPluginThemes);
+  return added;
+}
+
+export async function readPluginSkill(pluginId: string, skillId: string): Promise<PluginSkillContent> {
+  return request(`/plugins/${encodeURIComponent(pluginId)}/skill-content?id=${encodeURIComponent(skillId)}`);
+}
+
+
+export async function startToolJob(toolId: ToolId, input: RunToolRequest, title?: string, context?: ToolJobContext): Promise<ToolJob> {
+  return request(`/tools/${toolId}/jobs`, { method: "POST", body: JSON.stringify({ ...input, ...(title ? { title } : {}), ...(context ? { projectId: context.projectId, nodeId: context.nodeId } : {}) }) });
+}
+
+export async function listToolJobs(): Promise<ToolJob[]> {
+  return request("/tool-jobs");
+}
+
+export async function cancelToolJob(jobId: string): Promise<ToolJob> {
+  return request(`/tool-jobs/${encodeURIComponent(jobId)}/cancel`, { method: "POST" });
+}
+
+export async function retryToolJob(jobId: string): Promise<ToolJob> {
+  return request(`/tool-jobs/${encodeURIComponent(jobId)}/retry`, { method: "POST" });
+}
+
+export async function publishProject(projectId: string, accessToken: string, metadata: Omit<PublishProjectRequest, "accessToken">): Promise<PublishResult> {
+  const body: PublishProjectRequest = { accessToken, ...metadata };
+  return request(`/projects/${projectId}/publish`, { method: "POST", body: JSON.stringify(body) });
+}
+
+/**
+ * A ZIP of the redacted desktop logs and system information, for bug reports.
+ * When the background service cannot build it, the desktop app builds one
+ * with the logs and the service's status.
+ */
+/** Token use of OhMyGame's agent across projects, by day, project and model. */
+export async function getUsageStats(): Promise<UsageStats> {
+  return request("/usage");
+}
+
+export async function exportDiagnostics(): Promise<{ blob: Blob; fileName: string }> {
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), 15_000);
+  try {
+    const response = await fetch(apiUrl("/diagnostics/export"), { method: "POST", headers: runtimeHeaders(), signal: controller.signal });
+    if (!response.ok) throw await responseError(response);
+    const fileName = /filename="([^"]+)"/.exec(response.headers.get("content-disposition") ?? "")?.[1];
+    return { blob: await response.blob(), fileName: fileName ?? diagnosticsFileName(new Date()) };
+  } catch (cause) {
+    const desktopExport = window.ohMyGameDesktop?.exportDiagnostics;
+    if (!desktopExport) throw cause;
+    const bytes = await desktopExport();
+    return { blob: new Blob([bytes], { type: "application/zip" }), fileName: diagnosticsFileName(new Date()) };
+  } finally {
+    window.clearTimeout(timeout);
+  }
+}
+
+/** Downloads the game as it publishes, to host on another site. */
+export async function buildWebGame(projectId: string, version?: string): Promise<Blob> {
+  const response = await fetch(apiUrl(`/projects/${encodeURIComponent(projectId)}/build`), {
+    method: "POST",
+    headers: projectRuntimeHeaders(projectId, version),
+  });
+  if (!response.ok) throw await responseError(response);
+  return response.blob();
+}
+
+export async function waitForRuntime(timeoutMs = 10_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      await request<{ status: "ok" }>("/health");
+      return;
+    } catch {
+      await delay(200);
+    }
+  }
+  throw new Error(t("api.runtimeUnreachable"));
+}
+
+export async function getProject(projectId: string): Promise<ProjectState> {
+  return request(`/projects/${projectId}`);
+}
+
+export async function ensureProjectPreview(projectId: string): Promise<{ url: string; title: string }> {
+  return request(`/projects/${encodeURIComponent(projectId)}/preview?reuse=1`, { method: "POST" });
+}
+
+/** Whether an Interactive Story plays as its own page, or must be upgraded first. */
+export async function getStoryUpgrade(projectId: string): Promise<StoryUpgradeStatus> {
+  return request(`/projects/${projectId}/interactive-story/upgrade`);
+}
+
+export async function upgradeStory(projectId: string): Promise<StoryUpgradeResult> {
+  return request(`/projects/${projectId}/interactive-story/upgrade`, { method: "POST" });
+}
+
+export async function copyStoryLibraryMedia(projectId: string): Promise<StoryLibraryMediaResult> {
+  return request(`/projects/${projectId}/interactive-story/library-media`, { method: "POST" });
+}
+
+export async function getNodeRuntime(projectId: string): Promise<NodeRuntimeResponse> {
+  return request(`/projects/${projectId}/playable`);
+}
+
+export async function getNodeCodebase(projectId: string): Promise<NodeCodebaseDetail> {
+  return request(`/projects/${projectId}/playable/codebase`);
+}
+
+export async function getPlayableValidation(
+  projectId: string,
+  mode: "draft" | "publish" = "draft",
+): Promise<PlayableProjectValidation> {
+  return request(`/projects/${projectId}/playable/validation?mode=${mode}`);
+}
+
+export async function listPlayablePresets(): Promise<{ presets: PlayablePresetSummary[] }> {
+  return request("/playable/presets");
+}
+
+export async function addPlayableNode(
+  projectId: string,
+  body: { preset: string; id: string; title?: string; position?: { x: number; y: number } },
+  version?: string,
+): Promise<PlayableAddedNode> {
+  return request(`/projects/${projectId}/playable/nodes`, {
+    method: "POST",
+    body: JSON.stringify(body),
+    workspaceVersion: version,
+  });
+}
+
+export async function listPlayableThumbnails(projectId: string): Promise<PlayableThumbnailManifest> {
+  const { thumbnails } = await request<{ thumbnails: PlayableThumbnailManifest }>(`/projects/${projectId}/playable/thumbnails`);
+  return thumbnails;
+}
+
+export async function getPlayableThumbnail(projectId: string, nodeId: string): Promise<Blob | undefined> {
+  const response = await fetch(apiUrl(`/projects/${projectId}/playable/thumbnails/${encodeURIComponent(nodeId)}`), { headers: runtimeHeaders() });
+  if (response.status === 404) return undefined;
+  if (!response.ok) throw await responseError(response);
+  return response.blob();
+}
+
+export async function setPlayableThumbnail(projectId: string, nodeId: string, hash: string, image: Blob, version?: string): Promise<void> {
+  const response = await fetch(apiUrl(`/projects/${projectId}/playable/thumbnails/${encodeURIComponent(nodeId)}?hash=${encodeURIComponent(hash)}`), {
+    method: "PUT",
+    headers: { "content-type": "image/webp", ...projectRuntimeHeaders(projectId, version) },
+    body: image,
+  });
+  if (!response.ok) throw await responseError(response);
+}
+
+/** Rejects with status 409 when the project changed since `codebase.revision` was read. */
+export async function updateNodeCodebase(
+  projectId: string,
+  codebase: NodeCodebaseUpdate & { revision: string },
+  version?: string,
+): Promise<{ revision: string }> {
+  return request(`/projects/${projectId}/playable/codebase`, {
+    method: "PUT",
+    workspaceVersion: version,
+    body: JSON.stringify(codebase),
+  });
+}
+
+export async function getProjectCover(projectId: string): Promise<Blob | undefined> {
+  const response = await fetch(apiUrl(`/projects/${projectId}/cover`), { headers: runtimeHeaders() });
+  if (response.status === 404) return undefined;
+  if (!response.ok) throw await responseError(response);
+  return response.blob();
+}
+
+export async function getProjectCoverState(projectId: string): Promise<ProjectCoverState> {
+  return request(`/projects/${projectId}/cover/state`);
+}
+
+export async function setProjectCover(projectId: string, cover: Blob, source: ProjectCoverMode = "custom"): Promise<void> {
+  const suffix = source === "auto" ? "?source=auto" : "";
+  const response = await fetch(apiUrl(`/projects/${projectId}/cover${suffix}`), {
+    method: "PUT",
+    headers: { "content-type": "image/webp", ...projectRuntimeHeaders(projectId) },
+    body: cover,
+  });
+  if (!response.ok) throw await responseError(response);
+}
+
+export async function setProjectCoverMode(projectId: string, mode: ProjectCoverMode): Promise<void> {
+  await request(`/projects/${projectId}/cover/state`, { method: "PUT", body: JSON.stringify({ mode }) });
+}
+
+export async function setProjectAppearance(projectId: string, appearance: Omit<ProjectAppearance, "logo">): Promise<ProjectState> {
+  return request(`/projects/${projectId}/appearance`, { method: "PUT", body: JSON.stringify(appearance) });
+}
+
+export async function getProjectLogo(projectId: string): Promise<Blob | undefined> {
+  const response = await fetch(apiUrl(`/projects/${projectId}/logo`), { headers: runtimeHeaders() });
+  if (response.status === 404) return undefined;
+  if (!response.ok) throw await responseError(response);
+  return response.blob();
+}
+
+export async function setProjectLogo(projectId: string, logo: Blob | undefined): Promise<ProjectState> {
+  const response = await fetch(apiUrl(`/projects/${projectId}/logo`), logo
+    ? { method: "PUT", headers: { "content-type": "image/webp", ...projectRuntimeHeaders(projectId) }, body: logo }
+    : { method: "DELETE", headers: projectRuntimeHeaders(projectId) });
+  if (!response.ok) throw await responseError(response);
+  return response.json() as Promise<ProjectState>;
+}
+
+export async function listWorkspaceFiles(projectId: string, directory?: string): Promise<WorkspaceFile[]> {
+  return request(`/projects/${projectId}/files${directory === undefined ? "" : `?directory=${encodeURIComponent(directory)}`}`);
+}
+
+export async function getWorkspaceGitChanges(projectId: string): Promise<WorkspaceGitChanges> {
+  return request(`/projects/${encodeURIComponent(projectId)}/git/changes`);
+}
+
+export async function getWorkspaceGitFile(projectId: string, filePath: string): Promise<WorkspaceGitFileView> {
+  return request(`/projects/${encodeURIComponent(projectId)}/git/file?path=${encodeURIComponent(filePath)}`);
+}
+
+export async function createWorkspaceEntry(projectId: string, parent: string, name: string, kind: "file" | "folder"): Promise<{ path: string }> {
+  return request(`/projects/${encodeURIComponent(projectId)}/files`, { method: "POST", body: JSON.stringify({ parent, name, kind }) });
+}
+
+export async function renameWorkspaceEntry(projectId: string, filePath: string, name: string): Promise<{ path: string }> {
+  return request(`/projects/${encodeURIComponent(projectId)}/files?path=${encodeURIComponent(filePath)}`, { method: "PATCH", body: JSON.stringify({ name }) });
+}
+
+export async function deleteWorkspaceEntry(projectId: string, filePath: string): Promise<void> {
+  await request(`/projects/${encodeURIComponent(projectId)}/files?path=${encodeURIComponent(filePath)}`, { method: "DELETE" });
+}
+
+export async function saveProjectAssetToLibrary(projectId: string, filePath: string): Promise<LibraryAsset> {
+  return request(`/projects/${encodeURIComponent(projectId)}/assets/library?path=${encodeURIComponent(filePath)}`, { method: "POST" });
+}
+
+export async function listLibraryAssets(): Promise<LibraryAssetSummary[]> {
+  return request("/library/assets");
+}
+
+export async function createLibraryImage(input: CreateLibraryImageRequest): Promise<LibraryAsset> {
+  return request("/library/assets", { method: "POST", body: JSON.stringify(input) });
+}
+
+export interface LibraryUploadOptions {
+  duration?: number;
+  purpose?: LibraryAssetPurpose;
+  /** The Library video or audio an upload was cut from. */
+  derivedFrom?: LibraryAssetDerivation;
+  /** Show it on the Library page. Without it, the upload is only stored for the project that uses it. */
+  saved?: boolean;
+}
+
+export async function uploadLibraryAsset(file: File, mediaType: LibraryUploadMediaType, { duration, purpose, derivedFrom, saved }: LibraryUploadOptions = {}): Promise<LibraryAsset> {
+  const query = new URLSearchParams({ name: file.name, mediaType });
+  if (duration !== undefined) query.set("duration", String(duration));
+  if (purpose !== undefined) query.set("purpose", purpose);
+  if (saved) query.set("saved", "true");
+  if (derivedFrom) {
+    query.set("trimSource", derivedFrom.assetId);
+    query.set("trimStart", String(derivedFrom.trim.start));
+    query.set("trimEnd", String(derivedFrom.trim.end));
+  }
+  return request(`/library/assets/upload?${query}`, {
+    method: "POST",
+    headers: { "content-type": "application/octet-stream" },
+    body: file,
+  });
+}
+
+/** Copies a file that is not a document, table or media asset into the project's `assets/files/` folder. */
+export async function importCanvasFile(projectId: string, file: File, directory?: string): Promise<{ path: string }> {
+  return request(`/projects/${encodeURIComponent(projectId)}/canvas/files?${new URLSearchParams({ name: file.name, ...(directory ? { directory } : {}) })}`, {
+    method: "POST",
+    headers: { "content-type": "application/octet-stream" },
+    body: file,
+  });
+}
+
+/** Creates an `assets/files/` folder for a folder imported on the canvas; a repeated name gets a suffix. */
+export async function createCanvasImportFolder(projectId: string, name: string): Promise<{ path: string }> {
+  return request(`/projects/${encodeURIComponent(projectId)}/canvas/folders`, { method: "POST", body: JSON.stringify({ name }) });
+}
+
+export async function getLibraryAsset(assetId: string): Promise<Blob> {
+  const response = await fetch(apiUrl(`/library/assets/${encodeURIComponent(assetId)}/content`), { headers: runtimeHeaders() });
+  if (!response.ok) throw await responseError(response);
+  return response.blob();
+}
+
+/** Copies a Library asset into the project's `assets/imported/` folder; sending the same asset again returns the existing file. */
+export async function addLibraryAssetToProject(projectId: string, assetId: string): Promise<{ path: string; assetId: string }> {
+  return request(`/projects/${encodeURIComponent(projectId)}/library-assets/${encodeURIComponent(assetId)}`, { method: "POST" });
+}
+
+export async function renameLibraryAsset(assetId: string, name: string): Promise<LibraryAsset> {
+  return request(`/library/assets/${encodeURIComponent(assetId)}`, { method: "PATCH", body: JSON.stringify({ name }) });
+}
+
+/** The Library's sources from plugins, shown as tabs beside Local. */
+export async function listLibrarySources(): Promise<LibrarySource[]> {
+  return request(`/library/sources?locale=${encodeURIComponent(language)}`);
+}
+
+export async function searchLibrarySource(search: LibrarySourceSearchRequest, signal?: AbortSignal): Promise<LibrarySourceResults> {
+  return request("/library/sources/search", { method: "POST", body: JSON.stringify(search), ...(signal ? { signal } : {}) });
+}
+
+/** Fetches a source's result and puts it in the Library; adding it again returns the same asset. */
+/** Adds a source's result to the Library, with the credit it showed for a source whose download gives none. */
+export async function addLibrarySourceItem(source: string, item: Pick<LibrarySourceItem, "id" | "mediaType" | "author" | "license" | "url">): Promise<LibraryAsset> {
+  const { id, mediaType, author, license, url } = item;
+  return request("/library/sources/add", { method: "POST", body: JSON.stringify({ source, id, mediaType, ...(author ? { author } : {}), ...(license ? { license } : {}), ...(url ? { url } : {}) }) });
+}
+
+/** Takes an asset out of the Library; projects that use it keep it, and its file goes only when none does. */
+export async function removeLibraryAsset(assetId: string): Promise<void> {
+  await request(`/library/assets/${encodeURIComponent(assetId)}`, { method: "DELETE" });
+}
+
+export async function getWorkspaceFile(projectId: string, filePath: string): Promise<WorkspaceFileContent> {
+  return request(`/projects/${projectId}/files/content?path=${encodeURIComponent(filePath)}`);
+}
+
+export async function getConversationImage(url: string, signal?: AbortSignal): Promise<Blob> {
+  if (!/^\/projects\/[^/]+\/conversation-images\/[a-f0-9]{64}\.(png|jpg|webp|gif)$/.test(url)) {
+    throw new Error("Invalid conversation image reference");
+  }
+  const response = await fetch(apiUrl(url), { headers: runtimeHeaders(), signal });
+  if (!response.ok) throw await responseError(response);
+  return response.blob();
+}
+
+export async function getWorkspaceAsset(projectId: string, filePath: string): Promise<Blob> {
+  const response = await fetch(apiUrl(`/projects/${projectId}/files/raw?path=${encodeURIComponent(filePath)}`), {
+    headers: runtimeHeaders(),
+  });
+  if (!response.ok) throw await responseError(response);
+  return response.blob();
+}
+
+export async function listConversations(projectId: string): Promise<ConversationSummary[]> {
+  return request(`/projects/${projectId}/conversations`);
+}
+
+export async function createConversation(
+  projectId: string,
+  model?: AgentModelRef,
+  reasoningLevel?: AgentReasoningLevel,
+): Promise<ConversationSummary> {
+  return request(`/projects/${projectId}/conversations`, {
+    method: "POST",
+    body: JSON.stringify({ ...(model ? { model: modelRef(model) } : {}), ...(reasoningLevel ? { reasoningLevel } : {}) }),
+  });
+}
+
+export async function branchConversation(projectId: string, conversationId: string, entryId: string): Promise<ConversationSummary> {
+  return request(`/projects/${projectId}/conversations/${conversationId}/branch`, { method: "POST", body: JSON.stringify({ entryId }) });
+}
+
+export async function getConversation(projectId: string, conversationId: string, reset = false): Promise<ConversationDetail> {
+  return request(`/projects/${projectId}/conversations/${conversationId}${reset ? "?reset=1" : ""}`);
+}
+
+export async function renameConversation(
+  projectId: string,
+  conversationId: string,
+  title: string,
+): Promise<ConversationSummary> {
+  return request(`/projects/${projectId}/conversations/${conversationId}`, {
+    method: "PATCH",
+    body: JSON.stringify({ title }),
+  });
+}
+
+export async function archiveConversation(projectId: string, conversationId: string): Promise<void> {
+  await request(`/projects/${projectId}/conversations/${conversationId}/archive`, { method: "POST" });
+}
+
+export async function listArchivedConversations(projectId: string): Promise<ConversationSummary[]> {
+  return request(`/projects/${projectId}/conversations/archived`);
+}
+
+export async function unarchiveConversation(projectId: string, conversationId: string): Promise<ConversationSummary> {
+  return request(`/projects/${projectId}/conversations/${conversationId}/unarchive`, { method: "POST" });
+}
+
+export async function deleteArchivedConversation(projectId: string, conversationId: string): Promise<void> {
+  await request(`/projects/${projectId}/conversations/archived/${conversationId}`, { method: "DELETE" });
+}
+
+export async function setConversationModel(
+  projectId: string,
+  conversationId: string,
+  model: AgentModelRef,
+): Promise<ConversationAgentSettings> {
+  return request(`/projects/${projectId}/conversations/${conversationId}/model`, {
+    method: "PUT",
+    body: JSON.stringify(modelRef(model)),
+  });
+}
+
+export function setConversationReasoning(projectId: string, conversationId: string, level: AgentReasoningLevel): Promise<AgentReasoningLevel>;
+export function setConversationReasoning(projectId: string, conversationId: string, level: string): Promise<string>;
+export async function setConversationReasoning(projectId: string, conversationId: string, level: string): Promise<string> {
+  const result = await request<{ level: string }>(`/projects/${projectId}/conversations/${conversationId}/reasoning`, {
+    method: "PUT",
+    body: JSON.stringify({ level }),
+  });
+  return result.level;
+}
+
+export async function startPreview(projectId: string, reinstall = false): Promise<{ url: string }> {
+  return request(`/projects/${projectId}/preview${reinstall ? "?reinstall=1" : ""}`, { method: "POST" });
+}
+
+export async function sendPrompt(
+  projectId: string,
+  conversationId: string,
+  prompt: string,
+  references: PromptReference[] = [],
+  images: PromptImage[] = [],
+  mode: PromptMode = "normal",
+  mentions: PluginMention[] = [],
+  attachments: PromptAttachment[] = [],
+  contexts: PromptContext[] = [],
+): Promise<PromptResponse> {
+  // The language is for what the app says back, such as a project that isn't set up yet.
+  return request(`/projects/${projectId}/conversations/${conversationId}/turns?locale=${encodeURIComponent(language)}`, {
+    method: "POST",
+    body: JSON.stringify({ prompt, ...(mode === "planning" ? { mode } : {}), ...(mentions.length ? { mentions } : {}), ...(references.length ? { references } : {}), ...(images.length ? { images } : {}), ...(attachments.length ? { attachments: attachments.map(({ id, batchId }) => ({ id, batchId })) } : {}), ...(contexts.length ? { contexts } : {}) }),
+  });
+}
+
+export async function uploadProjectAttachment(
+  projectId: string,
+  batchId: string,
+  file: File,
+  relativePath?: string,
+): Promise<PromptAttachment> {
+  const query = new URLSearchParams({ batchId, name: file.name });
+  if (relativePath) query.set("relativePath", relativePath);
+  const response = await fetch(apiUrl(`/projects/${encodeURIComponent(projectId)}/attachments?${query}`), {
+    method: "POST",
+    headers: { "content-type": "application/vnd.ohmygame.attachment", ...projectRuntimeHeaders(projectId) },
+    body: file,
+  });
+  if (!response.ok) throw await responseError(response);
+  return response.json() as Promise<PromptAttachment>;
+}
+
+export async function compactConversation(projectId: string, conversationId: string, instructions?: string): Promise<void> {
+  await request(`/projects/${projectId}/conversations/${conversationId}/compact`, {
+    method: "POST",
+    body: JSON.stringify(instructions?.trim() ? { instructions: instructions.trim() } : {}),
+  });
+}
+
+/** `passive` reads what is known without loading the conversation's agent session. */
+export async function getConversationContextUsage(projectId: string, conversationId: string, passive = false): Promise<AgentContextUsage | undefined> {
+  const result = await request<{ contextUsage?: AgentContextUsage }>(`/projects/${projectId}/conversations/${conversationId}/context-usage${passive ? "?passive=1" : ""}`);
+  return result.contextUsage;
+}
+
+export async function getConversationCapabilities(projectId: string, conversationId: string): Promise<ConversationCapabilities> {
+  return request(`/projects/${projectId}/conversations/${conversationId}/capabilities?locale=${encodeURIComponent(language)}`);
+}
+
+export async function approvePlan(projectId: string, conversationId: string): Promise<PromptResponse> {
+  return request(`/projects/${projectId}/conversations/${conversationId}/plan/approve`, { method: "POST" });
+}
+
+export async function cancelPlan(projectId: string, conversationId: string): Promise<void> {
+  await request(`/projects/${projectId}/conversations/${conversationId}/plan`, { method: "DELETE" });
+}
+
+export async function refinePlan(projectId: string, conversationId: string): Promise<void> {
+  await request(`/projects/${projectId}/conversations/${conversationId}/plan/refine`, { method: "POST" });
+}
+
+export async function answerQuestionnaire(
+  projectId: string,
+  conversationId: string,
+  response: AnswerQuestionnaireRequest,
+): Promise<void> {
+  await request(`/projects/${projectId}/conversations/${conversationId}/questionnaire`, {
+    method: "POST",
+    body: JSON.stringify(response),
+  });
+}
+
+export async function reviseLastPrompt(
+  projectId: string,
+  conversationId: string,
+  prompt: string,
+): Promise<PromptResponse> {
+  return request(`/projects/${projectId}/conversations/${conversationId}/revise-last`, {
+    method: "POST",
+    body: JSON.stringify({ prompt }),
+  });
+}
+
+/** Lists the files the turn of the checkpoint's message changed. */
+export async function getCheckpointChanges(projectId: string, conversationId: string, checkpointId: string): Promise<CheckpointChangeItem[]> {
+  const { changes } = await request<{ changes: CheckpointChangeItem[] }>(`/projects/${projectId}/conversations/${conversationId}/checkpoints/${encodeURIComponent(checkpointId)}/changes`);
+  return changes;
+}
+
+/** Reads one of those files as it was before the turn and as the turn left it. */
+export async function getCheckpointFile(projectId: string, conversationId: string, checkpointId: string, filePath: string): Promise<CheckpointFileView> {
+  return request(`/projects/${projectId}/conversations/${conversationId}/checkpoints/${encodeURIComponent(checkpointId)}/file?path=${encodeURIComponent(filePath)}`);
+}
+
+/**
+ * Takes back the file changes of one turn and keeps the conversation. Without
+ * `conflicts` it rejects with status 409 and the paths in `ApiError.conflicts`
+ * when files were changed again after the turn. To overwrite them, `expected`
+ * names the paths the user was shown; it rejects the same way when other files
+ * were changed by now.
+ */
+export async function undoCheckpoint(projectId: string, conversationId: string, checkpointId: string, conflicts?: CheckpointUndoRequest["conflicts"], expected?: string[]): Promise<CheckpointUndoResponse> {
+  return changeCheckpointFiles("undo", projectId, conversationId, checkpointId, conflicts, expected);
+}
+
+/** Reapplies only undone paths, with the same conflict checks as Undo. */
+export async function reapplyCheckpoint(projectId: string, conversationId: string, checkpointId: string, conflicts?: CheckpointUndoRequest["conflicts"], expected?: string[]): Promise<CheckpointUndoResponse> {
+  return changeCheckpointFiles("reapply", projectId, conversationId, checkpointId, conflicts, expected);
+}
+
+function changeCheckpointFiles(direction: "undo" | "reapply", projectId: string, conversationId: string, checkpointId: string, conflicts?: CheckpointUndoRequest["conflicts"], expected?: string[]): Promise<CheckpointUndoResponse> {
+  return request(`/projects/${projectId}/conversations/${conversationId}/checkpoints/${encodeURIComponent(checkpointId)}/${direction}`, {
+    method: "POST",
+    body: JSON.stringify({ conflicts, expected } satisfies CheckpointUndoRequest),
+  });
+}
+
+/** Whether a restore or an undo was cut off and may have left the project's files partly changed. */
+export async function getUnfinishedRestore(projectId: string): Promise<boolean> {
+  const { unfinished } = await request<{ unfinished: boolean }>(`/projects/${projectId}/checkpoints/unfinished`);
+  return unfinished;
+}
+
+/**
+ * Lists what putting the files back after a restore or an undo that was cut
+ * off would do: "added" brings a file back, "removed" takes it away. The
+ * items say nothing about how a file stands.
+ */
+export async function getUnfinishedChanges(projectId: string): Promise<CheckpointChangeItem[]> {
+  const { changes } = await request<{ changes: CheckpointChangeItem[] }>(`/projects/${projectId}/checkpoints/unfinished/changes`);
+  return changes;
+}
+
+/** Puts the files back as they were before the restore or undo that was cut off. */
+export async function restoreUnfinished(projectId: string): Promise<void> {
+  return request(`/projects/${projectId}/checkpoints/unfinished/restore`, { method: "POST" });
+}
+
+export async function removePendingPrompt(projectId: string, conversationId: string, turnId: string): Promise<void> {
+  await request(`/projects/${projectId}/conversations/${conversationId}/queue/${turnId}`, { method: "DELETE" });
+}
+
+export async function steerPendingPrompt(projectId: string, conversationId: string, turnId: string): Promise<void> {
+  await request(`/projects/${projectId}/conversations/${conversationId}/queue/${turnId}/steer`, { method: "POST" });
+}
+
+export async function cancelPrompt(projectId: string, conversationId: string, turnId: string): Promise<void> {
+  await request(`/projects/${projectId}/conversations/${conversationId}/turns/${turnId}/cancel`, { method: "POST" });
+}
+
+export function subscribeToProject(
+  projectId: string,
+  cursor: number,
+  handlers: {
+    onEvent: (event: RuntimeEvent) => void;
+    onOpen: () => void;
+    onError: () => void;
+    onReset?: () => Promise<number>;
+  },
+): () => void {
+  const controller = new AbortController();
+  void streamProjectEvents(projectId, cursor, controller.signal, handlers);
+  return () => controller.abort();
+}
+
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly code?: string,
+    /** The workspace paths the request was refused for. */
+    readonly conflicts?: string[],
+    /** Those paths cannot be put back, whatever the request says to do with them. */
+    readonly blocked?: boolean,
+    /** The plugin panel, `publisher/name:panel`, that can resolve the refusal. */
+    readonly panel?: string,
+  ) {
+    super(message);
+  }
+}
+
+export async function request<T>(path: string, init: WorkspaceRequestInit = {}): Promise<T> {
+  const projectId = /^\/projects\/([^/?]+)/.exec(path)?.[1];
+  const observedVersion = projectId ? workspaceVersion(projectId) : undefined;
+  if (projectId && init.workspaceVersion !== undefined) assertWorkspaceVersion(projectId, init.workspaceVersion);
+  const response = await fetch(apiUrl(path), {
+    ...init,
+    headers: {
+      ...(init.body ? { "content-type": "application/json" } : {}),
+      ...runtimeHeaders(),
+      ...(projectId ? { "x-workspace-version": init.workspaceVersion ?? observedVersion! } : {}),
+      ...init.headers,
+    },
+  });
+  const version = response.headers.get("x-workspace-version");
+  if (projectId && version && (!init.method || init.method === "GET") && workspaceVersion(projectId) === observedVersion) observeWorkspaceVersion(projectId, version);
+  if (!response.ok) throw await responseError(response);
+  if (response.status === 204) return undefined as T;
+  return response.json() as Promise<T>;
+}
+
+async function responseError(response: Response): Promise<ApiError> {
+  const body = await response.json().catch(() => ({})) as { error?: string; message?: string; code?: string; conflicts?: unknown; blocked?: unknown; panel?: unknown };
+  const conflicts = Array.isArray(body.conflicts) && body.conflicts.every((path) => typeof path === "string") ? body.conflicts as string[] : undefined;
+  return new ApiError(mediaMigrationError(body.message ?? body.error ?? t("api.requestFailed", { status: response.status })), response.status, body.code, conflicts, body.blocked === true || undefined, typeof body.panel === "string" ? body.panel : undefined);
+}
+
+async function streamProjectEvents(
+  projectId: string,
+  initialCursor: number,
+  signal: AbortSignal,
+  handlers: {
+    onEvent: (event: RuntimeEvent) => void;
+    onOpen: () => void;
+    onError: () => void;
+    onReset?: () => Promise<number>;
+  },
+): Promise<void> {
+  let cursor = initialCursor;
+  let generation = runtimeConnection().generation;
+  while (!signal.aborted) {
+    const connection = new AbortController();
+    const unsubscribe = subscribeRuntimeConnection(() => connection.abort());
+    const connectionSignal = AbortSignal.any([signal, connection.signal]);
+    try {
+      const current = runtimeConnection();
+      if (current.status !== "ready") throw new Error(t("api.serviceUnavailable"));
+      if (current.generation !== generation) {
+        generation = current.generation;
+        cursor = handlers.onReset ? await handlers.onReset() : 0;
+      }
+      const response = await fetch(apiUrl(`/projects/${projectId}/events?cursor=${cursor}`), {
+        headers: { accept: "text/event-stream", ...runtimeHeaders() },
+        signal: connectionSignal,
+      });
+      if (response.status === 409 && handlers.onReset) {
+        cursor = await handlers.onReset();
+        continue;
+      }
+      if (!response.ok || !response.body) {
+        throw new ApiError(`Event stream failed with ${response.status}`, response.status);
+      }
+      handlers.onOpen();
+      await readEventBlocks(response.body, (block) => {
+        const event = parseRuntimeEvent(block);
+        if (!event || event.id <= cursor) return;
+        cursor = Math.max(cursor, event.id);
+        handlers.onEvent(event);
+      }, connectionSignal);
+      if (!signal.aborted) handlers.onError();
+    } catch {
+      if (signal.aborted) return;
+      handlers.onError();
+    }
+    finally { unsubscribe(); }
+    await reconnectDelay(signal);
+  }
+}
+
+async function streamModelAuthEvents(
+  operationId: string,
+  signal: AbortSignal,
+  handlers: { onEvent: (event: ModelAuthEvent) => void; onError: () => void },
+): Promise<void> {
+  let cursor = 0;
+  while (!signal.aborted) {
+    try {
+      const response = await fetch(apiUrl(`/settings/model-auth/${encodeURIComponent(operationId)}/events?cursor=${cursor}`), {
+        headers: { accept: "text/event-stream", ...runtimeHeaders() },
+        signal,
+      });
+      if (!response.ok || !response.body) throw new ApiError(`Authentication stream failed with ${response.status}`, response.status);
+      let finished = false;
+      await readEventBlocks(response.body, (block) => {
+        const event = parseModelAuthEvent(block);
+        if (!event) return;
+        if (event.type === "completed" || event.type === "cancelled" || event.type === "error") finished = true;
+        if (event.id <= cursor) return;
+        cursor = Math.max(cursor, event.id);
+        handlers.onEvent(event);
+      }, signal);
+      if (finished || signal.aborted) return;
+    } catch {
+      if (signal.aborted) return;
+      handlers.onError();
+    }
+    await reconnectDelay(signal);
+  }
+}
+
+/** Passes each complete event of a server-sent event stream until it ends or the signal aborts. */
+async function readEventBlocks(body: ReadableStream<Uint8Array>, onBlock: (block: string) => void, signal: AbortSignal): Promise<void> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  try {
+    while (!signal.aborted) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const blocks = buffer.split(/\r?\n\r?\n/);
+      buffer = blocks.pop() ?? "";
+      for (const block of blocks) {
+        if (signal.aborted) return;
+        onBlock(block);
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+function eventData(block: string): string {
+  return block.split(/\r?\n/)
+    .filter((line) => line.startsWith("data:"))
+    .map((line) => line.slice(5).trimStart())
+    .join("\n");
+}
+
+function parseRuntimeEvent(block: string): RuntimeEvent | undefined {
+  const fields = new Map<string, string[]>();
+  for (const line of block.split(/\r?\n/)) {
+    if (!line || line.startsWith(":")) continue;
+    const separator = line.indexOf(":");
+    const key = separator < 0 ? line : line.slice(0, separator);
+    const value = separator < 0 ? "" : line.slice(separator + 1).trimStart();
+    fields.set(key, [...(fields.get(key) ?? []), value]);
+  }
+  const type = fields.get("event")?.[0];
+  const data = fields.get("data")?.join("\n");
+  if (!type || !data || !RUNTIME_EVENT_TYPES.includes(type as (typeof RUNTIME_EVENT_TYPES)[number])) {
+    return undefined;
+  }
+  try {
+    return JSON.parse(data) as RuntimeEvent;
+  } catch {
+    return undefined;
+  }
+}
+
+function parseModelAuthEvent(block: string): ModelAuthEvent | undefined {
+  const data = eventData(block);
+  if (!data) return undefined;
+  try {
+    return JSON.parse(data) as ModelAuthEvent;
+  } catch {
+    return undefined;
+  }
+}
+
+function apiUrl(path: string): string {
+  const runtime = desktopRuntime();
+  return runtime ? `${runtime.daemonUrl}${path}` : `${API_BASE}${path}`;
+}
+
+function projectRuntimeHeaders(projectId: string, version = workspaceVersion(projectId)): HeadersInit {
+  assertWorkspaceVersion(projectId, version);
+  return { ...runtimeHeaders(), "x-workspace-version": version };
+}
+
+function runtimeHeaders(): HeadersInit {
+  const runtime = desktopRuntime();
+  return runtime ? { authorization: `Bearer ${runtime.token}` } : {};
+}
+
+function modelRef(model: AgentModelRef): AgentModelRef {
+  return { provider: model.provider, id: model.id };
+}
+
+function desktopRuntime(): DesktopRuntime | undefined {
+  const desktop = window.ohMyGameDesktop;
+  if (!desktop) return;
+  const state = runtimeConnection();
+  if (state.status !== "ready") throw new Error(t("api.serviceUnavailableLong"));
+  return state.runtime ? { daemonUrl: state.runtime.url, token: state.runtime.token } : desktop.runtime;
+}
+
+function reconnectDelay(signal: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    const onAbort = () => {
+      window.clearTimeout(timer);
+      resolve();
+    };
+    const timer = window.setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, 500);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
+}
+
+export async function listConnections(): Promise<import("../shared/connections.js").ConnectionSummary[]> {
+  return request("/connections");
+}
+export async function createConnection(input: import("../shared/connections.js").CreateConnectionRequest): Promise<import("../shared/connections.js").ConnectionSummary> {
+  return request("/connections", { method: "POST", body: JSON.stringify(input) });
+}
+export async function updateConnection(id: string, input: import("../shared/connections.js").UpdateConnectionRequest): Promise<import("../shared/connections.js").ConnectionSummary> {
+  return request(`/connections/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(input) });
+}
+export async function deleteConnection(id: string): Promise<void> {
+  await request(`/connections/${encodeURIComponent(id)}`, { method: "DELETE" });
+}
+export async function readConnectionDefinition(id: string): Promise<{ definition: import("../shared/plugins.js").McpServerDefinition }> {
+  return request(`/connections/${encodeURIComponent(id)}/definition`);
+}
+export async function saveConnectionDefinition(id: string, definition: import("../shared/plugins.js").McpServerDefinition): Promise<import("../shared/connections.js").ConnectionSummary> {
+  return request(`/connections/${encodeURIComponent(id)}/definition`, { method: "PUT", body: JSON.stringify({ definition }) });
+}
+export async function readConnectionConfiguration(id: string): Promise<import("../shared/plugins.js").PluginConfigurationView> {
+  return request(`/connections/${encodeURIComponent(id)}/configuration`);
+}
+export async function saveConnectionConfiguration(id: string, values: import("../shared/plugins.js").PluginConfigurationValues): Promise<import("../shared/plugins.js").PluginConfigurationView> {
+  return request(`/connections/${encodeURIComponent(id)}/configuration`, { method: "PUT", body: JSON.stringify({ values }) });
+}
+export async function testConnection(id: string, action: "test" | "auth-start" | "auth-complete" = "test", input?: string): Promise<import("../shared/plugins.js").PluginMcpResult> {
+  return request(`/connections/${encodeURIComponent(id)}/${action}`, { method: "POST", body: JSON.stringify(input ? { input } : {}) });
+}
+export async function createPluginSetup(pluginId?: string, mode?: import("../shared/plugin-setup.js").PluginSetupMode): Promise<import("../shared/plugin-setup.js").PluginSetupSummary> {
+  return request("/plugins/setup-sessions", { method: "POST", body: JSON.stringify({ pluginId, mode }) });
+}
+async function uploadPluginPackage<T>(route: string, file: Blob): Promise<T> {
+  const response = await fetch(apiUrl(route), { method: "POST", headers: { "content-type": "application/gzip", ...runtimeHeaders() }, body: file });
+  if (!response.ok) throw await responseError(response);
+  return response.json() as Promise<T>;
+}
+export async function readPluginSetup(id: string): Promise<import("../shared/plugin-setup.js").PluginSetupSummary> {
+  return request(`/plugins/setup-sessions/${encodeURIComponent(id)}`);
+}
+export async function deletePluginSetup(id: string): Promise<void> {
+  await request(`/plugins/setup-sessions/${encodeURIComponent(id)}`, { method: "DELETE" });
+}
+export async function listPluginSetups(): Promise<import("../shared/plugin-setup.js").PluginSetupSummary[]> {
+  return request("/plugins/setup-sessions");
+}
+export async function readPluginDraft(id: string): Promise<import("../shared/plugin-setup.js").PluginDraft> {
+  return request(`/plugins/setup-sessions/${encodeURIComponent(id)}/draft`);
+}
+export function updatePluginDraftIcon(id: string, input: import("../shared/plugin-setup.js").PluginIconUpdate): Promise<import("../shared/plugin-setup.js").PluginDraft> {
+  return request(`/plugins/setup-sessions/${encodeURIComponent(id)}/icon`, { method: "PUT", body: JSON.stringify(input) });
+}
+export async function readPluginIconImage(pluginId: string, setupId?: string, signal?: AbortSignal, previewPath?: string): Promise<Blob> {
+  const route = setupId ? `/plugins/setup-sessions/${encodeURIComponent(setupId)}/icon` : `/plugins/${encodeURIComponent(pluginId)}/icon`;
+  const suffix = setupId && previewPath ? `?${new URLSearchParams({ path: previewPath })}` : "";
+  const response = await fetch(apiUrl(`${route}${suffix}`), { headers: runtimeHeaders(), signal });
+  if (!response.ok) throw await responseError(response);
+  return response.blob();
+}
+/** The icon a plugin gives one of its model providers. */
+export async function readPluginAgentIcon(agentId: string, signal?: AbortSignal): Promise<Blob> {
+  const response = await fetch(apiUrl(`/plugin-agents/${encodeURIComponent(agentId)}/icon`), { headers: runtimeHeaders(), signal });
+  if (!response.ok) throw await responseError(response);
+  return response.blob();
+}
+export async function readPluginProviderIcon(providerId: string, signal?: AbortSignal): Promise<Blob> {
+  const response = await fetch(apiUrl(`/plugin-providers/${encodeURIComponent(providerId)}/icon`), { headers: runtimeHeaders(), signal });
+  if (!response.ok) throw await responseError(response);
+  return response.blob();
+}
+/** The icon or a screenshot the market lists for a plugin version, by its path in the package. */
+export async function readPluginMarketImage(path: string, role: "icon" | "screenshot", source: string | undefined, signal?: AbortSignal): Promise<Blob> {
+  const response = await fetch(apiUrl(`/plugin-market/images?${new URLSearchParams({ path, role, ...(source ? { source } : {}) })}`), { headers: runtimeHeaders(), signal });
+  if (!response.ok) throw await responseError(response);
+  return response.blob();
+}
+/** A market publisher's GitHub avatar, by GitHub's id for them. */
+export async function readPluginMarketAvatar(id: string, signal?: AbortSignal): Promise<Blob> {
+  const response = await fetch(apiUrl(`/plugin-market/avatars/${encodeURIComponent(id)}`), { headers: runtimeHeaders(), signal });
+  if (!response.ok) throw await responseError(response);
+  return response.blob();
+}
+/** One of an installed plugin's screenshots, by its place in the manifest. */
+export async function readPluginScreenshotImage(pluginId: string, index: number, signal?: AbortSignal): Promise<Blob> {
+  const response = await fetch(apiUrl(`/plugins/${encodeURIComponent(pluginId)}/screenshots/${index}`), { headers: runtimeHeaders(), signal });
+  if (!response.ok) throw await responseError(response);
+  return response.blob();
+}
+export async function readPluginDraftFile(id: string, path: string): Promise<{ path: string; content: string }> {
+  return request(`/plugins/setup-sessions/${encodeURIComponent(id)}/file?${new URLSearchParams({ path })}`);
+}
+export async function installPluginDraft(id: string, revision: string): Promise<import("../shared/plugin-setup.js").PluginSetupSummary> {
+  const state = await request<import("../shared/plugin-setup.js").PluginSetupSummary>(`/plugins/setup-sessions/${encodeURIComponent(id)}/install`, { method: "POST", body: JSON.stringify({ revision }) });
+  void syncPluginTheme(listPluginThemes);
+  return state;
+}
+export async function testPluginDraft(id: string, server: string, revision: string): Promise<import("../shared/plugins.js").PluginMcpResult> {
+  return request(`/plugins/setup-sessions/${encodeURIComponent(id)}/test/${encodeURIComponent(server)}`, { method: "POST", body: JSON.stringify({ revision }) });
+}
+/** Runs one of a draft's commands that runs its code, as its page asks in the preview. */
+export async function runDraftPageCommand(setupId: string, command: string, input?: unknown): Promise<{ result?: unknown; change?: { id: string; changed: string[] } }> {
+  return request(`/plugins/setup-sessions/${encodeURIComponent(setupId)}/page-commands`, { method: "POST", body: JSON.stringify(input === undefined ? { command } : { command, input }) });
+}
+/** Answers the workspace agent's request to see a draft's panel: the screenshot, or why there is none. */
+export async function answerDraftCapture(setupId: string, requestId: string, answer: { image: import("../shared/plugin-setup.js").PanelCapture } | { error: string }): Promise<void> {
+  await request(`/plugins/setup-sessions/${encodeURIComponent(setupId)}/captures/${encodeURIComponent(requestId)}`, { method: "POST", body: JSON.stringify(answer) });
+}
+/**
+ * Answers an agent's screenshot of a plugin panel: that this window took it,
+ * then the image or why there is none; or why it can't take it. False when
+ * nothing waits for it, as when another window took it first.
+ */
+export async function answerPluginPanelCapture(projectId: string, requestId: string, answer: { started: true } | { declined: string } | { image: import("../shared/plugin-setup.js").PanelCapture } | { error: string }): Promise<boolean> {
+  try {
+    await request(`/projects/${encodeURIComponent(projectId)}/plugin-panel-captures/${encodeURIComponent(requestId)}`, { method: "POST", body: JSON.stringify(answer) });
+    return true;
+  } catch (cause) {
+    if (cause instanceof ApiError && cause.status === 404) return false;
+    throw cause;
+  }
+}
+/**
+ * Answers a tool a plugin's panel page runs: that the page has the call,
+ * its progress, then its result or error. False when nothing waits for it,
+ * as when another window took the call or the caller gave up.
+ */
+export async function answerPluginPageTool(projectId: string, requestId: string, answer: { started: true } | { declined: string } | { progress: string } | { result: unknown } | { error: string }): Promise<boolean> {
+  try {
+    await request(`/projects/${encodeURIComponent(projectId)}/plugin-page-tools/${encodeURIComponent(requestId)}`, { method: "POST", body: JSON.stringify(answer) });
+    return true;
+  } catch (cause) {
+    if (cause instanceof ApiError && cause.status === 404) return false;
+    throw cause;
+  }
+}
+/** Lets a draft's native code run in its workspace, as it asks now; `key` is the one shown. */
+export async function allowPluginDraftRun(id: string, key: string): Promise<import("../shared/plugin-setup.js").PluginDraft> {
+  return request(`/plugins/setup-sessions/${encodeURIComponent(id)}/allow-run`, { method: "POST", body: JSON.stringify({ key }) });
+}
+/** Runs one of a draft's tools, commands or hooks in its workspace; what it changes can be undone. */
+export async function runPluginDraft(id: string, target: { tool: string } | { command: string } | { hook: string }, input?: unknown): Promise<import("../shared/plugin-setup.js").PluginDraftRun> {
+  return request(`/plugins/setup-sessions/${encodeURIComponent(id)}/run`, { method: "POST", body: JSON.stringify(input === undefined ? target : { ...target, input }) });
+}
+export async function stopPreview(projectId: string): Promise<{ preview: ProjectState["preview"] }> {
+  return request(`/projects/${projectId}/preview`, { method: "DELETE" });
+}
+export async function acquirePreview(projectId: string, leaseId: string, automatic = false, paused = false): Promise<void> {
+  await request(`/projects/${projectId}/preview/leases/${leaseId}`, { method: "PUT", body: JSON.stringify({ automatic, paused }) });
+}
+export function getGameTuning(projectId: string): Promise<GameTuningState> {
+  return request(`/projects/${projectId}/tuning`);
+}
+/** Passes values to the running game without saving them; null goes back to what is saved. */
+export function setGameTuningDraft(projectId: string, values: Record<string, GameTuningScalar | null>): Promise<GameTuningState> {
+  return request(`/projects/${projectId}/tuning/draft`, { method: "PUT", body: JSON.stringify({ values }) });
+}
+export function saveGameTuning(projectId: string): Promise<{ state: GameTuningState; changeId?: string }> {
+  return request(`/projects/${projectId}/tuning/save`, { method: "POST" });
+}
+/** Turns the preview page's next click into a `preview.picked` event, or stops that. */
+export async function setPreviewPicking(projectId: string, client: string, active: boolean): Promise<void> {
+  await request(`/projects/${projectId}/preview/picking`, { method: "PUT", body: JSON.stringify({ client, active }) });
+}
+export async function releasePreview(projectId: string, leaseId: string): Promise<void> {
+  await request(`/projects/${projectId}/preview/leases/${leaseId}`, { method: "DELETE" });
+}
+export async function inspectProjectPreview(projectId: string, settings: ProjectRunSettings): Promise<{ mode?: string; manager?: string; source?: string; error?: string }> {
+  return request(`/projects/${projectId}/preview/inspect`, { method: "POST", body: JSON.stringify(settings) });
+}
+
+
+/** The Doubao Speech connection; `distinctKeys` means the two services still use keys saved apart. */
+export function getVolcengineTtsSettings(): Promise<{ configured: boolean; distinctKeys?: boolean; defaultVoiceId?: string }> { return request("/settings/models/providers/volcengine-tts"); }
+
+/** A plugin panel a project's plugins offer, with its page's address. */
+export interface PluginPanel {
+  id: string;
+  plugin: string;
+  version: string;
+  title: string;
+  area: "left" | "center" | "right" | "bottom";
+  when?: string;
+  capabilities: import("../shared/plugin-ui-protocol.js").PluginUiCapabilities;
+  commands: string[];
+  accent?: import("../shared/plugin-ui-protocol.js").PluginAccent;
+  url?: string;
+  /** For a panel of the project's own, in `.ohmygame/panels/`: whether the person allowed it. */
+  projectPanel?: import("../shared/project-panels.js").ProjectPanelState;
+  /** A Plugin Builder draft's panel, previewed in its workspace. */
+  draft?: boolean;
+  /** A draft's commands, which its page runs: the app's kinds here, its code through `runDraftPageCommand`. */
+  draftCommands?: import("../shared/plugins.js").ProjectPluginCommand[];
+}
+
+export async function getPluginPanels(projectId: string, locale: "en" | "zh-CN"): Promise<PluginPanel[]> {
+  return request(`/projects/${encodeURIComponent(projectId)}/plugin-panels?locale=${locale}`);
+}
+
+/** Lets a project's own panel run with what it asks for now; `key` is the one it was shown with. */
+export async function allowProjectPanel(projectId: string, name: string, key: string): Promise<void> {
+  await request(`/projects/${encodeURIComponent(projectId)}/project-panels/${encodeURIComponent(name)}/allow`, { method: "POST", body: JSON.stringify({ key }) });
+}
+
+/** Makes a project's own panel into a plugin, in a new Plugin Builder workspace; `prompt` is what its agent is asked to finish it with. */
+export async function makeProjectPanelPlugin(projectId: string, name: string): Promise<import("../shared/plugin-setup.js").PluginSetupSummary & { prompt: string }> {
+  return request(`/projects/${encodeURIComponent(projectId)}/project-panels/${encodeURIComponent(name)}/plugin`, { method: "POST" });
+}
+
+/** Keeps an error a project's own panel didn't catch, where the agent can read it. */
+export async function reportProjectPanelError(projectId: string, name: string, text: string): Promise<void> {
+  await request(`/projects/${encodeURIComponent(projectId)}/project-panels/${encodeURIComponent(name)}/errors`, { method: "POST", body: JSON.stringify({ text: text.slice(0, 4000) }) });
+}
+
+/** A page's `net.fetch`, made by the daemon. */
+export async function pluginNetFetch(projectId: string, plugin: string, body: { url: string; method?: string; headers?: Record<string, string>; body?: string }): Promise<import("../shared/plugin-ui-protocol.js").PluginUiFetchResponse> {
+  return request(`/projects/${encodeURIComponent(projectId)}/plugin-net/${plugin}`, { method: "POST", body: JSON.stringify(body) });
+}
+
+/** The canvas nodes of the project's active plugins, in the app's language. */
+export async function getProjectPluginCanvas(projectId: string): Promise<import("../shared/plugins.js").ProjectPluginCanvas> {
+  return request(`/projects/${encodeURIComponent(projectId)}/plugin-canvas?locale=${encodeURIComponent(language)}`);
+}
+
+/** A plugin preset's nodes and edges; `id` is `publisher/name:preset`. */
+export async function getProjectPluginCanvasPreset(projectId: string, id: string): Promise<import("../shared/canvas-plugin-nodes.js").CanvasPresetBoard> {
+  const [plugin = "", preset = ""] = id.split(":");
+  return request(`/projects/${encodeURIComponent(projectId)}/plugin-canvas/presets/${plugin.split("/").map(encodeURIComponent).join("/")}/${encodeURIComponent(preset)}`);
+}
+
+export async function getPluginPageValue(projectId: string, plugin: string, key: string): Promise<unknown> {
+  return (await request<{ value: unknown }>(`/projects/${encodeURIComponent(projectId)}/plugin-storage/${plugin}/${encodeURIComponent(key)}`)).value;
+}
+
+export async function setPluginPageValue(projectId: string, plugin: string, key: string, value: unknown): Promise<void> {
+  await request(`/projects/${encodeURIComponent(projectId)}/plugin-storage/${plugin}/${encodeURIComponent(key)}`, { method: "PUT", body: JSON.stringify({ value }) });
+}
+
+const pluginFilesPath = (projectId: string, plugin: string) => `/projects/${encodeURIComponent(projectId)}/plugin-files/${plugin}`;
+
+/** A plugin page's listing of its project's files. */
+/** The project's latest turns that changed files, for a page with `project.history`. */
+export async function getPluginHistory(projectId: string, plugin: string, limit?: number): Promise<unknown> {
+  return request(`/projects/${encodeURIComponent(projectId)}/plugin-data/${plugin}/history${limit === undefined ? "" : `?limit=${limit}`}`);
+}
+
+/** What the project's conversations used, by day and model, for a page with `project.usage`. */
+export async function getPluginUsage(projectId: string, plugin: string): Promise<unknown> {
+  return request(`/projects/${encodeURIComponent(projectId)}/plugin-data/${plugin}/usage`);
+}
+
+/** The person's language models a page with `models` may ask. */
+export async function listPluginModels(projectId: string, plugin: string): Promise<unknown> {
+  return (await request<{ models: unknown[] }>(`/projects/${encodeURIComponent(projectId)}/plugin-models/${plugin}`)).models;
+}
+
+/** Asks one of the person's language models for a page with `models`; the daemon checks the request. */
+export async function completePluginModel(projectId: string, plugin: string, body: unknown, signal: AbortSignal): Promise<unknown> {
+  return request(`/projects/${encodeURIComponent(projectId)}/plugin-models/${plugin}/complete`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+    signal,
+  });
+}
+
+/**
+ * Runs a panel's assistant for a page with `models`: the daemon streams each
+ * event as a JSON line, then the result or why it failed.
+ */
+export async function runPluginAssistant(projectId: string, plugin: string, panel: string, body: Record<string, unknown>, onEvent: (event: import("../shared/plugin-assistant.js").PluginAssistantEvent) => void, signal: AbortSignal): Promise<import("../shared/plugin-assistant.js").PluginAssistantResult> {
+  const response = await fetch(apiUrl(`/projects/${encodeURIComponent(projectId)}/plugin-assistant/${plugin}`), {
+    method: "POST",
+    headers: { "content-type": "application/json", ...runtimeHeaders(), "x-workspace-version": workspaceVersion(projectId) },
+    body: JSON.stringify({ ...body, panel }),
+    signal,
+  });
+  if (!response.ok || !response.body) throw await responseError(response);
+  const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
+  let text = "";
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (value) text += value;
+    const lines = text.split("\n");
+    text = done ? "" : lines.pop()!;
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      const read = JSON.parse(line) as { event?: import("../shared/plugin-assistant.js").PluginAssistantEvent; result?: import("../shared/plugin-assistant.js").PluginAssistantResult; error?: string };
+      if (read.event) onEvent(read.event);
+      else if (read.result) return read.result;
+      else throw new Error(read.error ?? "The assistant couldn't answer");
+    }
+    if (done) throw new Error("The assistant stopped without an answer");
+  }
+}
+
+/** A panel's assistant conversation, oldest first. */
+export async function getPluginAssistantHistory(projectId: string, plugin: string, panel: string): Promise<unknown> {
+  return (await request<{ entries: unknown[] }>(`/projects/${encodeURIComponent(projectId)}/plugin-assistant/${plugin}?panel=${encodeURIComponent(panel)}`)).entries;
+}
+
+/** Forgets a panel's assistant conversation. */
+export async function clearPluginAssistant(projectId: string, plugin: string, panel: string): Promise<void> {
+  await request(`/projects/${encodeURIComponent(projectId)}/plugin-assistant/${plugin}?panel=${encodeURIComponent(panel)}`, { method: "DELETE" });
+}
+
+/** Adds a file a plugin's page made to the Library, under the plugin's name. */
+export async function addPluginLibraryAsset(projectId: string, plugin: string, name: string, contents: Blob, prompt?: string): Promise<{ id: string; name: string; mediaType: string }> {
+  const query = new URLSearchParams({ name, ...(prompt ? { prompt } : {}) });
+  const asset = await request<{ id: string; name: string; mediaType: string }>(`/projects/${encodeURIComponent(projectId)}/plugin-library/${plugin}?${query}`, {
+    method: "POST",
+    headers: { "content-type": "application/octet-stream" },
+    body: contents,
+  });
+  return { id: asset.id, name: asset.name, mediaType: asset.mediaType };
+}
+
+/** Names the panel so its file operations can join the tool running there. */
+const panelHeader = (panel?: string): Record<string, string> => panel ? { "x-plugin-panel": panel } : {};
+
+export async function listPluginFiles(projectId: string, plugin: string, options: { path?: string; recursive?: boolean }, panel?: string): Promise<unknown> {
+  const query = new URLSearchParams({ ...(options.path ? { path: options.path } : {}), ...(options.recursive ? { recursive: "true" } : {}) });
+  return request(`${pluginFilesPath(projectId, plugin)}?${query}`, { headers: panelHeader(panel) });
+}
+
+export async function readPluginFile(projectId: string, plugin: string, filePath: string, panel?: string): Promise<Blob> {
+  const response = await fetch(apiUrl(`${pluginFilesPath(projectId, plugin)}/content?path=${encodeURIComponent(filePath)}`), { headers: { ...runtimeHeaders(), ...panelHeader(panel) } });
+  if (!response.ok) throw await responseError(response);
+  return response.blob();
+}
+
+export async function writePluginFile(projectId: string, plugin: string, filePath: string, contents: Blob, panel?: string): Promise<string> {
+  const { value } = await request<{ value: string }>(`${pluginFilesPath(projectId, plugin)}/content?path=${encodeURIComponent(filePath)}`, {
+    method: "PUT",
+    headers: { "content-type": "application/octet-stream", ...panelHeader(panel) },
+    body: contents,
+  });
+  return value;
+}
+
+export async function createPluginFolder(projectId: string, plugin: string, folderPath: string, panel?: string): Promise<string> {
+  const { value } = await request<{ value: string }>(`${pluginFilesPath(projectId, plugin)}/folder`, { method: "POST", body: JSON.stringify({ path: folderPath }), headers: panelHeader(panel) });
+  return value;
+}
+
+export async function movePluginFile(projectId: string, plugin: string, from: string, to: string, panel?: string): Promise<string> {
+  const { value } = await request<{ value: string }>(`${pluginFilesPath(projectId, plugin)}/move`, { method: "POST", body: JSON.stringify({ from, to }), headers: panelHeader(panel) });
+  return value;
+}
+
+export async function deletePluginFile(projectId: string, plugin: string, filePath: string, panel?: string): Promise<void> {
+  await request(`${pluginFilesPath(projectId, plugin)}?path=${encodeURIComponent(filePath)}`, { method: "DELETE", headers: panelHeader(panel) });
+}
+
+/** The plugin commands a project offers. */
+/** Home's ways to start from the plugins a new project starts with. */
+export async function listPluginStarters(): Promise<{ plugins: string[]; commands: import("../shared/plugins.js").ProjectPluginCommand[] }> {
+  return request(`/plugin-starters?locale=${encodeURIComponent(language)}`);
+}
+
+export async function listProjectPluginCommands(projectId: string): Promise<import("../shared/plugins.js").ProjectPluginCommand[]> {
+  return request(`/projects/${encodeURIComponent(projectId)}/plugin-commands?locale=${encodeURIComponent(language)}`);
+}
+
+/** Turns on a gamepad map in the person's pages of the project's game; null turns it off. */
+export async function setPreviewInputMap(projectId: string, map: import("../shared/preview-input.js").GamepadKeyMap | null): Promise<void> {
+  await request(`/projects/${encodeURIComponent(projectId)}/preview/input-map`, { method: "PUT", body: JSON.stringify({ map }) });
+}
+
+/** What a project's plugins add to its preview, such as devices. */
+export async function getProjectPluginPreview(projectId: string): Promise<import("../shared/plugins.js").ProjectPluginPreview> {
+  return request(`/projects/${encodeURIComponent(projectId)}/plugin-preview?locale=${encodeURIComponent(language)}`);
+}
+
+/** What plugins changed in a project outside a turn, newest first. */
+export async function listProjectPluginChanges(projectId: string): Promise<import("../shared/plugins.js").ProjectPluginChange[]> {
+  return request(`/projects/${encodeURIComponent(projectId)}/plugin-changes`);
+}
+
+export async function undoProjectPluginChange(projectId: string, changeId: string): Promise<void> {
+  await request(`/projects/${encodeURIComponent(projectId)}/plugin-changes/${encodeURIComponent(changeId)}/undo`, { method: "POST" });
+}
+
+/** Runs a plugin command, `publisher/name:command`, whose code runs in its plugin. */
+export async function runPluginCommand(projectId: string, command: string, input?: unknown): Promise<{ result: unknown; change?: { id: string; changed: string[] } }> {
+  return request(`/projects/${encodeURIComponent(projectId)}/plugin-commands`, { method: "POST", body: JSON.stringify({ command, input }) });
+}
+
+export function getQuestionSettings(): Promise<{ delaySeconds: number; problem?: string }> {
+  return request("/settings/questions");
+}
+export function setQuestionSettings(delaySeconds: number): Promise<{ delaySeconds: number }> {
+  return request("/settings/questions", { method: "PUT", body: JSON.stringify({ delaySeconds }) });
+}
+export async function holdQuestionnaire(projectId: string, conversationId: string, requestId: string): Promise<void> {
+  await request(`/projects/${projectId}/conversations/${conversationId}/questionnaire/${encodeURIComponent(requestId)}/hold`, { method: "POST" });
+}
+export function readPluginToolAccess(id: string, signal?: AbortSignal): Promise<import("../shared/plugin-hooks.js").SavedToolApproval[]> {
+  return request(`/plugin-store/${pluginPath(id)}/tool-access`, { signal });
+}
+export function revokePluginToolAccess(id: string, key: string): Promise<import("../shared/plugin-hooks.js").SavedToolApproval[]> {
+  return request(`/plugin-store/${pluginPath(id)}/tool-access`, { method: "DELETE", body: JSON.stringify({ key }) });
+}

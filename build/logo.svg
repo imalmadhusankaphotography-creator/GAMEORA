@@ -1,0 +1,17 @@
+<svg width="280" height="280" viewBox="0 0 280 280" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <!-- GAMEORA logo: a G drawn in one neon stroke, with an AI sparkle in its opening. -->
+  <defs>
+    <linearGradient id="g-stroke" x1="60" y1="60" x2="225" y2="230" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#22D3EE"/>
+      <stop offset="0.55" stop-color="#8B5CF6"/>
+      <stop offset="1" stop-color="#EC4899"/>
+    </linearGradient>
+    <radialGradient id="g-glow" cx="140" cy="146" r="120" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#1E1B4B"/>
+      <stop offset="1" stop-color="#0B0E17"/>
+    </radialGradient>
+  </defs>
+  <rect width="280" height="280" rx="64" fill="url(#g-glow)"/>
+  <path d="M193.74 92.26A76 76 0 1 0 216 146H148" stroke="url(#g-stroke)" stroke-width="30" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M222 40Q225 59 244 62Q225 65 222 84Q219 65 200 62Q219 59 222 40Z" fill="#FFFFFF"/>
+</svg>

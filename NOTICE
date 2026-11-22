@@ -1,0 +1,15 @@
+GAMEORA
+Copyright 2026 Imal Madhusanka
+
+This product is a modified version of OhMyGame
+(https://github.com/WhiteTowerAI/ohmygame), Copyright WhiteTowerAI,
+licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Changes made in GAMEORA:
+- Renamed the app to GAMEORA, with a new logo, app ID and installer name.
+- User-visible text and the agent's instructions name GAMEORA.
+- Auto-update points to the GAMEORA GitHub Releases.
+- The build workflow was replaced with a Windows-only GitHub Actions build.
+
+The OhMyGame name and logo are not covered by the Apache License and are
+not used as GAMEORA's branding.

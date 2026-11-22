@@ -1,0 +1,307 @@
+import { createContext, useContext, useEffect, useState, useSyncExternalStore } from "react";
+import type { ProjectState } from "../shared/contracts.js";
+import { matchesWhen, type WhenContext } from "../shared/plugin-when.js";
+import type { ProjectInputMap, ProjectPluginChange, ProjectPluginCommand, ProjectPluginPreview, ProjectPreviewDevice, ProjectPreviewFilter } from "../shared/plugins.js";
+import type { PluginUiCapabilities } from "../shared/plugin-ui-protocol.js";
+import { allowProjectPanel, getPluginPanels, getProjectPluginPreview, getProjectPlugins, listProjectPluginChanges, listProjectPluginCommands, undoProjectPluginChange, type PluginPanel } from "./api.js";
+import { language, t } from "./i18n.js";
+import { LoaderCircle, MoreHorizontal } from "./icons.js";
+import { useReadyRuntimeGeneration } from "./runtime-connection.js";
+import { Alert, Button, DropdownMenu, Empty, IconButton, Skeleton } from "./ui/index.js";
+import type { PanelId } from "./workspace-layout.js";
+import "./plugin-frame.css";
+
+// What a project's plugins add to its workspace: panels beside the
+// built-in ones, commands in the slots their manifests name, and preview
+// devices, filters and gamepad maps. The project
+// shell reads them again whenever its plugins may have changed.
+
+export const pluginPanelId = (panel: Pick<PluginPanel, "plugin" | "id">): PanelId => `plugin:${panel.plugin}:${panel.id}`;
+
+/** What `when` sees in a project; names nothing here knows stay undefined. */
+export function projectWhenContext(project: Pick<ProjectState, "type" | "pluginType"> & { preview?: Pick<ProjectState["preview"], "status"> }, plugins: Iterable<string>): WhenContext {
+  return {
+    values: {
+      "project.type": project.pluginType?.id ?? project.type,
+      ...(project.preview?.status ? { "preview.status": project.preview.status } : {}),
+      platform: typeof window === "undefined" ? undefined : window.ohMyGameDesktop?.platform ?? "web",
+    },
+    plugins: new Set(plugins),
+  };
+}
+
+/** What a prompt command sends, naming its skill first when it has one. */
+export function commandPrompt(run: { prompt: string; skill?: string }): string {
+  return run.skill ? `Use the ${run.skill} skill.\n\n${run.prompt}` : run.prompt;
+}
+
+/**
+ * How a plugin page's `command.run` is carried out. Tool and native commands
+ * run in the plugin. A page never sends a message: a prompt only fills the
+ * composer, and only for a page allowed to; other app commands run as from a menu.
+ */
+export function pageCommand(panel: Pick<PluginPanel, "plugin" | "capabilities">, command: ProjectPluginCommand | undefined):
+  | { kind: "plugin" }
+  | { kind: "fill"; text: string }
+  | { kind: "app"; command: ProjectPluginCommand } {
+  if (!command || "tool" in command.run || "native" in command.run) return { kind: "plugin" };
+  if (!("prompt" in command.run)) return { kind: "app", command };
+  if (!panel.capabilities.composer) throw new Error(`${panel.plugin} can't use the composer`);
+  return { kind: "fill", text: commandPrompt(command.run) };
+}
+
+/** The commands a slot shows, in manifest order. */
+export function commandsForSlot(commands: readonly ProjectPluginCommand[], slot: string, context: WhenContext): ProjectPluginCommand[] {
+  return commands.filter((command) => command.slots.some((entry) => entry.slot === slot && matchesWhen(entry.when, context)));
+}
+
+/**
+ * What a command run from somewhere in a project is about, such as a canvas
+ * node. A prompt needs none: the composer already sends the canvas selection.
+ */
+export interface PluginCommandTarget {
+  /** Passed to a native command that declares `run.input`; others run as from a menu. */
+  input?: unknown;
+}
+
+/**
+ * The project's plugin commands and how to run one, for the views deep in the
+ * workspace (the game's toolbar, the canvas) that show a slot of their own.
+ * Outside a project, there are none.
+ */
+export interface PluginSlots {
+  commands: readonly ProjectPluginCommand[];
+  when: WhenContext;
+  run: (command: ProjectPluginCommand, target?: PluginCommandTarget) => Promise<unknown>;
+  /** Plugins the folder's files turned on here that wait to be allowed, such as an engine's. */
+  waiting?: readonly WaitingPlugin[];
+  /** Allows one of `waiting` in this project. */
+  allow?: (id: string) => Promise<void>;
+}
+
+/** A plugin the folder's files turned on that waits to be allowed. */
+export interface WaitingPlugin {
+  id: string;
+  displayName: string;
+}
+
+export const PluginSlotsContext = createContext<PluginSlots | undefined>(undefined);
+
+/** A slot's commands in this project, and how to run one; with the plugins that wait to be allowed, which may add some. */
+export function usePluginSlot(slot: string): { commands: ProjectPluginCommand[]; run: PluginSlots["run"]; waiting: readonly WaitingPlugin[]; allow: (id: string) => Promise<void> } {
+  const slots = useContext(PluginSlotsContext);
+  return {
+    commands: slots ? commandsForSlot(slots.commands, slot, slots.when) : [],
+    run: slots?.run ?? (async () => undefined),
+    waiting: slots?.waiting ?? [],
+    allow: slots?.allow ?? (async () => undefined),
+  };
+}
+
+/** The "/" list: commands with a `slash` name, and those in the `composer.slash` slot. */
+export function slashCommands(commands: readonly ProjectPluginCommand[], context: WhenContext): ProjectPluginCommand[] {
+  const slotted = new Set(commandsForSlot(commands, "composer.slash", context));
+  return commands.filter((command) => slotted.has(command) || (command.slash && !command.slots.some((entry) => entry.slot === "composer.slash")));
+}
+
+// Bumped when the open project's plugins change, so views outside the shell, like the canvas, read them again.
+let pluginsRevision = 0;
+const pluginsListeners = new Set<() => void>();
+export function announceProjectPluginsChanged(): void {
+  pluginsRevision += 1;
+  for (const listener of pluginsListeners) listener();
+}
+export function useProjectPluginsRevision(): number {
+  return useSyncExternalStore((listener) => { pluginsListeners.add(listener); return () => pluginsListeners.delete(listener); }, () => pluginsRevision);
+}
+
+/**
+ * `filesRevision` reads only the panels again: a project's own panels are
+ * files in it, which the agent can add, change or remove in any turn.
+ */
+export function useProjectPluginContributions(project: Pick<ProjectState, "id" | "type" | "pluginType"> & { preview?: Pick<ProjectState["preview"], "status"> } | undefined, revision: number, filesRevision = 0): {
+  panels: PluginPanel[];
+  commands: ProjectPluginCommand[];
+  previewDevices: ProjectPreviewDevice[];
+  previewFilters: ProjectPreviewFilter[];
+  inputMaps: ProjectInputMap[];
+  when: WhenContext;
+  waiting: WaitingPlugin[];
+} {
+  const generation = useReadyRuntimeGeneration();
+  const [loaded, setLoaded] = useState<{ projectId: string; commands: ProjectPluginCommand[]; preview: ProjectPluginPreview; active: string[]; waiting: WaitingPlugin[] }>();
+  const [panels, setPanels] = useState<{ projectId: string; panels: PluginPanel[] }>();
+  const projectId = project?.id;
+  useEffect(() => {
+    if (!projectId) return;
+    let disposed = false;
+    // A project whose plugins can't be read shows only the built-in panels.
+    void getPluginPanels(projectId, language).catch((): PluginPanel[] => []).then((next) => {
+      if (!disposed) setPanels({ projectId, panels: next });
+    });
+    return () => { disposed = true; };
+  }, [projectId, revision, generation, filesRevision]);
+  useEffect(() => {
+    if (!projectId) return;
+    let disposed = false;
+    void Promise.all([
+      listProjectPluginCommands(projectId).catch((): ProjectPluginCommand[] => []),
+      getProjectPluginPreview(projectId).catch((): ProjectPluginPreview => ({ devices: [], filters: [], inputMaps: [] })),
+      // `project.plugin('<id>')` asks about every active plugin, with or without panels.
+      getProjectPlugins(projectId).then((view) => Array.isArray(view?.plugins) ? view.plugins : []).catch(() => []),
+    ]).then(([commands, preview, plugins]) => {
+      const active = plugins.flatMap((plugin) => plugin.status === "active" ? [plugin.id] : []);
+      // Only one that would start the game, as an engine's does, is offered in the Game panel.
+      const waiting = plugins.flatMap((plugin) => plugin.detected && plugin.startsGame && (plugin.status === "needs-consent" || plugin.status === "needs-approval")
+        ? [{ id: plugin.id, displayName: plugin.displayName }] : []);
+      if (!disposed) setLoaded({ projectId, commands, preview, active, waiting });
+    });
+    return () => { disposed = true; };
+  }, [projectId, revision, generation]);
+  if (!project || loaded?.projectId !== project.id || panels?.projectId !== project.id) return { panels: [], commands: [], previewDevices: [], previewFilters: [], inputMaps: [], when: { values: {}, plugins: new Set() }, waiting: [] };
+  const when = projectWhenContext(project, [...loaded.active, ...[...panels.panels, ...loaded.commands].map((item) => item.plugin)]);
+  return {
+    // A page needs its address; one without it can't be shown, except a
+    // project's own panel, which shows why until it is allowed.
+    panels: panels.panels.filter((panel) => (panel.url || panel.projectPanel) && matchesWhen(panel.when, when)),
+    commands: loaded.commands,
+    previewDevices: loaded.preview.devices,
+    previewFilters: loaded.preview.filters,
+    inputMaps: loaded.preview.inputMaps,
+    when,
+    waiting: loaded.waiting,
+  };
+}
+
+/** How many of a panel's toolbar commands show as buttons; the rest are in a menu. */
+export const PLUGIN_TOOLBAR_BUTTONS = 3;
+
+/**
+ * A plugin panel's commands in its toolbar, in manifest order. The app draws
+ * them beside its own controls, which a plugin can't hide or move. A command
+ * runs once at a time.
+ */
+export function PluginPanelToolbar({ commands, onRun }: {
+  commands: readonly ProjectPluginCommand[];
+  onRun: (command: ProjectPluginCommand) => Promise<unknown>;
+}) {
+  const [running, setRunning] = useState<ReadonlySet<string>>(new Set());
+  const run = (command: ProjectPluginCommand) => {
+    if (running.has(command.id)) return;
+    setRunning((current) => new Set(current).add(command.id));
+    void onRun(command).finally(() => setRunning((current) => {
+      const next = new Set(current);
+      next.delete(command.id);
+      return next;
+    }));
+  };
+  if (!commands.length) return null;
+  const rest = commands.slice(PLUGIN_TOOLBAR_BUTTONS);
+  return <div className="plugin-toolbar">
+    {commands.slice(0, PLUGIN_TOOLBAR_BUTTONS).map((command) => {
+      const busy = running.has(command.id);
+      return <Button key={command.id} variant="ghost" size="sm" title={command.title} aria-busy={busy} disabled={busy}
+        icon={busy ? <LoaderCircle className="spin" size={14} /> : undefined} onClick={() => run(command)}>
+        <span className="plugin-toolbar-label">{command.title}</span>
+      </Button>;
+    })}
+    {rest.length ? <DropdownMenu placement="bottom-end" items={rest.map((command) => ({ label: command.title, disabled: running.has(command.id), onSelect: () => run(command) }))}
+      trigger={(props) => <IconButton {...props} size="sm" label={t("pluginCommands.more")}><MoreHorizontal size={14} /></IconButton>} /> : null}
+  </div>;
+}
+
+/** What a project panel's `panel.json` asks for, in the person's words. */
+export function projectPanelAsks(asks: PluginUiCapabilities): string[] {
+  const lines: string[] = [];
+  if (asks["project.files"]) lines.push(t(asks["project.files"] === "write" ? "projectPanel.askWrite" : "projectPanel.askRead"));
+  if (asks.composer) lines.push(t("projectPanel.askComposer"));
+  if (asks["project.selection"]) lines.push(t("projectPanel.askSelection"));
+  if (asks["project.history"]) lines.push(t("projectPanel.askHistory"));
+  if (asks["project.usage"]) lines.push(t("projectPanel.askUsage"));
+  if (asks.net?.length) lines.push(t("projectPanel.askNet", { hosts: asks.net.join(", ") }));
+  return lines;
+}
+
+/**
+ * A project's own panel that can't run yet: one whose `panel.json` the person
+ * hasn't allowed as it is now, or one that can't be used, with why.
+ */
+export function ProjectPanelGate({ projectId, panel, onAllowed }: { projectId: string; panel: PluginPanel; onAllowed: () => void }) {
+  const state = panel.projectPanel!;
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string>();
+  if (state.status === "invalid") return <div className="project-panel-gate">
+    <Alert tone="danger" title={t("projectPanel.invalid", { name: state.name })} />
+    <ul>{state.issues?.map((issue) => <li key={issue} className="plugins-mono">{issue}</li>)}</ul>
+    <p>{t("projectPanel.invalidHint")}</p>
+  </div>;
+  const asks = projectPanelAsks(state.asks ?? {});
+  return <div className="project-panel-gate">
+    <strong>{t("projectPanel.ask", { title: panel.title })}</strong>
+    <p>{t("projectPanel.askHint")}</p>
+    {asks.length ? <ul>{asks.map((line) => <li key={line}>{line}</li>)}</ul> : <p>{t("projectPanel.asksNothing")}</p>}
+    {error ? <Alert tone="danger" title={error} /> : null}
+    <div><Button size="sm" disabled={busy} onClick={() => {
+      setBusy(true);
+      setError(undefined);
+      void allowProjectPanel(projectId, state.name, state.key!).then(onAllowed, (cause: unknown) => setError(message(cause))).finally(() => setBusy(false));
+    }}>{t("projectPanel.allow")}</Button></div>
+  </div>;
+}
+
+/** What the project's plugins changed outside a turn, each with its own Undo. A tab of the project's Plugins. */
+export function PluginChanges({ projectId, busy, onUndone }: {
+  projectId: string;
+  /** An agent is working; an undo waits until it is done. */
+  busy: boolean;
+  onUndone?: () => void;
+}) {
+  const [changes, setChanges] = useState<ProjectPluginChange[]>();
+  const [error, setError] = useState<string>();
+  const [pending, setPending] = useState<string>();
+  const load = () => listProjectPluginChanges(projectId).then((next) => { setChanges(next); setError(undefined); });
+  useEffect(() => {
+    setChanges(undefined);
+    void load().catch((cause: unknown) => setError(message(cause)));
+  }, [projectId]);
+
+  async function undo(change: ProjectPluginChange): Promise<void> {
+    setPending(change.id);
+    setError(undefined);
+    try {
+      await undoProjectPluginChange(projectId, change.id);
+      onUndone?.();
+      await load();
+    } catch (cause) {
+      setError(message(cause));
+    } finally {
+      setPending(undefined);
+    }
+  }
+
+  return <>
+    <p className="project-plugins-intro">{t("pluginChanges.hint")}</p>
+    {error ? <Alert tone="danger" title={error} /> : null}
+    {busy ? <Alert title={t("pluginChanges.busy")} /> : null}
+    {!changes && !error ? <Skeleton height={120} /> : null}
+    {changes && !changes.length ? <Empty title={t("pluginChanges.empty")} /> : null}
+    {changes?.map((change) => <div className="project-plugin" key={change.id}>
+      <span className="project-plugin-text">
+        <strong>{change.title}</strong>
+        <small>
+          {change.plugin} · {new Date(change.at).toLocaleString(language)}
+          {change.unrecorded ? null : <>{" · "}{t("pluginChanges.files", { count: change.changed.length })}</>}
+        </small>
+        {change.failed ? <small className="project-plugin-note">{t("pluginChanges.failed", { error: change.failed })}</small> : null}
+        {change.unrecorded ? <small className="project-plugin-note">{t("pluginChanges.unrecorded")}</small> : null}
+        {change.late ? <small className="project-plugin-note">{t("pluginChanges.late")}</small> : null}
+      </span>
+      {change.undone ? <span className="project-plugins-count">{t("pluginChanges.undone")}</span>
+        : change.changed.length ? <Button size="sm" disabled={busy || pending !== undefined} onClick={() => void undo(change)}>{t("pluginChanges.undo")}</Button> : null}
+    </div>)}
+  </>;
+}
+
+function message(cause: unknown): string {
+  return cause instanceof Error ? cause.message : String(cause);
+}

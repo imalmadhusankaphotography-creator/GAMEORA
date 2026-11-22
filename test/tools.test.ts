@@ -1,0 +1,714 @@
+import { TEST_GLB } from "./model3d-fixture.js";
+import { access, mkdir, mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { createApp } from "../src/daemon/app.js";
+import { AssetLibrary } from "../src/daemon/asset-library.js";
+import { ImageGenerationError, type ImageGenerator } from "../src/daemon/openai-image.js";
+import { ToolRunner } from "../src/daemon/tools.js";
+import type { MediaTaskJournal } from "../src/daemon/media-task-journal.js";
+import { MAX_ANIMATION_ACTIONS } from "../src/shared/generation-config.js";
+
+const TEST_VIDEO_MODEL = { provider: "openrouter", id: "example/video-model" } as const;
+
+const apps: ReturnType<typeof createApp>[] = [];
+afterEach(async () => { await Promise.all(apps.splice(0).map((app) => app.close())); });
+
+describe("tool runner", () => {
+  it.each([true, false])("preserves a legacy MiniMax job when cutover rejects retry: %s", async (committed) => {
+    const directory = await temporaryData();
+    const file = path.join(directory, "tools/jobs.json");
+    await mkdir(path.dirname(file), { recursive: true });
+    const input = { prompt: "Preserve intent", model: { provider: "minimax-video-global", id: "MiniMax-H3" }, duration: 6, resolution: "720p", aspectRatio: "16:9" };
+    const bytes = JSON.stringify([{ id: "legacy-minimax", toolId: "generate-video", status: "cancelled", title: "Preserve intent", createdAt: "2026-11-01T00:00:00.000Z", input, prepared: true, recoveryId: "original-owner" }]);
+    await writeFile(file, bytes);
+    const generate = vi.fn().mockRejectedValue(new Error("Fixture stops before vendor"));
+    const runner = new ToolRunner(directory, fakeGenerator(), undefined, { generate }, undefined, undefined, undefined, { minimax: committed });
+    await runner.load();
+    if (committed) {
+      expect(() => runner.retryJob("legacy-minimax")).toThrow("Check its status in MiniMax");
+      expect(runner.jobs()).toEqual([expect.objectContaining({ id: "legacy-minimax", status: "cancelled", error: expect.stringContaining("Check its status in MiniMax") })]);
+      expect(await readFile(file, "utf8")).toBe(bytes);
+      expect(generate).not.toHaveBeenCalled();
+    } else {
+      runner.retryJob("legacy-minimax");
+      await vi.waitFor(() => expect(runner.jobs()[0]?.status).toBe("failed"));
+      expect(generate.mock.calls[0]?.[0]).toMatchObject(input);
+      expect(JSON.parse(await readFile(file, "utf8"))[0].recoveryId).toBe("original-owner");
+    }
+    await runner.close();
+  });
+
+  it.each(["image", "ark-video", "byteplus-video"] as const)("retains %s jobs and rejects replay only after Seedance cutover", async (kind) => {
+    for (const committed of [false, true]) {
+      const directory = await temporaryData(), file = path.join(directory, "tools/jobs.json");
+      await mkdir(path.dirname(file), { recursive: true });
+      const model = { provider: kind === "byteplus-video" ? "byteplus-modelark" : "volcengine-ark", id: "legacy-model" };
+      const input = { prompt: "Keep original intent", [kind === "image" ? "imageModel" : "model"]: model, ...(kind === "image" ? {} : { duration: 5, resolution: "720p", aspectRatio: "16:9" }) };
+      const bytes = JSON.stringify([{ id: "old-seedance", toolId: kind === "image" ? "generate-image" : "generate-video", status: "cancelled", title: "Keep intent", createdAt: "2026-11-01T00:00:00.000Z", input, model: { provider: "stale-display", id: "ignored" }, prepared: true, recoveryId: "same-owner", error: "Original provider error" }]);
+      await writeFile(file, bytes);
+      const generate = vi.fn().mockRejectedValue(new Error("Fixture stops before vendor"));
+      const runner = new ToolRunner(directory, { generate }, undefined, { generate }, undefined, undefined, undefined, { seedance: committed });
+      try {
+        await runner.load();
+        if (committed) {
+          expect(() => runner.retryJob("old-seedance")).toThrow("Check its result and billing");
+          expect(runner.jobs()[0]?.error).toContain("Check its result and billing");
+          expect(await readFile(file, "utf8")).toBe(bytes);
+          expect(generate).not.toHaveBeenCalled();
+        } else {
+          runner.retryJob("old-seedance");
+          await expect.poll(() => runner.jobs()[0]?.status).toBe("failed");
+          expect(generate.mock.calls[0]?.[0]).toMatchObject(input);
+          expect(JSON.parse(await readFile(file, "utf8"))[0].recoveryId).toBe("same-owner");
+        }
+      } finally { await runner.close(); }
+    }
+  });
+
+  it("rejects removed audio reference and subtitle options before generation", async () => {
+    const generate = vi.fn();
+    const runner = new ToolRunner(await temporaryData(), fakeGenerator(), undefined, undefined, undefined, undefined, { catalog: () => ({ models: [], providers: [] }), generate });
+    await runner.load();
+    for (const removed of [{ references: [{ type: "audio" as const, assetId: "rain" }] }, { referenceAssetId: "rain" }, { subtitles: true }]) {
+      await expect(runner.run("generate-audio", { prompt: "quiet music", instrumental: true, ...removed })).rejects.toMatchObject({ statusCode: 400 });
+    }
+    expect(generate).not.toHaveBeenCalled();
+  });
+
+  it("lists audio jobs saved by the per-kind tools as generate-audio", async () => {
+    const dataDirectory = await temporaryData();
+    await mkdir(path.join(dataDirectory, "tools"), { recursive: true });
+    await writeFile(path.join(dataDirectory, "tools", "jobs.json"), JSON.stringify([
+      { id: "old", toolId: "generate-sound-effect", status: "failed", title: "Rain", error: "Busy", createdAt: "2026-11-01T00:00:00.000Z", input: { prompt: "Rain", negativePrompt: "thunder" } },
+    ]));
+    const runner = new ToolRunner(dataDirectory, fakeGenerator());
+    await runner.load();
+    expect(runner.jobs()).toEqual([expect.objectContaining({ id: "old", toolId: "generate-audio" })]);
+  });
+
+  it("runs Image to 3D and persists its GLB output", async () => {
+    const dataDirectory = await temporaryData();
+    const library = new AssetLibrary(dataDirectory);
+    await library.load();
+    const generate = vi.fn().mockResolvedValue({
+      bytes: TEST_GLB,
+      mediaType: "model/gltf-binary" as const,
+      requestId: "meshy-task-1",
+    });
+    const runner = new ToolRunner(dataDirectory, fakeGenerator(), { generate }, undefined, library);
+    await runner.load();
+    const run = await runner.run("image-to-3d", {
+      images: [{ mediaType: "image/png", data: "ZnJvbnQ=" }],
+      targetPolycount: 8_000,
+      texture: true,
+      pbr: true,
+    });
+
+    expect(generate).toHaveBeenCalledWith(expect.objectContaining({
+      model: { provider: "meshy", id: "meshy-t2" },
+      images: [
+        { mediaType: "image/png", data: "ZnJvbnQ=" },
+      ],
+      targetPolycount: 8_000,
+      texture: true,
+      pbr: true,
+    }), undefined);
+    expect(run).toMatchObject({
+      toolId: "image-to-3d",
+      files: [{ name: "model.glb", mediaType: "model/gltf-binary" }],
+    });
+    expect(await readFile(path.join(dataDirectory, "tools", "runs", run.id, "model.glb"))).toEqual(TEST_GLB);
+    expect(library.get(run.files[0]!.assetId!)).toMatchObject({ origin: "generated", purpose: "asset", mediaType: "model" });
+    expect(library.get(run.files[0]!.assetId!)?.prompt).toBeUndefined();
+  });
+
+  it("runs 3D generation with a target poly count", async () => {
+    const generate = vi.fn().mockResolvedValue({
+      bytes: TEST_GLB,
+      mediaType: "model/gltf-binary" as const,
+    });
+    const runner = new ToolRunner(await temporaryData(), fakeGenerator(), { generate });
+    await runner.load();
+    await runner.run("image-to-3d", {
+      images: [{ mediaType: "image/png", data: "aW1hZ2U=" }],
+      model: { provider: "meshy", id: "meshy-t2" },
+      targetPolycount: 4_000,
+      texture: false,
+    });
+
+    expect(generate).toHaveBeenCalledWith(expect.objectContaining({
+      model: { provider: "meshy", id: "meshy-t2" },
+      images: [{ mediaType: "image/png", data: "aW1hZ2U=" }],
+      targetPolycount: 4_000,
+      texture: false,
+    }), undefined);
+  });
+
+  it("runs Meshy 7.1 with several views and its own polycount range", async () => {
+    const generate = vi.fn().mockResolvedValue({ bytes: TEST_GLB, mediaType: "model/gltf-binary" as const });
+    const runner = new ToolRunner(await temporaryData(), fakeGenerator(), { generate });
+    await runner.load();
+    const views = Array.from({ length: 4 }, () => ({ mediaType: "image/png" as const, data: "aW1hZ2U=" }));
+    await runner.run("image-to-3d", { images: views, model: { provider: "meshy", id: "meshy-7.1" }, targetPolycount: 100_000 });
+
+    expect(generate).toHaveBeenCalledWith(expect.objectContaining({ model: { provider: "meshy", id: "meshy-7.1" }, images: views, targetPolycount: 100_000 }), undefined);
+  });
+
+  it("animates a Library GLB and stores the result as a new asset", async () => {
+    const dataDirectory = await temporaryData();
+    const library = new AssetLibrary(dataDirectory);
+    await library.load();
+    const source = await library.add("hero.glb", TEST_GLB);
+    const animate = vi.fn().mockResolvedValue({ bytes: TEST_GLB, mediaType: "model/gltf-binary" as const });
+    const runner = new ToolRunner(dataDirectory, fakeGenerator(), { generate: vi.fn(), animate }, undefined, library);
+    await runner.load();
+
+    const run = await runner.run("animate-3d", { assetId: source.id, actionIds: [0, 30], heightMeters: 1.6 });
+
+    expect(animate).toHaveBeenCalledWith(expect.objectContaining({ model: TEST_GLB, actionIds: [0, 30], heightMeters: 1.6, execution: expect.any(Object) }), undefined);
+    expect(run).toMatchObject({ toolId: "animate-3d", files: [{ name: "model.glb", mediaType: "model/gltf-binary" }] });
+    expect(run.files[0]?.assetId).not.toBe(source.id);
+    expect(await readFile(path.join(dataDirectory, "tools", "runs", run.id, "model.glb"))).toEqual(TEST_GLB);
+  });
+
+  it("rejects animation requests it cannot run", async () => {
+    const dataDirectory = await temporaryData();
+    const library = new AssetLibrary(dataDirectory);
+    await library.load();
+    const model = await library.add("hero.glb", TEST_GLB);
+    const image = await library.add("hero.png", Buffer.from("png"));
+    const runner = new ToolRunner(dataDirectory, fakeGenerator(), { generate: vi.fn(), animate: vi.fn() }, undefined, library);
+    await runner.load();
+
+    await expect(runner.run("animate-3d", { assetId: model.id, actionIds: [] })).rejects.toMatchObject({ statusCode: 400 });
+    await expect(runner.run("animate-3d", { assetId: model.id, actionIds: [1, 1] })).rejects.toMatchObject({ statusCode: 400 });
+    await expect(runner.run("animate-3d", { assetId: model.id, actionIds: Array.from({ length: MAX_ANIMATION_ACTIONS + 1 }, (_, index) => index) })).rejects.toMatchObject({ statusCode: 400 });
+    await expect(runner.run("animate-3d", { assetId: image.id, actionIds: [0] })).rejects.toMatchObject({ statusCode: 400, message: "Only GLB models are supported" });
+    await expect(runner.run("animate-3d", { assetId: "missing", actionIds: [0] })).rejects.toMatchObject({ statusCode: 404 });
+    const withoutAnimation = new ToolRunner(dataDirectory, fakeGenerator(), { generate: vi.fn() }, undefined, library);
+    await expect(withoutAnimation.run("animate-3d", { assetId: model.id, actionIds: [0] })).rejects.toMatchObject({ statusCode: 503 });
+  });
+
+  it("loads animation libraries against the current connection and retries failures", async () => {
+    const animations = vi.fn()
+      .mockRejectedValueOnce(new Error("offline"))
+      .mockResolvedValue([{ id: 0, name: "Idle", category: "DailyActions", subCategory: "Idle" }]);
+    const runner = new ToolRunner(await temporaryData(), fakeGenerator(), { generate: vi.fn(), animations });
+
+    await expect(runner.animationActions()).rejects.toThrow("offline");
+    await expect(runner.animationActions()).resolves.toHaveLength(1);
+    await expect(runner.animationActions()).resolves.toHaveLength(1);
+    expect(animations).toHaveBeenCalledTimes(3);
+  });
+
+  it("runs the selected video model with a Library image reference", async () => {
+    // A plugin's generation leaves the vendor's result in the journal until the video is stored.
+    const generate = vi.fn(async (_input: unknown, _signal: unknown, options: { journal: MediaTaskJournal }) => {
+      await options.journal.begin({ request: 1 });
+      await options.journal.finish([{ url: "https://cdn.example/v.mp4" }]);
+      options.journal.release();
+      return { bytes: Buffer.from("video"), mediaType: "video/mp4" as const, requestId: "video-task-1" };
+    });
+    const dataDirectory = await temporaryData();
+    const library = new AssetLibrary(dataDirectory);
+    await library.load();
+    const image = await library.add("frame.png", Buffer.from("image"));
+    const runner = new ToolRunner(dataDirectory, fakeGenerator(), undefined, { generate }, library);
+    await runner.load();
+
+    const run = await runner.run("generate-video", {
+      prompt: "  A spaceship crossing a nebula  ",
+      model: TEST_VIDEO_MODEL,
+      references: [
+        { type: "image", assetId: image.id },
+      ],
+      duration: 6,
+      aspectRatio: "16:9",
+      resolution: "720p",
+    });
+
+    expect(generate).toHaveBeenCalledWith({
+      prompt: "A spaceship crossing a nebula",
+      model: TEST_VIDEO_MODEL,
+      references: [
+        expect.objectContaining({ type: "image", name: "frame.png", mediaType: "image/png" }),
+      ],
+      duration: 6,
+      aspectRatio: "16:9",
+      resolution: "720p",
+    }, undefined, { journal: expect.any(Object) });
+    // Stored, so the journal was cleared: nothing is left for a retry to fetch.
+    const journal = generate.mock.calls[0]![2].journal;
+    await expect(journal.begin({ request: 1 })).resolves.toEqual({ state: "new" });
+    journal.release();
+    expect(run).toMatchObject({
+      toolId: "generate-video",
+      files: [{ name: "output.mp4", mediaType: "video/mp4", assetId: expect.any(String) }],
+    });
+  });
+
+  it("runs speech through the common audio generator and stores it in the Library", async () => {
+    const dataDirectory = await temporaryData();
+    const library = new AssetLibrary(dataDirectory);
+    await library.load();
+    const model = { provider: "volcengine-tts", id: "seed-tts-2.0" } as const;
+    const generate = vi.fn().mockResolvedValue({
+      bytes: Buffer.from("mp3-audio"),
+      mediaType: "audio/mpeg" as const,
+      model,
+      metadata: { durationMs: 1_250 },
+    });
+    const runner = new ToolRunner(dataDirectory, fakeGenerator(), undefined, undefined, library, undefined, { catalog: () => ({ models: [], providers: [] }), generate });
+    await runner.load();
+
+    const run = await runner.run("generate-audio", { prompt: "  Welcome, traveler  ", voiceId: "narrator", model });
+
+    expect(generate).toHaveBeenCalledWith({ prompt: "  Welcome, traveler  ", voiceId: "narrator", model }, undefined, expect.objectContaining({ begin: expect.any(Function) }));
+    expect(run).toMatchObject({
+      toolId: "generate-audio",
+      model,
+      files: [{ name: "output.mp3", mediaType: "audio/mpeg", role: "audio", assetId: expect.any(String) }, { name: "output.mp3.audio.json", mediaType: "application/json", role: "metadata" }],
+    });
+    const asset = library.get(run.files[0]!.assetId!);
+    expect(asset).toMatchObject({ mediaType: "audio", contentType: "audio/mpeg", origin: "generated", prompt: "Welcome, traveler", duration: 1.25 });
+  });
+
+  it("rejects non-image video references", async () => {
+    const generate = vi.fn();
+    const dataDirectory = await temporaryData();
+    const library = new AssetLibrary(dataDirectory);
+    await library.load();
+    const video = await library.add("motion.mp4", Buffer.from("video"), { duration: 8 });
+    const runner = new ToolRunner(dataDirectory, fakeGenerator(), undefined, { generate }, library);
+    await runner.load();
+
+    await expect(runner.run("generate-video", { prompt: "Animate", model: TEST_VIDEO_MODEL, references: [{ type: "video", assetId: video.id }] }))
+      .rejects.toMatchObject({ statusCode: 400, message: "Invalid video references" });
+    expect(generate).not.toHaveBeenCalled();
+  });
+
+  it("runs the image tool and persists its output outside projects", async () => {
+    const dataDirectory = await temporaryData();
+    const generate = vi.fn<ImageGenerator["generate"]>().mockResolvedValue({
+      bytes: Buffer.from([0, 1, 2, 255]),
+      mediaType: "image/webp",
+      requestId: "openai-request-1",
+    });
+    const runner = new ToolRunner(dataDirectory, { generate });
+    await runner.load();
+    const run = await runner.run("generate-image", { prompt: "  A forest game background  ", size: "1536x1024" });
+
+    expect(generate).toHaveBeenCalledWith({ prompt: "A forest game background", size: "1536x1024" }, undefined, { journal: expect.any(Object), resuming: false, outputs: 1 });
+    expect(run).toMatchObject({
+      toolId: "generate-image",
+      files: [{ name: "output.webp", mediaType: "image/webp" }],
+    });
+    expect(run).not.toHaveProperty("requestId");
+    expect(run).not.toHaveProperty("prompt");
+
+    const runDirectory = path.join(dataDirectory, "tools", "runs", run.id);
+    expect((await readdir(runDirectory)).sort()).toEqual(["output.webp", "run.json"]);
+    expect(await readFile(path.join(runDirectory, "output.webp"))).toEqual(Buffer.from([0, 1, 2, 255]));
+    const storedRun = JSON.parse(await readFile(path.join(runDirectory, "run.json"), "utf8"));
+    expect(storedRun).toMatchObject({
+      version: 1,
+      id: run.id,
+    });
+    expect(storedRun).not.toHaveProperty("prompt");
+    expect(storedRun).not.toHaveProperty("requestId");
+  });
+
+  it("passes a reference-only image request to the selected model", async () => {
+    const generate = vi.fn<ImageGenerator["generate"]>().mockResolvedValue({
+      bytes: Buffer.from([0, 1, 2, 255]),
+      mediaType: "image/png",
+    });
+    const runner = new ToolRunner(await temporaryData(), { generate });
+    await runner.load();
+
+    await runner.run("generate-image", {
+      prompt: "",
+      resolution: "1K",
+      aspectRatio: "1:1",
+      images: [{ mediaType: "image/png", data: "cmVmZXJlbmNl" }],
+    });
+
+    expect(generate).toHaveBeenCalledWith({
+      prompt: "",
+      resolution: "1K",
+      aspectRatio: "1:1",
+      images: [{ mediaType: "image/png", data: "cmVmZXJlbmNl" }],
+    }, undefined, { journal: expect.any(Object), resuming: false, outputs: 1 });
+    await runner.close();
+  });
+
+  it("records what a project's plugins changed before an image was generated", async () => {
+    const dataDirectory = await temporaryData();
+    const library = new AssetLibrary(dataDirectory);
+    await library.load();
+    const generate = vi.fn<ImageGenerator["generate"]>().mockResolvedValue({ bytes: Buffer.from("image"), mediaType: "image/webp" });
+    const runner = new ToolRunner(dataDirectory, { generate }, undefined, undefined, library);
+    const changes = [{ plugin: "acme/style", version: "1.0.0", fields: ["prompt" as const] }];
+    runner.setImageHook(async (input, projectId) => projectId === "project-1"
+      ? { ...input, prompt: `${input.prompt}, pixel art`, requestedPrompt: input.prompt, pluginChanges: changes }
+      : input);
+    await runner.load();
+    // A request can't bring its own record of what plugins changed.
+    const forged = { requestedPrompt: "forged", pluginChanges: [{ plugin: "x/y", version: "9.9.9", fields: ["prompt"] }] };
+    const run = await runner.run("generate-image", { prompt: "A cat", size: "1024x1024", ...forged } as never, undefined, "project-1");
+    expect(generate).toHaveBeenCalledWith({ prompt: "A cat, pixel art", size: "1024x1024" }, undefined, { journal: expect.any(Object), resuming: false, outputs: 1 });
+    expect(run).toMatchObject({ prompt: "A cat, pixel art", requestedPrompt: "A cat", pluginChanges: changes });
+    const recorded = { prompt: "A cat, pixel art", requestedPrompt: "A cat", pluginChanges: changes };
+    expect(library.get(run.files[0]!.assetId!)).toMatchObject(recorded);
+    const reloaded = new AssetLibrary(dataDirectory);
+    await reloaded.load();
+    expect(reloaded.get(run.files[0]!.assetId!)).toMatchObject(recorded);
+
+    // A retry brings back the prepared request: plugins don't change it twice, and its record stays.
+    const prepared = await runner.prepare("generate-image", { prompt: "A bird", size: "1024x1024" }, "project-1");
+    const retried = await runner.prepare("generate-image", prepared, "project-1", { hooksApplied: true });
+    expect(retried).toMatchObject({ prompt: "A bird, pixel art", requestedPrompt: "A bird", pluginChanges: changes });
+    const malformed = await runner.prepare("generate-image", { ...prepared, pluginChanges: [{ plugin: "x/y", version: "1", fields: ["bogus"] }] } as never, "project-1", { hooksApplied: true });
+    expect(malformed).not.toHaveProperty("pluginChanges");
+    expect(malformed).not.toHaveProperty("requestedPrompt");
+
+    const plain = await runner.run("generate-image", { prompt: "A dog", ...forged } as never);
+    expect(plain).not.toHaveProperty("pluginChanges");
+    expect(library.get(plain.files[0]!.assetId!)).not.toHaveProperty("requestedPrompt");
+  });
+
+  it("generates multiple configured images", async () => {
+    const dataDirectory = await temporaryData();
+    let sequence = 0;
+    const generate = vi.fn<ImageGenerator["generate"]>().mockImplementation(async () => ({
+      bytes: Buffer.from(`image-${++sequence}`),
+      mediaType: "image/webp",
+    }));
+    const runner = new ToolRunner(dataDirectory, { generate });
+    await runner.load();
+    const run = await runner.run("generate-image", { prompt: "Four icons", resolution: "1K", aspectRatio: "1:1", outputs: 2 });
+
+    expect(generate).toHaveBeenCalledTimes(2);
+    expect(generate).toHaveBeenCalledWith({ prompt: "Four icons", resolution: "1K", aspectRatio: "1:1" }, undefined, { journal: expect.any(Object), resuming: false, outputs: 2 });
+    expect(run.files).toEqual([
+      { name: "output-1.webp", mediaType: "image/webp" },
+      { name: "output-2.webp", mediaType: "image/webp" },
+    ]);
+
+    expect((await readdir(path.join(dataDirectory, "tools", "runs", run.id))).sort()).toEqual(["output-1.webp", "output-2.webp", "run.json"]);
+  });
+
+  it("names generated images by their actual format", async () => {
+    const dataDirectory = await temporaryData();
+    const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13]);
+    const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0, 16]);
+    const outputs = [png, jpeg];
+    // A proxy can ignore the requested WebP format and return other bytes.
+    const generate = vi.fn<ImageGenerator["generate"]>().mockImplementation(async () => ({
+      bytes: outputs.shift()!,
+      mediaType: "image/webp",
+    }));
+    const runner = new ToolRunner(dataDirectory, { generate });
+    await runner.load();
+    const run = await runner.run("generate-image", { prompt: "Two icons", resolution: "1K", aspectRatio: "1:1", outputs: 2 });
+
+    expect(run.files).toEqual([
+      { name: "output-1.png", mediaType: "image/png" },
+      { name: "output-2.jpg", mediaType: "image/jpeg" },
+    ]);
+    const runDirectory = path.join(dataDirectory, "tools", "runs", run.id);
+    expect(await readFile(path.join(runDirectory, "output-1.png"))).toEqual(png);
+    await expect(runner.file(run.id, "output-2.jpg")).resolves.toMatchObject({ bytes: jpeg, mediaType: "image/jpeg" });
+  });
+
+  it("validates requests and reports missing configuration", async () => {
+    const runner = new ToolRunner(await temporaryData(), fakeGenerator());
+    await runner.load();
+
+    await expect(runner.run("missing", { prompt: "image" })).rejects.toMatchObject({ statusCode: 404 });
+    const invalid: Array<[string, unknown]> = [
+      ["generate-image", { prompt: " " }],
+      ["image-to-3d", { images: [{ mediaType: "image/webp", data: "aW1hZ2U=" }] }],
+      ["image-to-3d", { prompt: "model", images: [{ mediaType: "image/png", data: "aW1hZ2U=" }] }],
+      ["image-to-3d", { prompt: "model" }],
+      ["image-to-3d", { images: [] }],
+      ["image-to-3d", { targetPolycount: 4_000 }],
+      ["image-to-3d", { images: [{ mediaType: "image/png", data: "aW1hZ2U=" }], model: { provider: "meshy", id: "unknown-meshy-version" } }],
+      ["image-to-3d", { images: [{ mediaType: "image/png", data: "aW1hZ2U=" }], model: null }],
+      ["image-to-3d", { images: [{ mediaType: "image/png", data: "aW1hZ2U=" }], targetPolycount: 100_000 }],
+      ["image-to-3d", { images: Array.from({ length: 5 }, () => ({ mediaType: "image/png", data: "aW1hZ2U=" })), model: { provider: "meshy", id: "meshy-7.1" } }],
+      ["image-to-3d", { images: Array.from({ length: 2 }, () => ({ mediaType: "image/png", data: "aW1hZ2U=" })) }],
+      ["generate-image", { prompt: "image", size: "800x600" }],
+      ["generate-image", { prompt: "image", size: "1024x1024", resolution: "1K", aspectRatio: "1:1" }],
+      ["generate-image", { prompt: "image", resolution: "1K" }],
+    ];
+    for (const [toolId, input] of invalid) {
+      await expect(runner.run(toolId, input as never)).rejects.toMatchObject({ statusCode: 400 });
+    }
+
+    const unconfigured = new ToolRunner(await temporaryData(), {
+      generate: async () => { throw new ImageGenerationError("Image generation is not configured", 503); },
+    });
+    await unconfigured.load();
+    await expect(unconfigured.run("generate-image", { prompt: "image" }))
+      .rejects.toMatchObject({ statusCode: 503, message: "Image generation is not configured" });
+  });
+
+  it("passes the selected model through tool job requests", async () => {
+    const generate = vi.fn().mockResolvedValue({ bytes: Buffer.from("video"), mediaType: "video/mp4" as const });
+    const app = createApp({ dataDirectory: await temporaryData(), imageGenerator: fakeGenerator(), videoGenerator: { generate } });
+    apps.push(app);
+    const response = await app.inject({
+      method: "POST",
+      url: "/tools/generate-video/jobs",
+      payload: { prompt: "A nebula", model: TEST_VIDEO_MODEL, duration: 6, aspectRatio: "16:9", resolution: "720p" },
+    });
+    expect(response.statusCode).toBe(202);
+    await vi.waitFor(() => expect(generate).toHaveBeenCalledWith(expect.objectContaining({ model: TEST_VIDEO_MODEL }), expect.anything(), { journal: expect.any(Object) }));
+  });
+
+  it("limits tool request bodies", async () => {
+    const app = createApp({ dataDirectory: await temporaryData(), imageGenerator: fakeGenerator() });
+    apps.push(app);
+    const response = await app.inject({
+      method: "POST",
+      url: "/tools/image-to-3d/jobs",
+      payload: { images: [{ mediaType: "image/png", data: "a".repeat(26 * 1024 * 1024) }] },
+    });
+    expect(response.statusCode).toBe(413);
+  });
+
+  it("cancels image generation without persisting a run", async () => {
+    const dataDirectory = await temporaryData();
+    const generate: ImageGenerator["generate"] = async (_input, signal) => new Promise((_resolve, reject) => {
+      signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+    });
+    const runner = new ToolRunner(dataDirectory, { generate });
+    await runner.load();
+    const controller = new AbortController();
+
+    const run = runner.run("generate-image", { prompt: "A forest" }, controller.signal);
+    controller.abort();
+
+    await expect(run).rejects.toMatchObject({ name: "AbortError" });
+    expect(await readdir(path.join(dataDirectory, "tools", "runs"))).toEqual([]);
+  });
+
+  it("reads files from direct runs for Agent tools", async () => {
+    const dataDirectory = await temporaryData();
+    const runner = new ToolRunner(dataDirectory, fakeGenerator());
+    await runner.load();
+
+    const run = await runner.run("generate-image", { prompt: "A forest" });
+    await expect(runner.file(run.id, "output.webp")).resolves.toEqual({
+      bytes: Buffer.from("image"),
+      mediaType: "image/webp",
+    });
+    await expect(runner.file("not-a-run", "output.webp")).resolves.toBeUndefined();
+    await expect(runner.file(run.id, "../output.webp")).resolves.toBeUndefined();
+    await runner.removeRun(run.id);
+    await expect(runner.file(run.id, "output.webp")).resolves.toBeUndefined();
+  });
+
+  it("runs media generations as concurrent background jobs", async () => {
+    const pending: Array<(value: { bytes: Buffer; mediaType: "image/webp" }) => void> = [];
+    const generate: ImageGenerator["generate"] = async () => new Promise((resolve) => pending.push(resolve));
+    const dataDirectory = await temporaryData();
+    const app = createApp({ dataDirectory, imageGenerator: { generate } });
+    apps.push(app);
+
+    const projectId = (await app.inject({ method: "POST", url: "/projects", payload: { type: "asset-canvas" } })).json().id;
+    const first = await app.inject({ method: "POST", url: "/tools/generate-image/jobs", payload: { prompt: "First image", projectId, nodeId: "node-1" } });
+    const second = await app.inject({ method: "POST", url: "/tools/generate-image/jobs", payload: { prompt: "Second image" } });
+
+    expect(first.statusCode).toBe(202);
+    expect(second.statusCode).toBe(202);
+    await vi.waitFor(() => expect(pending).toHaveLength(2));
+    expect((await app.inject({ method: "GET", url: "/tool-jobs" })).json()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: second.json().id, status: "running", title: "Second image" }),
+      expect.objectContaining({ id: first.json().id, status: "running", title: "First image", context: { projectId, nodeId: "node-1" } }),
+    ]));
+
+    pending[0]!({ bytes: Buffer.from("first"), mediaType: "image/webp" });
+    pending[1]!({ bytes: Buffer.from("second"), mediaType: "image/webp" });
+    await vi.waitFor(async () => {
+      const jobs = (await app.inject({ method: "GET", url: "/tool-jobs" })).json();
+      expect(jobs.every((job: { status: string }) => job.status === "succeeded")).toBe(true);
+    });
+    const completed = (await app.inject({ method: "GET", url: "/tool-jobs" })).json();
+    expect(completed).toHaveLength(2);
+    expect(completed.every((job: { run?: unknown }) => Boolean(job.run))).toBe(true);
+    for (const job of completed) {
+      await expect(access(path.join(dataDirectory, "tools", "runs", job.run.id))).rejects.toMatchObject({ code: "ENOENT" });
+    }
+  });
+
+  it("requires Canvas job context to include both project and node", async () => {
+    const app = createApp({ dataDirectory: await temporaryData(), imageGenerator: fakeGenerator() });
+    apps.push(app);
+    const response = await app.inject({
+      method: "POST",
+      url: "/tools/generate-image/jobs",
+      payload: { prompt: "Image", projectId: "project-1" },
+    });
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toEqual({ error: "Project and node context must be provided together" });
+  });
+
+  it("cancels and retries a background generation job", async () => {
+    let attempt = 0;
+    const generate: ImageGenerator["generate"] = async (_input, signal) => {
+      attempt += 1;
+      if (attempt > 1) return { bytes: Buffer.from("retried"), mediaType: "image/webp" };
+      return new Promise((_resolve, reject) => signal?.addEventListener("abort", () => reject(signal.reason), { once: true }));
+    };
+    const app = createApp({ dataDirectory: await temporaryData(), imageGenerator: { generate } });
+    apps.push(app);
+    const created = await app.inject({ method: "POST", url: "/tools/generate-image/jobs", payload: { prompt: "Retry me" } });
+
+    await vi.waitFor(() => expect(attempt).toBe(1));
+    const cancelled = await app.inject({ method: "POST", url: `/tool-jobs/${created.json().id}/cancel` });
+    expect(cancelled.statusCode).toBe(200);
+    expect(cancelled.json().status).toBe("cancelled");
+    await vi.waitFor(async () => {
+      const [job] = (await app.inject({ method: "GET", url: "/tool-jobs" })).json();
+      expect(job.status).toBe("cancelled");
+    });
+    const retried = await app.inject({ method: "POST", url: `/tool-jobs/${created.json().id}/retry` });
+    expect(retried.statusCode).toBe(202);
+    await vi.waitFor(async () => {
+      const jobs = (await app.inject({ method: "GET", url: "/tool-jobs" })).json();
+      expect(jobs.find((job: { id: string }) => job.id === retried.json().id)?.status).toBe("succeeded");
+      expect(jobs.some((job: { id: string }) => job.id === created.json().id)).toBe(false);
+    });
+  });
+
+  it("freezes a resolved model for retries and shares resolution with direct project calls", async () => {
+    let current = { provider: "studio", id: "first" };
+    const resolve = vi.fn(async (_tool: string, input: object, projectId?: string) => ({ ...input, prompt: "Icon", imageModel: { ...current, provider: projectId ?? current.provider } }));
+    const generate = vi.fn<ImageGenerator["generate"]>()
+      .mockRejectedValueOnce(new ImageGenerationError("Temporary failure", 502))
+      .mockResolvedValue({ bytes: Buffer.from("image"), mediaType: "image/png" });
+    const runner = new ToolRunner(await temporaryData(), { generate }, undefined, undefined, undefined, resolve);
+    await runner.load();
+    const first = runner.start("generate-image", { prompt: "Icon" });
+    await vi.waitFor(() => expect(runner.jobs()[0]?.status).toBe("failed"));
+    current = { provider: "another-studio", id: "second" };
+    runner.retryJob(first.id);
+    await vi.waitFor(() => expect(runner.jobs()[0]?.status).toBe("succeeded"));
+    expect(generate.mock.calls.map(([input]) => input.imageModel)).toEqual([{ provider: "studio", id: "first" }, { provider: "studio", id: "first" }]);
+    expect(resolve).toHaveBeenCalledTimes(1);
+    await runner.run("generate-image", { prompt: "Icon" }, undefined, "project-1");
+    expect(generate.mock.calls.at(-1)?.[0].imageModel).toEqual({ provider: "project-1", id: "second" });
+  });
+
+  it("logs each finished generation without its prompt", async () => {
+    const lines: { level: string; message: string; details: Record<string, unknown> }[] = [];
+    const generate = vi.fn<ImageGenerator["generate"]>()
+      .mockRejectedValueOnce(new ImageGenerationError("The provider rejected the request", 400))
+      .mockResolvedValue({ bytes: Buffer.from("image"), mediaType: "image/png" });
+    const runner = new ToolRunner(await temporaryData(), { generate });
+    runner.setLogger({
+      info: (details, message) => lines.push({ level: "info", message, details: details as Record<string, unknown> }),
+      warn: (details, message) => lines.push({ level: "warn", message, details: details as Record<string, unknown> }),
+    });
+    await runner.load();
+
+    runner.start("generate-image", { prompt: "A secret castle", imageModel: { provider: "openai", id: "gpt-image-1" } }, { context: { projectId: "p1", nodeId: "n1" } });
+    await vi.waitFor(() => expect(lines).toHaveLength(1));
+    runner.start("generate-image", { prompt: "A secret castle", imageModel: { provider: "openai", id: "gpt-image-1" } });
+    await vi.waitFor(() => expect(lines).toHaveLength(2));
+
+    expect(lines).toEqual([
+      { level: "warn", message: "Generation failed", details: { toolId: "generate-image", model: "openai/gpt-image-1", projectId: "p1", durationMs: expect.any(Number), error: "The provider rejected the request" } },
+      { level: "info", message: "Generation succeeded", details: { toolId: "generate-image", model: "openai/gpt-image-1", durationMs: expect.any(Number) } },
+    ]);
+    expect(JSON.stringify(lines)).not.toContain("secret castle");
+  });
+
+  it("keeps only recent completed background jobs", async () => {
+    const app = createApp({ dataDirectory: await temporaryData(), imageGenerator: fakeGenerator() });
+    apps.push(app);
+
+    await Promise.all(Array.from({ length: 21 }, (_, index) => app.inject({
+      method: "POST",
+      url: "/tools/generate-image/jobs",
+      payload: { prompt: `Image ${index}` },
+    })));
+    await vi.waitFor(async () => {
+      const jobs = (await app.inject({ method: "GET", url: "/tool-jobs" })).json();
+      expect(jobs).toHaveLength(20);
+      expect(jobs.every((job: { status: string }) => job.status === "succeeded")).toBe(true);
+    });
+  });
+
+  it("logs direct agent and prepared canvas generations once with project context", async () => {
+    const generate = vi.fn<ImageGenerator["generate"]>()
+      .mockResolvedValueOnce({ bytes: Buffer.from("image"), mediaType: "image/png" })
+      .mockRejectedValueOnce(new ImageGenerationError("Provider failed", 502))
+      .mockRejectedValueOnce(new DOMException("Cancelled", "AbortError"));
+    const runner = new ToolRunner(await temporaryData(), { generate });
+    const info = vi.fn(), warn = vi.fn();
+    runner.setLogger({ info, warn });
+    await runner.load();
+    try {
+      const request = { prompt: "A private castle", imageModel: { provider: "openai", id: "gpt-image-1" } };
+      await runner.run("generate-image", request, undefined, "agent-project");
+      await expect(runner.runPrepared("generate-image", request, undefined, { projectId: "canvas-project" })).rejects.toThrow("Provider failed");
+      await expect(runner.runPrepared("generate-image", request)).rejects.toThrow("Cancelled");
+      expect(info.mock.calls).toEqual([
+        [expect.objectContaining({ toolId: "generate-image", model: "openai/gpt-image-1", projectId: "agent-project", durationMs: expect.any(Number) }), "Generation succeeded"],
+        [expect.objectContaining({ toolId: "generate-image" }), "Generation cancelled"],
+      ]);
+      expect(warn.mock.calls).toEqual([[expect.objectContaining({ projectId: "canvas-project", error: "Provider failed" }), "Generation failed"]]);
+      expect(JSON.stringify([...info.mock.calls, ...warn.mock.calls])).not.toContain("private castle");
+    } finally { await runner.close(); }
+  });
+
+  it("keeps generation results and persisted jobs when the logger throws", async () => {
+    const dataDirectory = await temporaryData();
+    const failure = new ImageGenerationError("Provider failed", 502);
+    const generate = vi.fn<ImageGenerator["generate"]>()
+      .mockResolvedValueOnce({ bytes: Buffer.from("image"), mediaType: "image/png" })
+      .mockRejectedValueOnce(failure)
+      .mockResolvedValue({ bytes: Buffer.from("image"), mediaType: "image/png" });
+    const runner = new ToolRunner(dataDirectory, { generate });
+    runner.setLogger({ info: () => { throw new Error("Logger failed"); }, warn: () => { throw new Error("Logger failed"); } });
+    await runner.load();
+    try {
+      const request = { prompt: "fixture" };
+      await expect(runner.run("generate-image", request)).resolves.toMatchObject({ toolId: "generate-image" });
+      await expect(runner.run("generate-image", request)).rejects.toMatchObject({ message: failure.message, statusCode: failure.statusCode });
+      const job = runner.start("generate-image", request);
+      await vi.waitFor(() => expect(runner.jobs().find(({ id }) => id === job.id)?.status).toBe("succeeded"));
+    } finally { await runner.close(); }
+    expect(JSON.parse(await readFile(path.join(dataDirectory, "tools", "jobs.json"), "utf8"))).toMatchObject([{ status: "succeeded" }]);
+  });
+
+  it("records direct and background preparation failures without calling the provider", async () => {
+    const generate = vi.fn<ImageGenerator["generate"]>();
+    const runner = new ToolRunner(await temporaryData(), { generate }, undefined, undefined, undefined, async () => { throw new Error("Provider is disabled"); });
+    const warn = vi.fn();
+    runner.setLogger({ info: vi.fn(), warn });
+    await runner.load();
+    try {
+      await expect(runner.run("generate-image", { prompt: "fixture" }, undefined, "p1")).rejects.toThrow("Provider is disabled");
+      const job = runner.start("generate-image", { prompt: "fixture" });
+      await vi.waitFor(() => expect(runner.jobs().find(({ id }) => id === job.id)?.status).toBe("failed"));
+      expect(warn).toHaveBeenCalledTimes(2);
+      expect(warn).toHaveBeenCalledWith(expect.objectContaining({ projectId: "p1", error: "Provider is disabled" }), "Generation failed");
+      expect(generate).not.toHaveBeenCalled();
+    } finally { await runner.close(); }
+  });
+
+});
+
+function temporaryData(): Promise<string> {
+  return mkdtemp(path.join(tmpdir(), "ohmygame-tools-"));
+}
+
+function fakeGenerator(): ImageGenerator {
+  return { generate: async () => ({ bytes: Buffer.from("image"), mediaType: "image/webp" }) };
+}

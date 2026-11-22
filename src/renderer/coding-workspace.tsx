@@ -1,0 +1,2058 @@
+import { previewPageUrl as isolatedPreviewUrl } from "../shared/preview-page.js";
+import {
+  Check,
+  Copy,
+  Gamepad2,
+  MoreHorizontal,
+  MousePointer2,
+  ChevronDown,
+  ChevronRight,
+  Code2,
+  ExternalLink,
+  FileCode2,
+  FileConfig,
+  FileDocument,
+  FilePlain,
+  FileStyle,
+  FileText,
+  Folder,
+  FolderOpen,
+  Globe2,
+  Music2,
+  FolderPlus,
+  Image as ImageIcon,
+  LaptopMinimalistic,
+  Layers3,
+  LoaderCircle,
+  Monitor,
+  Pencil,
+  Plus,
+  Play,
+  RefreshCw,
+  Search,
+  SlidersHorizontal,
+  Palette,
+  Smartphone,
+  Server,
+  Tablet,
+  Terminal,
+  Plug,
+  Trash2,
+  X,
+  type IconComponent,
+} from "./icons.js";
+import { usePluginSlot } from "./project-plugin-contributions.js";
+import { Fragment, lazy, Suspense, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type ComponentProps, type CSSProperties, type ReactNode } from "react";
+import { createPortal } from "react-dom";
+import { Tree, type NodeRendererProps, type TreeApi } from "react-arborist";
+import { isBuiltinPreviewViewport, PREVIEW_VIEWPORTS } from "../shared/contracts.js";
+import type { PreviewViewport, ProjectFileOpenMode, ProjectState, WorkspaceFile, WorkspaceFileContent } from "../shared/contracts.js";
+import type { GameRename } from "../shared/publish-v1.js";
+import type { ProjectInputMap, ProjectPreviewDevice, ProjectPreviewFilter } from "../shared/plugins.js";
+import { colorMatrixValues, type PreviewColorFilter } from "../shared/preview-filter.js";
+import type { GamepadKeyMap } from "../shared/preview-input.js";
+import type { PlaytestWatchState } from "../shared/playtest.js";
+import { buildsWebPreview, supportsWebPreview } from "../shared/project-runtime.js";
+import { isProjectDataPath } from "../shared/project-layout.js";
+import type { GameTuningState } from "../shared/game-tuning.js";
+import { GameTuningPanel } from "./game-tuning-panel.js";
+import { createWorkspaceEntry, deleteWorkspaceEntry, setPreviewInputMap, setPreviewPicking, getProjectCover, getProjectCoverState, getWorkspaceFile, listWorkspaceFiles, renameWorkspaceEntry, saveProjectAssetToLibrary, setProjectCover } from "./api.js";
+import { captureElementImage } from "./page-capture.js";
+import { AssetThumbnail, WorkspaceAssetDialog, assetSortDetail, fileExtension, fileName, filterAssets, hasMediaType, libraryAssetOriginLabel, mediaTypeLabel, type BrowsableAsset, type MediaFilter, type ProjectAssetFilters } from "./asset-browser.js";
+import { sortAssets, type AssetSort } from "./asset-sort.js";
+import { useNearViewport } from "./asset-gallery.js";
+import { AssetSortSelect, ProjectAssetFilterRow, useAssetSort } from "./library-filters.js";
+import "./library.css";
+import { ProjectRenameDialog } from "./project-rename-dialog.js";
+import { HighlightedCode } from "./highlighted-code.js";
+import { MarkdownContent, workspaceLinkPath } from "./markdown-content.js";
+import { PublishDialog, type PublishDetails } from "./publish-dialog.js";
+import { ProjectPreviewSettings } from "./project-preview-settings.js";
+import type { ProjectSettingsSlot } from "./project-settings.js";
+import { AssetMedia } from "./asset-gallery.js";
+import { useWorkspaceAssetUrl } from "./use-workspace-asset-url.js";
+import { useWorkspaceFiles } from "./use-workspace-files.js";
+import { useWebGamePlayer } from "./use-web-game-player.js";
+import { GameRecordButton } from "./game-recording.js";
+import { ErrorBoundary } from "./error-boundary.js";
+import { gamePanelAddable, panelTitle } from "./workspace-layout.js";
+import { useReadyRuntimeGeneration, useRuntimeConnection } from "./runtime-connection.js";
+import { DesktopGamePreview } from "./desktop-game-preview.js";
+import { t } from "./i18n.js";
+import { GitChangesList, useWorkspaceGitChanges, WorkspaceGitDiff } from "./workspace-git-changes.js";
+import type { PanelNodes } from "./panel-layout.js";
+import { useCanvasDocuments } from "./use-canvas-documents.js";
+import { Button, CategoryMark, Disclosure, DropdownMenu, Empty, IconButton, MediaTile, SearchInput, Tabs } from "./ui/index.js";
+
+const CanvasWorkspace = lazy(() => import("./canvas-workspace.js").then((module) => ({ default: module.CanvasWorkspace })));
+const DesignDocumentPanel = lazy(() => import("./design-document-panel.js").then((module) => ({ default: module.DesignDocumentPanel })));
+type WorkspaceContextMenu = { path: string; directory: boolean; x: number; y: number };
+type WorkspaceFileChange = { from?: string; to?: string };
+type WorkspaceEntryAction = "new-file" | "new-folder" | "rename" | "delete" | "copy-path" | "save-library";
+
+export function workspacePathAfterChange(selectedPath: string | undefined, change: WorkspaceFileChange): string | undefined {
+  if (!change.from) return change.to ?? selectedPath;
+  if (!selectedPath || (selectedPath !== change.from && !selectedPath.startsWith(`${change.from}/`))) return selectedPath;
+  return change.to ? `${change.to}${selectedPath.slice(change.from.length)}` : undefined;
+}
+interface CodingWorkspaceProps {
+  project?: ProjectState;
+  publishing: boolean;
+  workspaceRevision: number;
+  /** The latest tuned values the daemon announced. */
+  gameTuning?: GameTuningState;
+  previewPaused?: boolean;
+  onPublish: (details: PublishDetails) => Promise<boolean>;
+  publishDialog?: "open" | "success";
+  onClosePublish: () => void;
+  onRestart: (project?: ProjectState, reinstall?: boolean) => void;
+  onStop?: () => Promise<void>;
+  onAskAgent?: (text: string) => void;
+  /** Shows the canvas in place of the first view when there are no panels. */
+  canvasOpen?: boolean;
+  onDesignSaveReady?: (save: (() => Promise<void>) | undefined) => void;
+  onDesignContextChange?: (context: import("../shared/contracts.js").PromptContext | undefined) => void;
+  onProjectUpdated?: (project: ProjectState) => void;
+  /** The published game's page was renamed from the publish dialog. */
+  onGameRenamed?: (renamed: GameRename) => void;
+  openFileRequest?: { path: string; id: number };
+  /** The design document the next message references, by its workspace path. */
+  referencedDocument?: string;
+  /** References a design document in the next message, or stops referencing it. */
+  onReferenceDocument?: (document: { id: string; title: string } | undefined) => void;
+  /** Quotes text picked in the design document into the next message. */
+  onQuoteDocument?: (text: string) => void;
+  /** The preview page that is picking an element for the next message. */
+  pickingClient?: string;
+  onPickingChange?: (client: string | undefined) => void;
+  /** The preview devices the project's plugins add. */
+  previewDevices?: readonly ProjectPreviewDevice[];
+  /** The colour filters the project's plugins add. */
+  previewFilters?: readonly ProjectPreviewFilter[];
+  /** The gamepad maps the project's plugins add. */
+  inputMaps?: readonly ProjectInputMap[];
+  /** Present while the project's settings show this workspace's tab. */
+  settingsSlot?: ProjectSettingsSlot;
+  /** Opens the project's settings on this workspace's tab. */
+  onOpenSettings?: () => void;
+  /**
+   * The panels the views render into. Without them (in tests), the first
+   * view renders in place.
+   */
+  panels?: CodingPanels;
+}
+
+/** The workspace's views, each a panel of its own. */
+export type CodingView = "preview" | "design" | "canvas" | "code" | "assets";
+
+export interface CodingPanels {
+  /** Where each view renders: its panel's body and its controls in the tab strip. */
+  nodes: Record<CodingView, PanelNodes>;
+  /** The views the person can see now. */
+  visible: ReadonlySet<CodingView>;
+  /** Brings a view forward, opening its panel if it was closed. */
+  onShow: (view: CodingView) => void;
+  /** The top bar's slot for Play, which opens the game in its own window from any view. */
+  play?: HTMLElement | null;
+}
+
+export function CodingWorkspace({
+  project,
+  publishing,
+  workspaceRevision,
+  gameTuning,
+  previewPaused = false,
+  onPublish,
+  publishDialog,
+  onClosePublish,
+  onRestart,
+  onStop,
+  onAskAgent,
+  canvasOpen = false,
+  onDesignSaveReady,
+  onDesignContextChange,
+  onProjectUpdated,
+  onGameRenamed,
+  openFileRequest,
+  referencedDocument,
+  onReferenceDocument,
+  onQuoteDocument,
+  pickingClient,
+  onPickingChange,
+  previewDevices = NO_DEVICES,
+  previewFilters = NO_FILTERS,
+  inputMaps = NO_INPUT_MAPS,
+  settingsSlot,
+  onOpenSettings,
+  panels,
+}: CodingWorkspaceProps) {
+  const supportsPreview = supportsWebPreview(project);
+  const hasPreview = supportsWebPreview(project);
+  const visible = panels?.visible ?? new Set<CodingView>([canvasOpen ? "canvas" : hasPreview ? "preview" : "code"]);
+  const shows = (view: CodingView) => visible.has(view);
+  const show = (view: CodingView) => panels?.onShow(view);
+  // A view's body mounts the first time it shows and then stays, so a hidden
+  // panel keeps its place (the design canvas, the open file).
+  const opened = useRef(new Set<CodingView>());
+  for (const view of visible) opened.current.add(view);
+  const [designHeaderActions, setDesignHeaderActions] = useState<HTMLDivElement | null>(null);
+  const [documentToolbar, setDocumentToolbar] = useState<HTMLDivElement | null>(null);
+  // The design document and the canvas show the same documents, so they share
+  // them. Loading creates the project's canvas, so it waits for either to open.
+  const documentsOpened = !!project && (opened.current.has("design") || opened.current.has("canvas"));
+  const documents = useCanvasDocuments(project?.id ?? "", documentsOpened);
+  const documentsRef = useRef(documents);
+  documentsRef.current = documents;
+  // Saving the design saves the canvas, which saves the documents too, or the
+  // documents alone while the canvas hasn't opened.
+  const canvasSave = useRef<(() => Promise<void>) | undefined>(undefined);
+  const registerCanvasSave = useCallback((save: (() => Promise<void>) | undefined) => { canvasSave.current = save; }, []);
+  const saveDesign = useCallback(() => canvasSave.current ? canvasSave.current() : documentsRef.current.flush(), []);
+  useEffect(() => {
+    if (!documentsOpened) return;
+    onDesignSaveReady?.(saveDesign);
+    return () => onDesignSaveReady?.(undefined);
+  }, [documentsOpened, onDesignSaveReady, saveDesign]);
+  const [chosenViewport, setViewport] = useState<PreviewViewport>(project?.previewViewport ?? "fit");
+  const { viewport, device } = shownViewport(chosenViewport, previewDevices);
+  // For this visit only; a filter whose plugin is gone is off.
+  const [filterId, setFilterId] = useState<string>();
+  const filter = previewFilters.find((item) => item.id === filterId);
+  const [tuningOpen, setTuningOpen] = useState(false);
+  const [previewPath, setPreviewPath] = useState(project?.previewPath ?? "/");
+  const [previewClient] = useState(() => crypto.randomUUID());
+  const [actualPreviewPath, setActualPreviewPath] = useState(project?.previewPath ?? "/");
+  const [logsOpen, setLogsOpen] = useState(false);
+  const [knownPaths, setKnownPaths] = useState<string[]>(["/"]);
+  const [files, setFiles] = useState<WorkspaceFile[]>([]);
+  const [codeFileRequest, setCodeFileRequest] = useState(openFileRequest);
+  const codeRequestId = useRef(0);
+  const [filesLoading, setFilesLoading] = useState(false);
+  const [filesError, setFilesError] = useState<string>();
+  const [filesRevision, setFilesRevision] = useState(0);
+  const [reload, setReload] = useState(0);
+  const [agentPlaytestWatch, setAgentPlaytestWatch] = useState<PlaytestWatchState | undefined>(() => (
+    typeof window !== "undefined" && window.ohMyGameDesktop?.agentPlaytests ? { visible: false, activeSessions: 0 } : undefined
+  ));
+  const [agentPlaytestWatchPending, setAgentPlaytestWatchPending] = useState(false);
+  const preview = project?.preview;
+  const previewBaseUrl = preview?.status === "ready" ? preview.url : undefined;
+  const player = useWebGamePlayer(supportsPreview ? project?.id : undefined, previewBaseUrl, preview?.revision, preview?.pages?.find((page) => page.source === "player")?.path);
+  const nativePreview = typeof window !== "undefined" && window.ohMyGameDesktop?.webGamePlayer?.preview;
+  const gameClient = nativePreview ? player.client ?? previewClient : previewClient;
+  const previewPageUrl = previewBaseUrl ? isolatedPreviewUrl(new URL(previewPath, previewBaseUrl).toString(), "editor", gameClient) : undefined;
+  const currentPreviewUrl = previewBaseUrl ? isolatedPreviewUrl(new URL(actualPreviewPath, previewBaseUrl).toString(), "editor", gameClient) : undefined;
+  const previewStage = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const page = preview?.pages?.find((page) => nativePreview ? page.client === gameClient : player.open ? page.source === "player" : page.client === previewClient);
+    if (!page) return;
+    setActualPreviewPath(page.path);
+    setKnownPaths((current) => current.includes(page.path) ? current : [...current, page.path]);
+  }, [preview?.pages, gameClient, previewClient, player.open, nativePreview]);
+
+  useEffect(() => {
+    setPreviewPath(project?.previewPath ?? "/");
+    setActualPreviewPath(project?.previewPath ?? "/");
+  }, [project?.id, project?.previewPath]);
+
+  useEffect(() => {
+    if (preview?.status !== "ready") setPreviewPath(actualPreviewPath);
+  }, [preview?.status]);
+  const previousPlayerOpen = useRef(false);
+  useEffect(() => {
+    if (!nativePreview && previousPlayerOpen.current && !player.open) {
+      const page = preview?.pages?.find((page) => page.source === "player");
+      if (page) { setPreviewPath(page.path); setActualPreviewPath(page.path); }
+    }
+    previousPlayerOpen.current = player.open;
+  }, [player.open]);
+
+  useEffect(() => {
+    setViewport(project?.previewViewport ?? "fit");
+  }, [project?.id, project?.previewViewport]);
+
+  useEffect(() => setFilterId(undefined), [project?.id]);
+  // Off until the person picks one; remembered per project on this device.
+  const [inputMapId, setInputMapId] = useState(() => savedInputMap(project?.id));
+  useEffect(() => setInputMapId(savedInputMap(project?.id)), [project?.id]);
+  // Reading the plugins again gives new objects; only a different map changes anything.
+  const inputMap = inputMaps.find((item) => item.id === inputMapId);
+  const inputMapJson = inputMap && JSON.stringify(inputMap.map);
+  const runtimeGeneration = useReadyRuntimeGeneration();
+  useEffect(() => {
+    if (!project?.id || !inputMapJson) return;
+    const projectId = project.id;
+    sendInputMap(projectId, JSON.parse(inputMapJson) as GamepadKeyMap);
+    return () => sendInputMap(projectId, null);
+  }, [project?.id, inputMapJson, runtimeGeneration]);
+  const chooseInputMap = (id: string | undefined) => {
+    setInputMapId(id);
+    if (project?.id) saveInputMap(project.id, id);
+  };
+  // The desktop game draws its own filter, in Preview and Play alike.
+  const setNativeFilter = typeof window !== "undefined" ? window.ohMyGameDesktop?.webGamePlayer?.setFilter : undefined;
+  const filterJson = filter && JSON.stringify(gameFilter(filter));
+  useEffect(() => {
+    if (!setNativeFilter || !project?.id || !filterJson) return;
+    const projectId = project.id;
+    void setNativeFilter(projectId, JSON.parse(filterJson) as PreviewColorFilter).catch(() => {});
+    return () => { void setNativeFilter(projectId, null).catch(() => {}); };
+  }, [setNativeFilter, project?.id, filterJson]);
+
+  useEffect(() => {
+    setKnownPaths(["/"]);
+  }, [project?.id]);
+
+  useEffect(() => {
+    const watch = window.ohMyGameDesktop?.agentPlaytests;
+    if (!watch) return;
+    let disposed = false;
+    const unsubscribe = watch.onState((state) => { if (!disposed) setAgentPlaytestWatch(state); });
+    void watch.state().then((state) => { if (!disposed) setAgentPlaytestWatch(state); }).catch(() => undefined);
+    return () => { disposed = true; unsubscribe(); };
+  }, []);
+
+  useEffect(() => {
+    setFiles([]);
+    setFilesError(undefined);
+    setCodeFileRequest(undefined);
+  }, [project?.id]);
+
+  useEffect(() => {
+    if (!project || !shows("assets")) return;
+    let disposed = false;
+    setFilesLoading(true);
+    setFilesError(undefined);
+    void listWorkspaceFiles(project.id).then((result) => {
+      if (disposed) return;
+      setFiles(result);
+    }).catch((cause) => {
+      if (!disposed) setFilesError(errorMessage(cause));
+    }).finally(() => {
+      if (!disposed) setFilesLoading(false);
+    });
+    return () => { disposed = true; };
+  }, [project?.id, shows("assets"), workspaceRevision, filesRevision]);
+
+  useEffect(() => {
+    if (!openFileRequest) return;
+    setCodeFileRequest({ path: openFileRequest.path, id: ++codeRequestId.current });
+    show("code");
+  }, [openFileRequest?.id]);
+
+  function navigatePreview(path: string): void {
+    if (!previewBaseUrl) return;
+    const nextPath = normalizePreviewPath(path);
+    setPreviewPath(nextPath);
+    setActualPreviewPath(nextPath);
+    setKnownPaths((current) => current.includes(nextPath) ? current : [...current, nextPath]);
+  }
+
+  function refreshPreview(): void {
+    if (preview?.status === "ready") {
+      if (player.open) void player.reload();
+      else if (nativePreview) setReload((value) => value + 1);
+      else { setPreviewPath(actualPreviewPath); setReload((value) => value + 1); }
+    } else if (preview?.status === "error" || preview?.status === "stopped") {
+      onRestart();
+    }
+  }
+
+  function playGame(): void {
+    void player.play({ path: actualPreviewPath, viewport: playerViewport(viewport, device) });
+  }
+
+  async function toggleAgentPlaytestWatch(): Promise<void> {
+    const watch = window.ohMyGameDesktop?.agentPlaytests;
+    if (!watch || agentPlaytestWatchPending) return;
+    setAgentPlaytestWatchPending(true);
+    try { setAgentPlaytestWatch(await watch.setVisible(!agentPlaytestWatch?.visible)); }
+    catch { try { setAgentPlaytestWatch(await watch.state()); } catch {} }
+    finally { setAgentPlaytestWatchPending(false); }
+  }
+
+  const picking = pickingClient !== undefined && pickingClient === gameClient;
+  async function setPicking(active: boolean): Promise<void> {
+    if (!project) return;
+    onPickingChange?.(active ? gameClient : undefined);
+    try { await setPreviewPicking(project.id, gameClient, active); }
+    catch { if (active) onPickingChange?.(undefined); }
+  }
+  // Picking ends when the page it was in goes away.
+  useEffect(() => {
+    if (pickingClient !== undefined && (pickingClient !== gameClient || preview?.status !== "ready" || !shows("preview"))) {
+      if (project) void setPreviewPicking(project.id, pickingClient, false).catch(() => undefined);
+      onPickingChange?.(undefined);
+    }
+  }, [pickingClient, gameClient, preview?.status, shows("preview")]);
+  useEffect(() => {
+    if (!picking) return;
+    const onKey = (event: globalThis.KeyboardEvent) => { if (event.key === "Escape") void setPicking(false); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [picking]);
+
+  const canPlay = !player.open && (!project || preview?.status === "waiting" || preview?.status === "starting");
+  const playButton = supportsPreview ? <Button
+    size="sm"
+    variant="ghost"
+    className={`preview-play-button${player.open ? " is-active" : ""}`}
+    icon={player.pending ? <LoaderCircle className="spin" size={14} /> : <Play size={14} />}
+    data-tooltip={player.pending ? t("workspace.openingGame") : player.open ? undefined : t("workspace.playInWindow")}
+    disabled={player.pending || (player.checking && !player.error) || canPlay}
+    onClick={playGame}
+  >{player.open ? t("workspace.returnToGame") : t("workspace.play")}</Button> : null;
+  const recordButton = supportsPreview && project ? <GameRecordButton projectId={project.id} gameRunning={player.open || preview?.status === "ready"} /> : null;
+  const [codeToolbar, setCodeToolbar] = useState<HTMLDivElement | null>(null);
+  const openCode = (path: string) => {
+    setCodeFileRequest({ path, id: ++codeRequestId.current });
+    show("code");
+  };
+
+  const views: Record<CodingView, { toolbar?: ReactNode; body: ReactNode } | undefined> = {
+    preview: hasPreview ? {
+      toolbar: supportsPreview ? <>
+        <PreviewControls
+          path={actualPreviewPath}
+          paths={knownPaths}
+          status={preview?.status}
+          previewUrl={currentPreviewUrl}
+          refreshDisabled={!project || preview?.status === "waiting" || preview?.status === "starting"}
+          refreshLabel={preview?.status === "ready" ? t("workspace.reloadPreview") : t("workspace.restartPreview")}
+          viewport={viewport}
+          devices={previewDevices}
+          filters={previewFilters}
+          filter={filter?.id}
+          onFilterChange={setFilterId}
+          inputMaps={inputMaps}
+          inputMap={inputMap?.id}
+          onInputMapChange={chooseInputMap}
+          agentPlaytestWatch={agentPlaytestWatch}
+          agentPlaytestWatchPending={agentPlaytestWatchPending}
+          picking={picking}
+          pickDisabled={!project || preview?.status !== "ready" || player.open}
+          tuningOpen={tuningOpen}
+          onToggleTuning={buildsWebPreview(project) ? undefined : () => setTuningOpen((open) => !open)}
+          logsOpen={logsOpen}
+          onLogs={() => setLogsOpen((open) => !open)}
+          onNavigate={navigatePreview}
+          onRefresh={refreshPreview}
+          onRestart={() => onRestart()}
+          onTogglePicking={() => void setPicking(!picking)}
+          onToggleAgentPlaytestWatch={() => void toggleAgentPlaytestWatch()}
+          onViewportChange={setViewport}
+        />
+        {panels ? null : recordButton}
+        {panels ? null : playButton}
+      </> : undefined,
+      body: <>
+        {supportsPreview ? (
+          <div className="coding-workspace-preview-panel">
+            <ErrorBoundary label={t("errorBoundary.label.preview")} resetKey={previewPageUrl}>
+            <PreviewView
+              project={project} client={gameClient} onAskAgent={onAskAgent} onLogs={() => setLogsOpen(true)} onOpenFile={openCode} reload={reload} revision={workspaceRevision} url={previewPageUrl} viewport={viewport} device={device} filter={filter}
+              pausedAfterRecovery={previewPaused}
+              active={shows("preview")} playerOpen={player.open} suspended={player.suspended} pending={player.pending || player.checking}
+              error={player.error} onPlay={playGame} stageRef={previewStage}
+              onRetry={() => onRestart()} onSettings={onOpenSettings}
+            />
+            </ErrorBoundary>
+            {picking ? <span className="preview-pick-hint" role="status">{t("workspace.pickHint")}</span> : null}
+            {tuningOpen && project && !buildsWebPreview(project) ? <GameTuningPanel projectId={project.id} previewReady={preview?.status === "ready"} announced={gameTuning} revision={workspaceRevision} onAskAgent={onAskAgent} onClose={() => setTuningOpen(false)} /> : null}
+          </div>
+        ) : null}
+      </>,
+    } : project && gamePanelAddable(project) ? {
+      // A General project without its web preview: its engine's plugins say how to play it, else the switch is in Project settings.
+      body: <GameStartEmpty onOpenSettings={onOpenSettings} />,
+    } : undefined,
+    design: project ? {
+      toolbar: <div className="viewer-publish design-doc-toolbar" ref={setDocumentToolbar} />,
+      body: <Suspense fallback={<div className="design-loading"><LoaderCircle className="spin" size={18} /></div>}><DesignDocumentPanel
+        project={project} documents={documents} toolbarTarget={documentToolbar} referenced={referencedDocument}
+        onReference={(document) => onReferenceDocument?.(document)} onQuote={(text) => onQuoteDocument?.(text)} onAskAgent={onAskAgent}
+      /></Suspense>,
+    } : undefined,
+    canvas: project ? {
+      toolbar: <div className="viewer-publish design-header-actions" ref={setDesignHeaderActions} />,
+      body: <Suspense fallback={<div className="design-loading"><LoaderCircle className="spin" size={18} /></div>}><CanvasWorkspace
+        project={project} documents={documents} onProjectUpdated={onProjectUpdated} headerActionsTarget={designHeaderActions} onSaveReady={registerCanvasSave} onContextChange={onDesignContextChange}
+      /></Suspense>,
+    } : undefined,
+    code: {
+      toolbar: <div className="code-toolbar" ref={setCodeToolbar} />,
+      body: project ? <WorkspaceCodeView
+        key={project.id}
+        toolbarTarget={codeToolbar}
+        projectId={project.id}
+        revision={workspaceRevision + filesRevision}
+        enabled={shows("code")}
+        openFileRequest={codeFileRequest}
+        onFilesChanged={() => setFilesRevision((value) => value + 1)}
+      /> : null,
+    },
+    assets: {
+      body: <AssetsView
+        key={project?.id}
+        projectId={project?.id}
+        files={files.filter((file) => file.mediaType && !file.directory)}
+        loading={filesLoading}
+        error={filesError}
+        revision={workspaceRevision + filesRevision}
+        onShowInCode={openCode}
+      />,
+    },
+  };
+
+  // Each view keeps the workspace's classes, so its styles hold inside any panel.
+  // The preview logs cover the bottom of the view in sight, the game's first.
+  const logsView = (["preview", "code", "assets", "canvas", "design"] as const).find((view) => views[view] && shows(view));
+  const viewPane = (view: CodingView, body: ReactNode, header?: ReactNode) => (
+    <section className="viewer-pane coding-workspace" data-active-tab={view} aria-label={t("workspace.label")}>
+      {header}
+      {body}
+      {supportsPreview && logsOpen && view === logsView ? <PreviewLogs project={project} onClose={() => setLogsOpen(false)} /> : null}
+    </section>
+  );
+  const topPlay = panels?.play && playButton ? createPortal(<>{recordButton}{playButton}</>, panels.play) : null;
+  const placed = (Object.keys(views) as CodingView[]).map((view) => {
+    const content = views[view];
+    if (!content) return null;
+    if (!panels) {
+      // In place: only what shows, with its controls in a header.
+      return shows(view) ? <Fragment key={view}>{viewPane(view, content.body, content.toolbar ? <header className="pane-header viewer-header"><div className="viewer-publish">{content.toolbar}</div></header> : null)}</Fragment> : null;
+    }
+    if (!opened.current.has(view)) return null;
+    const nodes = panels.nodes[view];
+    // Each panel fails by itself, where it is, and leaves the others showing.
+    return <Fragment key={view}>
+      {content.toolbar ? createPortal(<div className="viewer-publish">{content.toolbar}</div>, nodes.toolbar) : null}
+      {createPortal(<ErrorBoundary label={panelTitle(view === "preview" ? "game" : view)} resetKey={project?.id}>{viewPane(view, content.body)}</ErrorBoundary>, nodes.body)}
+    </Fragment>;
+  });
+
+  return (
+    <>
+      {placed}
+      {topPlay}
+      {project && publishDialog ? <PublishDialog project={project} publishing={publishing} justPublished={publishDialog === "success"} onClose={onClosePublish} onPublish={onPublish} onRenamed={onGameRenamed} /> : null}
+      {project && settingsSlot ? createPortal(<ProjectPreviewSettings
+        project={project}
+        previewDevices={previewDevices}
+        previewActions={supportsPreview ? {
+          onReinstall: () => onRestart(undefined, true),
+          onStop: onStop ? () => { void player.close().catch(() => {}).then(onStop); } : undefined,
+        } : undefined}
+        onClose={settingsSlot.onClose}
+        onBusyChange={settingsSlot.onBusyChange}
+        onSaved={(updated) => onProjectUpdated?.(updated)}
+      />, settingsSlot.node) : null}
+    </>
+  );
+}
+
+function PreviewControls({
+  path,
+  paths,
+  status,
+  previewUrl,
+  refreshDisabled,
+  refreshLabel,
+  viewport,
+  devices,
+  filters,
+  filter,
+  onFilterChange,
+  inputMaps,
+  inputMap,
+  onInputMapChange,
+  agentPlaytestWatch,
+  agentPlaytestWatchPending,
+  picking,
+  pickDisabled,
+  tuningOpen,
+  onToggleTuning,
+  logsOpen,
+  onLogs,
+  onNavigate,
+  onRefresh,
+  onRestart,
+  onTogglePicking,
+  onToggleAgentPlaytestWatch,
+  onViewportChange,
+}: {
+  path: string;
+  paths: string[];
+  status?: ProjectState["preview"]["status"];
+  previewUrl?: string;
+  refreshDisabled: boolean;
+  refreshLabel: string;
+  viewport: PreviewViewport;
+  devices: readonly ProjectPreviewDevice[];
+  filters: readonly ProjectPreviewFilter[];
+  filter?: string;
+  onFilterChange: (filter: string | undefined) => void;
+  inputMaps: readonly ProjectInputMap[];
+  inputMap?: string;
+  onInputMapChange: (map: string | undefined) => void;
+  agentPlaytestWatch?: PlaytestWatchState;
+  agentPlaytestWatchPending: boolean;
+  picking: boolean;
+  pickDisabled: boolean;
+  tuningOpen: boolean;
+  /** Absent when this game can't be tuned. */
+  onToggleTuning?: () => void;
+  logsOpen: boolean;
+  onLogs: () => void;
+  onNavigate: (path: string) => void;
+  onRefresh: () => void;
+  onRestart: () => void;
+  onTogglePicking: () => void;
+  onToggleAgentPlaytestWatch: () => void;
+  onViewportChange: (viewport: PreviewViewport) => void;
+}) {
+  const gameMore = usePluginSlot("game.more");
+  // Like a browser's toolbar: where the preview is, then how it shows, then the rest.
+  return (
+    <div className="preview-controls">
+      <PreviewLocation disabled={!previewUrl} path={path} paths={paths} onNavigate={onNavigate} />
+      <ViewportMenu value={viewport} devices={devices} onChange={onViewportChange} filters={filters} filter={filter} onFilterChange={onFilterChange} inputMaps={inputMaps} inputMap={inputMap} onInputMapChange={onInputMapChange} />
+      <IconButton size="sm" className="preview-pick-button" label={picking ? t("workspace.stopPicking") : t("workspace.pickElement")}
+        active={picking} disabled={pickDisabled && !picking} onClick={onTogglePicking}><MousePointer2 size={14} /></IconButton>
+      {onToggleTuning ? <IconButton size="sm" className="preview-tuning-button" label={t("gameTuning.title")} active={tuningOpen} onClick={onToggleTuning}><SlidersHorizontal size={14} /></IconButton> : null}
+      {/* Only while the agent plays the game, or the window was asked for, does the toggle do anything. */}
+      {agentPlaytestWatch && (agentPlaytestWatch.activeSessions > 0 || agentPlaytestWatch.visible) ? (
+        <Button size="sm" variant="ghost" className={`preview-agent-watch-button${agentPlaytestWatch.visible ? " is-active" : ""}`}
+          aria-pressed={agentPlaytestWatch.visible} disabled={agentPlaytestWatchPending}
+          title={agentPlaytestWatch.visible ? t("workspace.hidePlaytest") : t("workspace.showPlaytest")}
+          icon={<Gamepad2 size={14} />} onClick={onToggleAgentPlaytestWatch}>{t("workspace.agentPlaytest")}</Button>
+      ) : null}
+      <IconButton size="sm" className="preview-refresh-button" label={refreshLabel} disabled={refreshDisabled} onClick={onRefresh}><RefreshCw size={14} /></IconButton>
+      <DropdownMenu placement="bottom-end" trigger={(props) => <IconButton {...props} size="sm" label={t("workspace.moreActions")}><MoreHorizontal size={14} /></IconButton>} items={[
+        ...(previewUrl ? [{ label: t("workspace.openInBrowser"), icon: <ExternalLink size={14} />, onSelect: () => openPreviewInBrowser(previewUrl) }] : []),
+        { label: t("projectSettings.restartPreview"), icon: <Server size={14} />, disabled: status === "waiting" || status === "starting", onSelect: onRestart },
+        { label: logsOpen ? t("workspace.closeLogs") : t("workspace.logs"), icon: <Terminal size={14} />, onSelect: onLogs },
+        // The project's plugins' entries for the game, after the app's.
+        ...(gameMore.commands.length ? ["separator" as const, ...gameMore.commands.map((command) => ({ label: command.title, icon: <Plug size={14} />, onSelect: () => void gameMore.run(command) }))] : []),
+      ]} />
+    </div>
+  );
+}
+
+/**
+ * The page in the person's browser, as a client of its own: sharing the
+ * editor's id would take over the editor's reload stream and element picking.
+ * The desktop app sends a new window's web page to the browser; its
+ * openExternal is for sign-in pages and refuses the game's local address.
+ */
+function openPreviewInBrowser(url: string): void {
+  window.open(isolatedPreviewUrl(url, "external"), "_blank", "noopener,noreferrer");
+}
+
+function PreviewLocation({
+  disabled,
+  path,
+  paths,
+  onNavigate,
+}: {
+  disabled: boolean;
+  path: string;
+  paths: string[];
+  onNavigate: (path: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const root = useRef<HTMLDivElement>(null);
+  const trigger = useRef<HTMLButtonElement>(null);
+  const search = useRef<HTMLInputElement>(null);
+  const popoverId = useId();
+  const normalizedQuery = query.trim() ? normalizePreviewPath(query) : undefined;
+  const matchingPaths = paths.filter((knownPath) => knownPath.toLowerCase().includes(query.trim().toLowerCase()));
+  const options = normalizedQuery && !matchingPaths.includes(normalizedQuery)
+    ? [...matchingPaths, normalizedQuery]
+    : matchingPaths;
+
+  useEffect(() => {
+    if (!open) return;
+    search.current?.focus();
+    const onPointerDown = (event: PointerEvent) => {
+      if (!root.current?.contains(event.target as Node)) setOpen(false);
+    };
+    const onKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      setOpen(false);
+      trigger.current?.focus();
+    };
+    document.addEventListener("pointerdown", onPointerDown);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", onPointerDown);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [open]);
+
+  useEffect(() => {
+    if (disabled) setOpen(false);
+  }, [disabled]);
+
+  function navigate(nextPath: string): void {
+    onNavigate(nextPath);
+    setOpen(false);
+    setQuery("");
+    trigger.current?.focus();
+  }
+
+  // A game with one page at the root needs no address.
+  if (path === "/" && paths.every((knownPath) => knownPath === "/")) return null;
+  return (
+    <div className="preview-location" ref={root}>
+      <button
+        ref={trigger}
+        className="preview-location-trigger"
+        type="button"
+        aria-controls={popoverId}
+        aria-expanded={open}
+        aria-haspopup="dialog"
+        disabled={disabled}
+        onClick={() => {
+          setQuery("");
+          setOpen((current) => !current);
+        }}
+        title={path}
+      >
+        <span className="preview-location-path">{path}</span>
+        <ChevronDown className={open ? "preview-location-chevron-open" : undefined} size={13} />
+      </button>
+      {open ? (
+        <div className="preview-location-popover" id={popoverId} role="dialog" aria-label={t("workspace.previewPages")}>
+          <form
+            className="preview-location-search"
+            onSubmit={(event) => {
+              event.preventDefault();
+              if (normalizedQuery) navigate(normalizedQuery);
+            }}
+          >
+            <Search size={16} />
+            <input
+              ref={search}
+              aria-label={t("workspace.findPage")}
+              placeholder={t("workspace.findPage")}
+              spellCheck={false}
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key !== "Enter" || !normalizedQuery) return;
+                event.preventDefault();
+                navigate(normalizedQuery);
+              }}
+            />
+          </form>
+          <div className="preview-location-options">
+            {options.map((option) => (
+              <button
+                className="preview-location-option"
+                type="button"
+                aria-current={option === path ? "page" : undefined}
+                key={option}
+                onClick={() => navigate(option)}
+              >
+                <span>{option === path ? <Check size={14} /> : null}</span>
+                <strong>{option}</strong>
+              </button>
+            ))}
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function ViewportMenu({ value, devices, onChange, filters, filter, onFilterChange, inputMaps, inputMap, onInputMapChange }: {
+  value: PreviewViewport; devices: readonly ProjectPreviewDevice[]; onChange: (value: PreviewViewport) => void;
+  filters: readonly ProjectPreviewFilter[]; filter?: string; onFilterChange: (filter: string | undefined) => void;
+  inputMaps: readonly ProjectInputMap[]; inputMap?: string; onInputMapChange: (map: string | undefined) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const root = useRef<HTMLDivElement>(null);
+  const trigger = useRef<HTMLButtonElement>(null);
+  const menuId = useId();
+
+  useEffect(() => {
+    if (!open) return;
+    const onPointerDown = (event: PointerEvent) => {
+      if (!root.current?.contains(event.target as Node)) setOpen(false);
+    };
+    const onKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      setOpen(false);
+      trigger.current?.focus();
+    };
+    document.addEventListener("pointerdown", onPointerDown);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", onPointerDown);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [open]);
+
+  return (
+    <div className="viewport-menu" ref={root}>
+      <button
+        ref={trigger}
+        className="viewport-trigger"
+        type="button"
+        aria-controls={menuId}
+        aria-expanded={open}
+        aria-haspopup="menu"
+        aria-label={t("workspace.viewportLabel")}
+        title={viewportLabel(value, devices)}
+        onClick={() => setOpen((current) => !current)}
+      >
+        <ViewportIcon viewport={value} devices={devices} />
+        <ChevronDown size={11} />
+      </button>
+      {open ? (
+        <div className="viewport-menu-popover" id={menuId} role="menu" aria-label={t("workspace.viewportLabel")}>
+          {/* The built-in sizes, then the plugins' devices. */}
+          {[...PREVIEW_VIEWPORTS, ...devices.map((device) => device.id)].map((viewport) => (
+            <button
+              className="viewport-option"
+              type="button"
+              role="menuitemradio"
+              aria-checked={viewport === value}
+              key={viewport}
+              onClick={() => {
+                onChange(viewport);
+                setOpen(false);
+                trigger.current?.focus();
+              }}
+            >
+              <ViewportIcon viewport={viewport} devices={devices} />
+              <span>{viewportLabel(viewport, devices)}</span>
+              {viewport === value ? <Check size={13} /> : null}
+            </button>
+          ))}
+          {/* The plugins' colour filters, for what the person sees only. */}
+          {filters.length ? <div className="viewport-menu-group" role="group" aria-label={t("workspace.filterLabel")}>
+            <span className="viewport-menu-heading" aria-hidden="true">{t("workspace.filterLabel")}</span>
+            {[undefined, ...filters].map((item) => (
+              <button
+                className="viewport-option"
+                type="button"
+                role="menuitemradio"
+                aria-checked={item?.id === filter}
+                key={item?.id ?? "none"}
+                title={item?.source}
+                onClick={() => {
+                  onFilterChange(item?.id);
+                  setOpen(false);
+                  trigger.current?.focus();
+                }}
+              >
+                <Palette size={14} />
+                <span>{item?.title ?? t("workspace.noFilter")}</span>
+                {item?.id === filter ? <Check size={13} /> : null}
+              </button>
+            ))}
+          </div> : null}
+          {/* The plugins' gamepad maps, which press keys in the person's game. */}
+          {inputMaps.length ? <div className="viewport-menu-group" role="group" aria-label={t("workspace.gamepadLabel")}>
+            <span className="viewport-menu-heading" aria-hidden="true">{t("workspace.gamepadLabel")}</span>
+            {[undefined, ...inputMaps].map((item) => (
+              <button
+                className="viewport-option"
+                type="button"
+                role="menuitemradio"
+                aria-checked={item?.id === inputMap}
+                key={item?.id ?? "none"}
+                onClick={() => {
+                  onInputMapChange(item?.id);
+                  setOpen(false);
+                  trigger.current?.focus();
+                }}
+              >
+                <Gamepad2 size={14} />
+                <span>{item?.title ?? t("workspace.noGamepad")}</span>
+                {item?.id === inputMap ? <Check size={13} /> : null}
+              </button>
+            ))}
+          </div> : null}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function ViewportIcon({ viewport, devices }: { viewport: PreviewViewport; devices: readonly ProjectPreviewDevice[] }) {
+  const device = devices.find((item) => item.id === viewport);
+  if (device) return <Smartphone size={14} style={device.width > device.height ? { transform: "rotate(90deg)" } : undefined} />;
+  if (viewport === "tablet") return <Tablet size={14} />;
+  if (viewport === "mobile") return <Smartphone size={14} />;
+  if (viewport === "mobile-landscape") return <Smartphone size={14} style={{ transform: "rotate(90deg)" }} />;
+  return <Monitor size={14} />;
+}
+
+function viewportLabel(viewport: PreviewViewport, devices: readonly ProjectPreviewDevice[]): string {
+  const device = devices.find((item) => item.id === viewport);
+  if (device) return t("workspace.viewport.device", { title: device.title, width: device.width, height: device.height });
+  if (viewport === "tablet") return t("workspace.viewport.tablet");
+  if (viewport === "mobile") return t("workspace.viewport.mobile");
+  if (viewport === "mobile-landscape") return t("workspace.viewport.mobileLandscape");
+  return t("projectSettings.device.fit");
+}
+
+const NO_DEVICES: readonly ProjectPreviewDevice[] = [];
+const NO_FILTERS: readonly ProjectPreviewFilter[] = [];
+const NO_INPUT_MAPS: readonly ProjectInputMap[] = [];
+const inputMapKey = (projectId: string) => `ohmygame:input-map:${projectId}`;
+
+// One at a time, so turning a map off and on again can't arrive the other way round.
+let inputMapRequests = Promise.resolve();
+function sendInputMap(projectId: string, map: GamepadKeyMap | null): void {
+  inputMapRequests = inputMapRequests.then(() => setPreviewInputMap(projectId, map)).catch(() => {});
+}
+
+/** The gamepad map the person picked for a project on this device; storage may be unavailable. */
+export function savedInputMap(projectId: string | undefined): string | undefined {
+  if (!projectId) return undefined;
+  try { return localStorage.getItem(inputMapKey(projectId)) ?? undefined; } catch { return undefined; }
+}
+
+function saveInputMap(projectId: string, id: string | undefined): void {
+  try {
+    if (id) localStorage.setItem(inputMapKey(projectId), id);
+    else localStorage.removeItem(inputMapKey(projectId));
+  } catch { /* Kept for this visit only. */ }
+}
+
+/** Just what draws a filter, for the desktop game host. */
+const gameFilter = ({ colorSpace, matrix, offset }: PreviewColorFilter): PreviewColorFilter => ({ colorSpace, matrix, ...(offset ? { offset } : {}) });
+
+/**
+ * The viewport the preview shows, and the plugin device it is. A device whose
+ * plugin is gone, or not read yet, shows as Fit.
+ */
+export function shownViewport(viewport: PreviewViewport, devices: readonly ProjectPreviewDevice[]): { viewport: PreviewViewport; device?: ProjectPreviewDevice } {
+  if (isBuiltinPreviewViewport(viewport)) return { viewport };
+  const device = devices.find((item) => item.id === viewport);
+  return device ? { viewport, device } : { viewport: "fit" };
+}
+
+export function playerViewport(viewport: PreviewViewport, device?: Pick<ProjectPreviewDevice, "width" | "height">): { width: number; height: number } {
+  if (device) return { width: device.width, height: device.height };
+  if (viewport === "mobile") return { width: 375, height: 667 };
+  if (viewport === "mobile-landscape") return { width: 667, height: 375 };
+  if (viewport === "tablet") return { width: 768, height: 1024 };
+  return { width: 1280, height: 720 };
+}
+
+export function PreviewView({ project, client, onAskAgent, onOpenFile, onLogs, reload, revision, url, viewport, device, filter, active = true, playerOpen = false, suspended = false, pending = false, pausedAfterRecovery = false, error, onPlay, onRetry, onSettings, stageRef }: {
+  client?: string; onAskAgent?: (text: string) => void; onOpenFile?: (path: string) => void; onLogs?: () => void;
+  project?: ProjectState; reload: number; revision: number; url?: string; viewport: PreviewViewport;
+  /** The plugin device `viewport` names, when it names one. */
+  device?: Pick<ProjectPreviewDevice, "width" | "height">;
+  /** A colour filter over the game; a cover isn't taken meanwhile, so it stays as the game looks. */
+  filter?: PreviewColorFilter;
+  active?: boolean; playerOpen?: boolean; suspended?: boolean; pending?: boolean; error?: string; onPlay?: () => void;
+  pausedAfterRecovery?: boolean;
+  stageRef?: React.Ref<HTMLDivElement>;
+  onRetry?: () => void; onSettings?: () => void;
+}) {
+  const runtime = useRuntimeConnection();
+  const preview = project?.preview;
+  const frame = useRef<HTMLElement | null>(null);
+  const native = typeof window !== "undefined" ? window.ohMyGameDesktop?.webGamePlayer?.preview : undefined;
+  const captureTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const [started, setStarted] = useState(active && !suspended);
+  const [cover, setCover] = useState<string>();
+  const diagnostic = preview?.diagnostics?.length
+    ? preview.diagnostics.find((item) => native ? item.client === client : playerOpen ? item.source === "player" : item.client === client)
+    : preview?.diagnostic;
+  const [failedCopyDiagnostic, setFailedCopyDiagnostic] = useState<typeof diagnostic>();
+  const copyAttempt = useRef(0);
+  const captureBlocked = useRef(false);
+  captureBlocked.current = !!diagnostic || runtime.status !== "ready" || !!filter;
+  const filterId = useId().replaceAll(":", "");
+
+  useEffect(() => {
+    if (diagnostic || runtime.status !== "ready") clearTimeout(captureTimer.current);
+  }, [diagnostic, runtime.status]);
+
+  useEffect(() => {
+    if (suspended) { if (!native) setStarted(false); clearTimeout(captureTimer.current); }
+    else if (active) setStarted(true);
+  }, [suspended, active]);
+
+  useEffect(() => {
+    setCover(undefined);
+    if (!project || !playerOpen) return;
+    let disposed = false;
+    let objectUrl: string | undefined;
+    void getProjectCover(project.id).then((blob) => {
+      if (disposed || !blob) return;
+      objectUrl = URL.createObjectURL(blob);
+      setCover(objectUrl);
+    }).catch(() => {});
+    return () => { disposed = true; if (objectUrl) URL.revokeObjectURL(objectUrl); };
+  }, [project?.id, playerOpen]);
+
+  useEffect(() => () => clearTimeout(captureTimer.current), []);
+  useEffect(() => {
+    if (revision > 0 && frame.current) scheduleCoverCapture(frame.current);
+  }, [revision]);
+
+  function scheduleCoverCapture(element: HTMLElement): void {
+    frame.current = element;
+    clearTimeout(captureTimer.current);
+    if (!project || !window.ohMyGameDesktop?.capturePage) return;
+    captureTimer.current = setTimeout(() => {
+      if (captureBlocked.current) return;
+      void captureProjectCover(project.id, element, native ? () => native.capture(project.id) : undefined).catch(() => {});
+    }, 1_000);
+  }
+
+  const showFrame = (active || started || (native && playerOpen)) && (native || !suspended) && preview?.status === "ready" && url;
+  return (
+    <div ref={stageRef} className={`viewer-stage viewer-stage-${device ? "device" : viewport}`}
+      style={device ? { "--preview-device-width": `${device.width}px`, "--preview-device-ratio": `${device.width} / ${device.height}` } as React.CSSProperties : undefined}>
+      {showFrame ? <div className="preview-frame-wrap" hidden={suspended}>
+        {native && project ? <DesktopGamePreview
+          bridge={native} refresh={window.ohMyGameDesktop!.webGamePlayer!.refresh} projectId={project.id} url={url!} reload={reload}
+          visible={active && !suspended && !diagnostic && !error && runtime.status === "ready"}
+          onReady={scheduleCoverCapture}
+        /> : <iframe
+          ref={(element) => { frame.current = element; }}
+          key={`${url}:${reload}`} className="preview-frame" src={url}
+          title={t("workspace.previewTitle", { name: project?.name ?? t("workspace.project") })}
+          sandbox="allow-downloads allow-forms allow-modals allow-pointer-lock allow-same-origin allow-scripts"
+          allow="gamepad; clipboard-write"
+          style={filter ? { filter: `url(#${filterId})` } : undefined}
+          onLoad={(event) => scheduleCoverCapture(event.currentTarget)}
+        />}
+        {filter && !native ? <svg className="preview-filter-definition" aria-hidden="true">
+          <filter id={filterId} colorInterpolationFilters={filter.colorSpace}>
+            <feColorMatrix type="matrix" values={colorMatrixValues(filter)} />
+          </filter>
+        </svg> : null}
+      </div> : null}
+      {suspended ? <div className="preview-player-state">
+        {cover ? <img className="preview-player-cover" src={cover} alt="" /> : null}
+        <div className="preview-empty-state">
+          <div className="preview-empty-mark" aria-hidden="true">{pending ? <LoaderCircle className="spin" size={20} /> : <Play size={20} />}</div>
+          <p className="preview-empty-title">{pending ? t("workspace.openingGame") : t("workspace.gameInWindow")}</p>
+          <p className="preview-empty-description">{t("workspace.closeWindowHint")}</p>
+          {playerOpen && onPlay ? <button type="button" className="preview-return-button" disabled={pending} onClick={onPlay}>{t("workspace.returnToGame")}</button> : null}
+        </div>
+      </div> : !showFrame && project?.type === "general" && preview?.issue === "no-web-project" && preview.status === "waiting" ? <div className="preview-status-panel">
+        <GameStartEmpty noWebProject onOpenSettings={onSettings} />
+      </div> : !showFrame ? <div className="preview-status-panel">
+        <PreviewState status={preview?.status} error={preview?.error} phase={preview?.phase} startedAt={preview?.startedAt} />
+        {(pausedAfterRecovery || preview?.stopReason === "recovery") && preview?.status === "stopped" ? <p>{t("workspace.pausedAfterRecovery")}</p> : null}
+        {preview?.status === "stopped" && preview.stopReason === "manual" ? <p>{t("workspace.stoppedManual")}</p> : preview?.status === "stopped" && preview.stopReason === "idle" ? <p>{t("workspace.stoppedIdle")}</p> : preview?.status === "stopped" && project?.previewAutoStart === false ? <p>{t("workspace.autoDisabled")}</p> : null}
+        {onRetry && (preview?.status === "error" || preview?.status === "stopped") ? <div className="preview-recovery-actions">
+          <button type="button" disabled={runtime.status !== "ready"} onClick={onRetry}>{preview.status === "stopped" ? t("projectSettings.startPreview") : t("workspace.retryPreview")}</button>
+          {onSettings ? <button type="button" onClick={onSettings}>{t("projectSettings.title")}</button> : null}
+          {onLogs ? <button type="button" onClick={onLogs}>{t("workspace.viewLogs")}</button> : null}
+          {preview?.error && onAskAgent ? <button type="button" onClick={() => onAskAgent(previewRepairPrompt(project, preview.error!))}>{t("workspace.askAgent")}</button> : null}
+        </div> : null}
+        {preview?.status === "error" ? <GameStartActions /> : null}
+      </div> : null}
+      {diagnostic ? <div className="preview-diagnostic" role="alert">
+        <strong>{diagnostic.kind === "compile" ? t("workspace.compileFailed") : diagnostic.kind === "runtime" ? t("workspace.runtimeError") : t("workspace.loadFailed")}</strong>
+        <Disclosure summary={t("common.errorDetails")}><pre>{diagnostic.message}</pre></Disclosure>
+        <p>{diagnostic.source === "playtest" ? t("workspace.source.playtest") : diagnostic.source === "player" ? t("workspace.source.player") : t("workspace.previewSource")}{diagnostic.path ? ` · ${diagnostic.path}` : ""}</p>
+        <div className="preview-recovery-actions">
+          <button type="button" onClick={async () => {
+            const attempt = ++copyAttempt.current;
+            setFailedCopyDiagnostic(undefined);
+            try {
+              await navigator.clipboard.writeText(diagnostic.message);
+            } catch {
+              if (attempt === copyAttempt.current) setFailedCopyDiagnostic(diagnostic);
+            }
+          }}>{t("workspace.copyError")}</button>
+          {failedCopyDiagnostic === diagnostic ? <span role="status">{t("common.copyFailed")}</span> : null}
+          {onLogs ? <button type="button" onClick={onLogs}>{t("workspace.viewLogs")}</button> : null}
+          {onAskAgent ? <button type="button" onClick={() => onAskAgent(previewRepairPrompt(project, diagnostic.message))}>{t("workspace.askAgent")}</button> : null}
+          {onOpenFile && previewErrorFile(project, diagnostic.message) ? <button type="button" onClick={() => onOpenFile(previewErrorFile(project, diagnostic.message)!)}>{t("workspace.openSource")}</button> : null}
+        </div>
+      </div> : null}
+      {error ? <div className="preview-player-error" role="alert">{error}</div> : null}
+    </div>
+  );
+}
+
+async function captureProjectCover(projectId: string, frame: HTMLElement, capture?: () => Promise<Uint8Array>): Promise<void> {
+  if ((await getProjectCoverState(projectId)).mode === "custom") return;
+  // A publish dialog can cover the preview in the desktop window's screenshot.
+  if (document.querySelector('[role="dialog"][aria-modal="true"]')) return;
+  const cover = await captureElementImage(frame, 800, undefined, capture);
+  if (cover) await setProjectCover(projectId, cover, "auto");
+}
+
+export function normalizePreviewPath(value: string): string {
+  const path = value.trim().replaceAll("\\", "/").replace(/^\/+/, "");
+  return path ? `/${path}` : "/";
+}
+
+/**
+ * The file tree neither drags nor drops, so it keeps out of the page's drag and
+ * drop. react-dnd's HTML5 backend allows one per window, and two trees that
+ * end up with their own (one opened while another is still mounted) would
+ * throw "Cannot have two HTML5 backends at the same time".
+ */
+const NO_DRAG_AND_DROP: NonNullable<ComponentProps<typeof Tree>["dndBackend"]> = () => ({
+  setup() {},
+  teardown() {},
+  connectDragSource: () => () => {},
+  connectDragPreview: () => () => {},
+  connectDropTarget: () => () => {},
+  profile: () => ({}),
+});
+
+export function WorkspaceFileBrowser({
+  files,
+  selectedPath,
+  selectedFile,
+  loading,
+  error,
+  onSelect,
+  onOpenExternal,
+  projectId,
+  revision = 0,
+  filesRevision = 0,
+  openFileRequestId,
+  onFilesChanged = () => {},
+  fileActions,
+  renderFile,
+  toolbarTarget,
+  onDirectoryToggle,
+  onSearchChange,
+  onRefresh,
+  treeLoading = false,
+}: {
+  files: WorkspaceFile[];
+  selectedPath?: string;
+  selectedFile?: WorkspaceFileContent;
+  loading: boolean;
+  error?: string;
+  onSelect: (path: string) => void;
+  onOpenExternal?: (path: string, mode: ProjectFileOpenMode) => Promise<void>;
+  projectId?: string;
+  revision?: number;
+  filesRevision?: number;
+  openFileRequestId?: number;
+  onFilesChanged?: (change: WorkspaceFileChange) => void;
+  fileActions?: ReactNode;
+  renderFile?: (file: WorkspaceFileContent) => ReactNode;
+  /** The panel toolbar, where the open file's path and actions go. Without it they get a header. */
+  toolbarTarget?: HTMLElement | null;
+  onDirectoryToggle?: (directory: string, expanded: boolean) => void;
+  onSearchChange?: (term: string) => void;
+  onRefresh?: () => void;
+  treeLoading?: boolean;
+}) {
+  // A refresh can move the selection on before the new file arrives. What stays on screen is only ever the selected file.
+  const openFile = selectedFile?.path === selectedPath ? selectedFile : undefined;
+  const [searchTerm, setSearchTerm] = useState("");
+  useEffect(() => {
+    const timer = setTimeout(() => onSearchChange?.(searchTerm), searchTerm.trim() ? 200 : 0);
+    return () => clearTimeout(timer);
+  }, [searchTerm, onSearchChange]);
+  const [browserView, setBrowserView] = useState<"files" | "changes">("files");
+  const [selectedGitPath, setSelectedGitPath] = useState<string>();
+  const git = useWorkspaceGitChanges(projectId, revision, filesRevision);
+  const showChanges = browserView === "changes" && git.data?.available;
+  useEffect(() => { setBrowserView("files"); }, [projectId, openFileRequestId]);
+  useEffect(() => {
+    if (!git.data?.available) return;
+    const items = git.data.changes;
+    setSelectedGitPath((current) => items.some((item) => item.path === current) ? current : items[0]?.path);
+  }, [git.data]);
+  const tree = useMemo(() => workspaceFileTree(files), [files]);
+  const selectedEntry = selectedPath ? files.find((file) => file.path === selectedPath && !file.directory) : undefined;
+  const selectedMedia = selectedEntry && hasMediaType(selectedEntry) ? selectedEntry : undefined;
+  const [treeElement, setTreeElement] = useState<HTMLDivElement | null>(null);
+  const [contextMenu, setContextMenu] = useState<WorkspaceContextMenu>();
+  // The tree renders its children as the row component, so a new function on
+  // each render would remount every row. The menu reads the latest state instead.
+  const rowMenu = useRef({ busy: false, onSelect });
+  const renderTreeRow = useCallback((props: NodeRendererProps<WorkspaceFileNode>) => <WorkspaceTreeNode {...props} onContextMenu={projectId ? (node, event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    if (rowMenu.current.busy) return;
+    if (node.data.path && !node.data.directory) rowMenu.current.onSelect(node.data.path);
+    setContextMenu({
+      path: node.data.path ?? node.data.id,
+      directory: Boolean(node.data.directory || !node.isLeaf),
+      x: event.clientX,
+      y: event.clientY,
+    });
+  } : undefined} />, [projectId]);
+  const [entryDialog, setEntryDialog] = useState<{ kind: "rename" | "file" | "folder"; path: string }>();
+  const [actionError, setActionError] = useState<string>();
+  const [busy, setBusy] = useState(false);
+  rowMenu.current = { busy, onSelect };
+  const codeElement = useRef<HTMLDivElement>(null);
+  const [explorerWidth, setExplorerWidth] = useState(240);
+  const explorerResize = useRef<{ clientX: number; width: number; maximum: number; current: number }>(null);
+  const treeHeight = useElementHeight(treeElement);
+  const fileTree = useRef<TreeApi<WorkspaceFileNode>>(null);
+  const revealed = useRef<{ tree: TreeApi<WorkspaceFileNode>; path: string; request?: number }>(null);
+
+  function finishExplorerResize(): void {
+    if (explorerResize.current) setExplorerWidth(explorerResize.current.current);
+    explorerResize.current = null;
+  }
+
+  // Brings a file into view when it is chosen, or when coming back from Changes builds a new tree. Scrolling
+  // also opens its folders, so a refresh, which only brings a new list, leaves the tree where the person has it.
+  useEffect(() => {
+    const tree = fileTree.current;
+    if (!selectedPath) revealed.current = null;
+    if (!tree || treeLoading || !selectedPath || !files.some((file) => file.path === selectedPath)) return;
+    const last = revealed.current;
+    if (last?.tree === tree && last.path === selectedPath && last.request === openFileRequestId) return;
+    const reveal = { tree, path: selectedPath, request: openFileRequestId };
+    let disposed = false;
+    let frame: number | undefined;
+    void tree.scrollTo(selectedPath)?.then(() => {
+      if (disposed) return;
+      // Opening a parent can load children and move the row. Only finish the reveal
+      // after that render; a pending directory load cancels this attempt.
+      frame = requestAnimationFrame(() => {
+        if (disposed) return;
+        revealed.current = reveal;
+        void tree.scrollTo(selectedPath);
+        tree.select(selectedPath, { focus: false });
+      });
+    });
+    return () => { disposed = true; if (frame !== undefined) cancelAnimationFrame(frame); };
+  }, [files, selectedPath, openFileRequestId, treeHeight, showChanges, treeLoading]);
+
+  async function mutate(operation: () => Promise<WorkspaceFileChange>): Promise<void> {
+    if (busy) return;
+    setBusy(true);
+    setActionError(undefined);
+    try { onFilesChanged(await operation()); }
+    catch (cause) { setActionError(errorMessage(cause)); }
+    finally { setBusy(false); }
+  }
+
+  function entryAction(action: WorkspaceEntryAction, entry: WorkspaceContextMenu): void {
+    setContextMenu(undefined);
+    setActionError(undefined);
+    if (!projectId || busy) return;
+    if (action === "rename") { setEntryDialog({ kind: "rename", path: entry.path }); return; }
+    if (action === "new-file" || action === "new-folder") {
+      const parent = entry.directory ? entry.path : entry.path.split("/").slice(0, -1).join("/");
+      setEntryDialog({ kind: action === "new-file" ? "file" : "folder", path: parent });
+      return;
+    }
+    if (action === "copy-path") {
+      void navigator.clipboard.writeText(entry.path).catch((cause) => setActionError(errorMessage(cause)));
+      return;
+    }
+    if (action === "save-library") {
+      void mutate(async () => { await saveProjectAssetToLibrary(projectId, entry.path); return {}; });
+      return;
+    }
+    if (!window.confirm(entry.directory ? t("workspace.confirmDeleteFolder", { path: entry.path }) : t("workspace.confirmDelete", { path: entry.path }))) return;
+    void mutate(async () => { await deleteWorkspaceEntry(projectId, entry.path); return { from: entry.path }; });
+  }
+  const fileHeader = openFile && !showChanges ? <>
+    <span className="file-content-path" title={openFile.path}>
+      {openFile.path.split("/").map((part, index, parts) => index === parts.length - 1
+        ? <span key={index} className="file-content-name">{part}</span>
+        : <span key={index}>{part}<span className="file-content-separator">/</span></span>)}
+      {openFile.truncated ? ` ${t("workspace.truncated")}` : ""}
+    </span>
+    {fileActions}
+    {onOpenExternal ? <FileOpenActions path={openFile.path} onOpen={onOpenExternal} /> : null}
+  </> : null;
+  const toolbar = toolbarTarget ? createPortal(<>
+    {fileHeader ?? <span className="file-content-path" />}
+  </>, toolbarTarget) : null;
+  if (loading && files.length === 0) return <WorkspaceState loading label={t("workspace.loadingCode")} />;
+  if (error && !selectedPath && files.length === 0) return <WorkspaceState error={error} />;
+  return <>
+    {toolbar}
+    <div className="code-view" ref={codeElement} style={{ "--file-explorer-width": `${explorerWidth}px` } as CSSProperties}>
+      <div className="file-explorer">
+        {git.data?.available || git.error ? <div className="file-explorer-views">
+          {git.data?.available ? <nav aria-label={t("workspace.gitViews")}>
+            <button type="button" aria-pressed={!showChanges} onClick={() => setBrowserView("files")}>{t("workspace.gitFiles")}</button>
+            <button type="button" aria-pressed={Boolean(showChanges)} onClick={() => { setBrowserView("changes"); git.refresh(); }}>
+              {t("workspace.gitChanges")}<span className="git-change-count">{git.data.changes.length}</span>
+            </button>
+          </nav> : <span className="git-changes-note" role="alert">{t("workspace.gitFailed")}</span>}
+          <button type="button" className="icon-button" disabled={git.loading} onClick={git.refresh}
+            title={t("workspace.gitRefresh")} aria-label={t("workspace.gitRefresh")}>
+            <RefreshCw size={12} className={git.loading ? "spin" : undefined} />
+          </button>
+        </div> : null}
+        {onRefresh && error ? <p className="file-action-error" role="alert">{error}</p> : null}
+        <div className="file-explorer-filter">
+        <label className="file-filter">
+          <Search size={13} aria-hidden="true" />
+          <input
+            type="search"
+            value={searchTerm}
+            onChange={(event) => setSearchTerm(event.target.value)}
+            placeholder={t("workspace.filterFiles")}
+            aria-label={t("workspace.filterFilesLabel")}
+          />
+        </label>
+        {onRefresh ? <IconButton size="sm" label={t("workspace.refreshFiles")} onClick={onRefresh} disabled={loading}><RefreshCw size={12} className={loading ? "spin" : undefined} /></IconButton> : null}
+        </div>
+        {actionError ? <p className="file-action-error" role="alert">{actionError}</p> : null}
+        {showChanges ? <GitChangesList data={git.data} loading={git.loading} error={git.error} search={searchTerm}
+          selectedPath={selectedGitPath} onSelect={setSelectedGitPath} /> : <div className="file-tree" ref={setTreeElement} onContextMenu={(event) => {
+          event.preventDefault();
+          if (projectId && !busy) setContextMenu({ path: "", directory: true, x: event.clientX, y: event.clientY });
+        }}>
+          {treeHeight > 0 ? (
+            <Tree
+              ref={fileTree}
+              data={tree}
+              width="100%"
+              height={treeHeight}
+              rowHeight={24}
+              indent={12}
+              openByDefault={false}
+              selection={selectedPath}
+              searchTerm={searchTerm}
+              searchMatch={(node, term) => node.data.name.toLocaleLowerCase().includes(term.toLocaleLowerCase())}
+              onToggle={(id) => { if (!searchTerm.trim()) onDirectoryToggle?.(id, fileTree.current?.isOpen(id) ?? false); }}
+              disableDrag
+              disableDrop
+              dndBackend={NO_DRAG_AND_DROP}
+              disableEdit
+              disableMultiSelection
+              onActivate={(node) => {
+                if (node.data.path && !node.data.directory) onSelect(node.data.path);
+                else node.toggle();
+              }}
+              aria-label={t("workspace.files")}
+            >
+              {renderTreeRow}
+            </Tree>
+          ) : null}
+        </div>}
+      </div>
+      <div
+        className="file-explorer-resizer"
+        role="separator"
+        aria-label={t("workspace.resizeExplorer")}
+        aria-orientation="vertical"
+        onPointerDown={(event) => {
+          if (!event.isPrimary || event.button !== 0) return;
+          event.preventDefault();
+          event.currentTarget.setPointerCapture(event.pointerId);
+          const width = event.currentTarget.previousElementSibling!.getBoundingClientRect().width;
+          const maximum = Math.min(480, codeElement.current!.clientWidth - 241);
+          explorerResize.current = { clientX: event.clientX, width, maximum, current: width };
+          setContextMenu(undefined);
+        }}
+        onPointerMove={(event) => {
+          const resize = explorerResize.current;
+          if (!resize || !event.currentTarget.hasPointerCapture(event.pointerId)) return;
+          resize.current = Math.round(Math.max(140, Math.min(resize.maximum, resize.width + event.clientX - resize.clientX)));
+          codeElement.current?.style.setProperty("--file-explorer-width", `${resize.current}px`);
+        }}
+        onPointerUp={(event) => {
+          if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+          finishExplorerResize();
+        }}
+        onPointerCancel={finishExplorerResize}
+        onLostPointerCapture={finishExplorerResize}
+      />
+      <div className="file-content">
+        {showChanges && projectId ? <WorkspaceGitDiff key={`${projectId}:${selectedGitPath}`} projectId={projectId} path={selectedGitPath} changes={git.data} />
+          // A refresh keeps the open file on screen, also when it fails: the next one tries again.
+          : openFile ? (
+          <>
+            {toolbarTarget ? null : <div className="file-content-header">{fileHeader}</div>}
+            {selectedMedia && projectId
+              ? <WorkspaceMediaPreview projectId={projectId} file={selectedMedia} revision={revision} />
+              : openFile.binary
+              ? <WorkspaceState label={t("workspace.binaryUnavailable")} />
+              : renderFile ? renderFile(openFile)
+              : isMarkdownFile(openFile.path) ? <WorkspaceMarkdownPreview projectId={projectId} revision={revision} file={openFile} onOpenFile={onSelect} />
+              : <HighlightedCode path={openFile.path} content={openFile.content ?? ""} />}
+          </>
+        ) : error ? <WorkspaceState error={error} /> : loading ? <WorkspaceState loading label={t("workspace.loadingFile")} /> : <WorkspaceState icon={<FolderOpen size={20} />} label={t("workspace.selectFile")} />}
+      </div>
+    </div>
+    {contextMenu ? <WorkspaceTreeContextMenu menu={contextMenu} file={files.find((file) => file.path === contextMenu.path)} onClose={() => setContextMenu(undefined)} onOpen={onOpenExternal} onAction={(action) => entryAction(action, contextMenu)} /> : null}
+    {entryDialog ? <ProjectRenameDialog title={entryDialog.kind === "rename" ? t("workspace.renameEntry", { name: fileName(entryDialog.path) }) : entryDialog.kind === "file" ? t("workspace.newFile") : t("workspace.newFolder")} name={entryDialog.kind === "rename" ? fileName(entryDialog.path) : ""} returnFocus={null} onClose={() => setEntryDialog(undefined)} onConfirm={(name) => {
+      const entry = entryDialog;
+      setEntryDialog(undefined);
+      if (!projectId || !name.trim()) return;
+      void mutate(async () => {
+        if (entry.kind === "rename") return { from: entry.path, to: (await renameWorkspaceEntry(projectId, entry.path, name)).path };
+        const created = await createWorkspaceEntry(projectId, entry.path, name, entry.kind);
+        return entry.kind === "file" ? { to: created.path } : {};
+      });
+    }} /> : null}
+  </>;
+}
+
+interface WorkspaceCodeViewProps {
+  projectId: string;
+  revision: number;
+  openFileRequest?: { path: string; id: number };
+  toolbarTarget?: HTMLElement | null;
+  enabled?: boolean;
+  onFilesChanged?: () => void;
+}
+
+export function WorkspaceCodeView(props: WorkspaceCodeViewProps) {
+  return <WorkspaceCodeContent key={props.projectId} {...props} />;
+}
+
+function WorkspaceCodeContent({ projectId, revision, openFileRequest, toolbarTarget, enabled = true, onFilesChanged }: WorkspaceCodeViewProps) {
+  const [filesRevision, setFilesRevision] = useState(0);
+  const [selectedPath, setSelectedPath] = useState(openFileRequest?.path);
+  const listing = useWorkspaceFiles(projectId, revision + filesRevision, selectedPath, enabled);
+  const files = listing.files;
+  const [selectedFile, setSelectedFile] = useState<WorkspaceFileContent>();
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string>();
+  const request = useRef(0);
+  const handledOpenFileRequest = useRef(openFileRequest?.id);
+
+  useEffect(() => {
+    if (!enabled || listing.loading) return;
+    let disposed = false;
+    const currentRequest = ++request.current;
+    setLoading(true);
+    setError(undefined);
+    void (async () => {
+      const result = files;
+      const requestedPath = openFileRequest?.path;
+      const nextPath = selectedPath && result.some((file) => file.path === selectedPath)
+        ? selectedPath
+        : requestedPath && result.some((file) => file.path === requestedPath)
+        ? requestedPath
+        : result.find((file) => !file.directory)?.path;
+      setSelectedPath(nextPath);
+      if (!nextPath) {
+        setSelectedFile(undefined);
+        return;
+      }
+      const content = await loadWorkspaceFile(projectId, nextPath, result);
+      if (!disposed && request.current === currentRequest) setSelectedFile(content);
+    })().catch((cause) => {
+      if (!disposed && request.current === currentRequest) setError(errorMessage(cause));
+    }).finally(() => {
+      if (!disposed && request.current === currentRequest) setLoading(false);
+    });
+    return () => { disposed = true; };
+  }, [projectId, files, listing.loading, enabled]);
+
+  async function selectFile(path: string): Promise<void> {
+    const currentRequest = ++request.current;
+    setSelectedPath(path);
+    setSelectedFile(undefined);
+    setLoading(true);
+    setError(undefined);
+    try {
+      const content = await loadWorkspaceFile(projectId, path, files);
+      if (request.current === currentRequest) setSelectedFile(content);
+    } catch (cause) {
+      if (request.current === currentRequest) setError(errorMessage(cause));
+    } finally {
+      if (request.current === currentRequest) setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    if (!openFileRequest || handledOpenFileRequest.current === openFileRequest.id) return;
+    handledOpenFileRequest.current = openFileRequest.id;
+    void selectFile(openFileRequest.path);
+  }, [openFileRequest?.id]);
+
+  return <WorkspaceFileBrowser
+    files={files}
+    selectedPath={selectedPath}
+    selectedFile={selectedFile}
+    loading={loading || listing.loading}
+    error={error ?? listing.error}
+    onSelect={(path) => void selectFile(path)}
+    projectId={projectId}
+    revision={revision}
+    filesRevision={filesRevision}
+    openFileRequestId={openFileRequest?.id}
+    toolbarTarget={toolbarTarget}
+    onDirectoryToggle={listing.toggle}
+    onSearchChange={listing.search}
+    onRefresh={listing.refresh}
+    treeLoading={listing.loading}
+    onFilesChanged={(change) => {
+      request.current += 1;
+      setSelectedPath((current) => workspacePathAfterChange(current, change));
+      setSelectedFile(undefined);
+      setFilesRevision((value) => value + 1);
+      onFilesChanged?.();
+    }}
+    onOpenExternal={typeof window !== "undefined" && window.ohMyGameDesktop?.openProjectFile
+      ? (path, mode) => window.ohMyGameDesktop!.openProjectFile(projectId, path, mode)
+      : undefined}
+  />;
+}
+
+function FileOpenActions({ path, onOpen }: { path: string; onOpen: (path: string, mode: ProjectFileOpenMode) => Promise<void> }) {
+  const [open, setOpen] = useState(false);
+  const actions = useRef<HTMLDivElement>(null);
+  const platform = typeof window === "undefined" ? "" : window.ohMyGameDesktop?.platform;
+  const options = projectEntryOpenOptions(platform, false);
+  const opener = useProjectEntryOpener(path, onOpen, () => setOpen(false), () => setOpen(true));
+
+  useEffect(() => {
+    if (!open) return;
+    const close = (event: MouseEvent) => {
+      if (!actions.current?.contains(event.target as Node)) setOpen(false);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpen(false);
+    };
+    document.addEventListener("mousedown", close);
+    window.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("mousedown", close);
+      window.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [open]);
+
+  return (
+    <div className="file-open-actions" ref={actions}>
+      <button type="button" disabled={opener.opening} onClick={() => void opener.choose("default")} title={t("workspace.openDefault")} aria-label={t("workspace.openDefaultLabel")}>
+        <ExternalLink size={13} />
+      </button>
+      <button className="file-open-menu-button" type="button" onClick={() => setOpen((value) => !value)} title={t("workspace.chooseOpen")} aria-label={t("workspace.chooseOpenLabel")} aria-expanded={open} aria-haspopup="menu">
+        <ChevronDown size={12} />
+      </button>
+      {open ? (
+        <div className="file-open-menu" role="menu">
+          {options.map(({ mode, label, icon: Icon }) => (
+            <button type="button" role="menuitem" disabled={opener.opening} key={mode} onClick={() => void opener.choose(mode)}><Icon size={13} />{label}</button>
+          ))}
+          {opener.error ? <p className="file-open-error" role="alert">{opener.error}</p> : null}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function WorkspaceTreeContextMenu({ menu, file, onClose, onOpen, onAction }: {
+  menu: WorkspaceContextMenu;
+  file?: WorkspaceFile;
+  onClose: () => void;
+  onOpen?: (path: string, mode: ProjectFileOpenMode) => Promise<void>;
+  onAction: (action: WorkspaceEntryAction) => void;
+}) {
+  const root = useRef<HTMLDivElement>(null);
+  const [position, setPosition] = useState({ x: menu.x, y: menu.y });
+  const platform = window.ohMyGameDesktop?.platform;
+  const options = onOpen && menu.path ? projectEntryOpenOptions(platform, menu.directory) : [];
+  const opener = useProjectEntryOpener(menu.path, onOpen, onClose);
+
+  useLayoutEffect(() => {
+    const bounds = root.current?.getBoundingClientRect();
+    if (!bounds) return;
+    setPosition({
+      x: Math.max(6, Math.min(menu.x, window.innerWidth - bounds.width - 6)),
+      y: Math.max(6, Math.min(menu.y, window.innerHeight - bounds.height - 6)),
+    });
+    root.current?.focus();
+  }, [menu.x, menu.y]);
+
+  useEffect(() => {
+    const closeOutside = (event: PointerEvent) => {
+      if (!root.current?.contains(event.target as Node)) onClose();
+    };
+    const closeOnKey = (event: KeyboardEvent) => { if (event.key === "Escape") onClose(); };
+    const closeOnLayout = () => onClose();
+    document.addEventListener("pointerdown", closeOutside);
+    document.addEventListener("scroll", closeOnLayout, true);
+    window.addEventListener("keydown", closeOnKey);
+    window.addEventListener("resize", closeOnLayout);
+    return () => {
+      document.removeEventListener("pointerdown", closeOutside);
+      document.removeEventListener("scroll", closeOnLayout, true);
+      window.removeEventListener("keydown", closeOnKey);
+      window.removeEventListener("resize", closeOnLayout);
+    };
+  }, [onClose]);
+
+  return createPortal(
+    <div
+      ref={root}
+      className="workspace-tree-context-menu"
+      role="menu"
+      aria-label={menu.directory ? t("workspace.folderActions") : t("workspace.fileActions")}
+      tabIndex={-1}
+      style={{ left: position.x, top: position.y }}
+      onContextMenu={(event) => event.preventDefault()}
+      onKeyDown={(event) => {
+        const items = [...(root.current?.querySelectorAll<HTMLButtonElement>("button:not(:disabled)") ?? [])];
+        if (!items.length || !["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
+        event.preventDefault();
+        const current = items.indexOf(document.activeElement as HTMLButtonElement);
+        const index = current < 0 && event.key === "ArrowUp" ? 0 : current;
+        const next = event.key === "Home" ? 0 : event.key === "End" ? items.length - 1 : (index + (event.key === "ArrowDown" ? 1 : -1) + items.length) % items.length;
+        items[next]?.focus();
+      }}
+    >
+      <button type="button" role="menuitem" onClick={() => onAction("new-file")}><Plus size={14} /><span>{t("workspace.newFile")}</span></button>
+      <button type="button" role="menuitem" onClick={() => onAction("new-folder")}><FolderPlus size={14} /><span>{t("workspace.newFolder")}</span></button>
+      {menu.path ? <>
+        <hr />
+        <button type="button" role="menuitem" onClick={() => onAction("rename")}><Pencil size={14} /><span>{t("common.rename")}</span></button>
+        <button type="button" role="menuitem" onClick={() => onAction("copy-path")}><Copy size={14} /><span>{t("workspace.copyPath")}</span></button>
+        {file?.mediaType ? <button type="button" role="menuitem" onClick={() => onAction("save-library")}><Layers3 size={14} /><span>{t("workspace.saveToLibrary")}</span></button> : null}
+      </> : null}
+      {options.length ? <hr /> : null}
+      {options.map(({ mode, label, icon: Icon }) => (
+        <button type="button" role="menuitem" disabled={opener.opening} key={mode} onClick={() => void opener.choose(mode)}><Icon size={14} /><span>{label}</span></button>
+      ))}
+      {menu.path ? <><hr /><button type="button" role="menuitem" className="workspace-file-delete" onClick={() => onAction("delete")}><Trash2 size={14} /><span>{t("common.delete")}</span></button></> : null}
+      {opener.error ? <p className="file-open-error" role="alert">{opener.error}</p> : null}
+    </div>,
+    document.body,
+  );
+}
+
+function useProjectEntryOpener(
+  path: string,
+  onOpen: ((path: string, mode: ProjectFileOpenMode) => Promise<void>) | undefined,
+  onOpened: () => void,
+  onFailed?: () => void,
+) {
+  const [opening, setOpening] = useState(false);
+  const [error, setError] = useState<string>();
+
+  async function choose(mode: ProjectFileOpenMode): Promise<void> {
+    if (opening || !onOpen) return;
+    setOpening(true);
+    setError(undefined);
+    try {
+      await onOpen(path, mode);
+      onOpened();
+    } catch (cause) {
+      setError(errorMessage(cause));
+      onFailed?.();
+    } finally {
+      setOpening(false);
+    }
+  }
+
+  return { opening, error, choose };
+}
+
+function projectEntryOpenOptions(platform: string | undefined, directory: boolean): Array<{ mode: ProjectFileOpenMode; label: string; icon: IconComponent }> {
+  const fileManager = platform === "darwin" ? "Finder" : platform === "win32" ? t("workspace.fileExplorer") : t("workspace.fileManager");
+  return [
+    { mode: "default", label: directory ? t("workspace.openIn", { app: fileManager }) : t("workspace.defaultApp"), icon: ExternalLink },
+    { mode: "reveal", label: directory ? t("workspace.showInFolder") : t("workspace.showIn", { app: fileManager }), icon: FolderOpen },
+    { mode: "vscode", label: directory ? t("workspace.openFolderIn", { app: "VS Code" }) : t("workspace.openIn", { app: "VS Code" }), icon: Code2 },
+    { mode: "zed", label: directory ? t("workspace.openFolderIn", { app: "Zed" }) : t("workspace.openIn", { app: "Zed" }), icon: Code2 },
+    ...(!directory && (platform === "darwin" || platform === "win32") ? [{
+      mode: "text-editor" as const,
+      label: t("workspace.openIn", { app: platform === "darwin" ? t("workspace.textEdit") : t("workspace.notepad") }),
+      icon: FileText,
+    }] : []),
+  ];
+}
+
+function WorkspaceMediaPreview({ projectId, file, revision }: {
+  projectId: string;
+  file: WorkspaceFile & { mediaType: NonNullable<WorkspaceFile["mediaType"]> };
+  revision: number;
+}) {
+  const preview = useWorkspaceAssetUrl(projectId, file.path, revision);
+  return (
+    <div className="workspace-media-preview">
+      {!preview.url && !preview.error ? <span className="workspace-media-state"><LoaderCircle className="spin" size={16} />{t("workspace.loadingPreview")}</span> : null}
+      {preview.error ? <span className="workspace-media-state workspace-media-error" role="alert"><X size={16} />{preview.error}</span> : null}
+      {preview.url ? <AssetMedia type={file.mediaType} url={preview.url} label={fileName(file.path)} /> : null}
+    </div>
+  );
+}
+
+function WorkspaceMarkdownPreview({ projectId, revision, file, onOpenFile }: {
+  projectId?: string;
+  revision: number;
+  file: WorkspaceFileContent;
+  onOpenFile: (path: string) => void;
+}) {
+  const baseDir = file.path.split("/").slice(0, -1).join("/");
+  const renderImage = useCallback((src: string | undefined, alt: string | undefined) => (
+    <WorkspaceMarkdownImage projectId={projectId} revision={revision} baseDir={baseDir} src={src} alt={alt} />
+  ), [projectId, revision, baseDir]);
+  return <MarkdownContent className="file-content-markdown" text={file.content ?? ""} projectId={projectId} baseDir={baseDir} onOpenWorkspaceFile={onOpenFile} renderImage={renderImage} />;
+}
+
+function WorkspaceMarkdownImage({ projectId, revision, baseDir, src, alt }: {
+  projectId?: string;
+  revision: number;
+  baseDir: string;
+  src?: string;
+  alt?: string;
+}) {
+  const path = workspaceLinkPath(src, undefined, baseDir);
+  const { url } = useWorkspaceAssetUrl(path ? projectId : undefined, path ?? "", revision);
+  const external = src && /^(?:https?:|data:image\/)/i.test(src) ? src : undefined;
+  const resolved = url ?? external;
+  return resolved ? <img src={resolved} alt={alt ?? ""} loading="lazy" /> : <span className="file-content-markdown-image">{alt}</span>;
+}
+
+function loadWorkspaceFile(projectId: string, filePath: string, files: WorkspaceFile[]): Promise<WorkspaceFileContent> {
+  const file = files.find((candidate) => candidate.path === filePath);
+  if (file?.directory) return Promise.reject(new Error("Path is a directory"));
+  if (file && hasMediaType(file)) {
+    return Promise.resolve({ path: file.path, size: file.size, binary: true });
+  }
+  return getWorkspaceFile(projectId, filePath);
+}
+
+export interface WorkspaceFileNode {
+  id: string;
+  name: string;
+  path?: string;
+  directory?: true;
+  children?: WorkspaceFileNode[];
+}
+
+interface MutableWorkspaceFileNode {
+  id: string;
+  name: string;
+  path?: string;
+  directory?: true;
+  children: Map<string, MutableWorkspaceFileNode>;
+}
+
+function isMarkdownFile(path: string): boolean {
+  const ext = path.split(".").at(-1)?.toLocaleLowerCase();
+  return ext === "md" || ext === "markdown";
+}
+
+export function workspaceFileTree(files: readonly WorkspaceFile[]): WorkspaceFileNode[] {
+  const roots = new Map<string, MutableWorkspaceFileNode>();
+  for (const file of files) {
+    const parts = file.path.split("/").filter(Boolean);
+    let children = roots;
+    let currentPath = "";
+    for (const [index, name] of parts.entries()) {
+      currentPath = currentPath ? `${currentPath}/${name}` : name;
+      let node = children.get(name);
+      if (!node) {
+        node = { id: currentPath, name, children: new Map() };
+        children.set(name, node);
+      }
+      if (index === parts.length - 1) {
+        node.path = file.directory ? undefined : file.path;
+        if (file.directory) node.directory = true;
+      }
+      children = node.children;
+    }
+  }
+  return finalizeWorkspaceNodes(roots);
+}
+
+function finalizeWorkspaceNodes(nodes: Map<string, MutableWorkspaceFileNode>): WorkspaceFileNode[] {
+  return [...nodes.values()]
+    .sort((left, right) => Number(Boolean(left.path)) - Number(Boolean(right.path)) || left.name.localeCompare(right.name))
+    .map((node) => ({
+      id: node.id,
+      name: node.name,
+      ...(node.path ? { path: node.path } : {}),
+      ...(node.directory ? { directory: true as const } : {}),
+      ...(node.directory || node.children.size > 0 ? { children: finalizeWorkspaceNodes(node.children) } : {}),
+    }));
+}
+
+/** A file's icon from its extension, tinted with the kind of file it is. */
+function fileIcon(name: string): { icon: IconComponent; tone: string } {
+  const extension = name.slice(name.lastIndexOf(".") + 1).toLowerCase();
+  if (["ts", "tsx", "js", "jsx", "mjs", "cjs", "gd", "cs", "py"].includes(extension)) return { icon: FileCode2, tone: "code" };
+  if (["css", "scss"].includes(extension)) return { icon: FileStyle, tone: "video" };
+  if (["html", "htm"].includes(extension)) return { icon: Globe2, tone: "data" };
+  if (["json", "toml", "yaml", "yml"].includes(extension)) return { icon: FileConfig, tone: "audio" };
+  if (["md", "txt"].includes(extension)) return { icon: FileDocument, tone: "document" };
+  if (["png", "jpg", "jpeg", "webp", "svg", "gif"].includes(extension)) return { icon: ImageIcon, tone: "image" };
+  if (["mp3", "ogg", "wav"].includes(extension)) return { icon: Music2, tone: "audio" };
+  return { icon: FilePlain, tone: "text" };
+}
+
+function WorkspaceTreeNode({ node, style, onContextMenu }: NodeRendererProps<WorkspaceFileNode> & {
+  onContextMenu?: (node: NodeRendererProps<WorkspaceFileNode>["node"], event: React.MouseEvent<HTMLDivElement>) => void;
+}) {
+  const folder = Boolean(node.data.directory || !node.isLeaf);
+  const expandable = folder;
+  return (
+    <div className={`file-tree-node${node.isSelected ? " file-tree-node-selected" : ""}`} style={style} title={node.id} onContextMenu={(event) => onContextMenu?.(node, event)}>
+      {expandable ? <button
+        className={`file-tree-toggle${node.isOpen ? " file-tree-toggle-open" : ""}`}
+        type="button"
+        tabIndex={-1}
+        aria-label={node.isOpen ? t("workspace.collapse", { name: node.data.name }) : t("workspace.expand", { name: node.data.name })}
+        onClick={(event) => {
+          event.stopPropagation();
+          node.toggle();
+        }}
+      >
+        <ChevronRight size={13} aria-hidden="true" />
+      </button> : <span className="file-tree-spacer" />}
+      {folder ? (
+        node.isOpen
+          ? <FolderOpen className="file-tree-folder-icon" size={14} aria-hidden="true" />
+          : <Folder className="file-tree-folder-icon" size={14} aria-hidden="true" />
+      ) : (() => {
+        const { icon: Icon, tone } = fileIcon(node.data.name);
+        return <Icon className={`file-tree-file-icon tone-${tone}`} size={14} aria-hidden="true" />;
+      })()}
+      <span>{node.data.name}</span>
+    </div>
+  );
+}
+
+function useElementHeight(element: HTMLElement | null): number {
+  const [height, setHeight] = useState(0);
+  useEffect(() => {
+    if (!element) return;
+    // Hidden, it measures 0. Keeping the last size keeps what it holds mounted,
+    // such as the file tree's open folders.
+    const update = () => {
+      if (element.clientHeight) setHeight(element.clientHeight);
+    };
+    update();
+    const observer = new ResizeObserver(update);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [element]);
+  return height;
+}
+
+/** The Assets view for a workspace that does not load its file list already, such as an Interactive Story. */
+export function WorkspaceAssetsView({ projectId, revision, onShowInCode }: { projectId: string; revision: number; onShowInCode: (path: string) => void }) {
+  const [files, setFiles] = useState<WorkspaceFile[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string>();
+
+  useEffect(() => {
+    let disposed = false;
+    setLoading(true);
+    setError(undefined);
+    void listWorkspaceFiles(projectId).then((result) => {
+      if (!disposed) setFiles(result);
+    }).catch((cause) => {
+      if (!disposed) setError(errorMessage(cause));
+    }).finally(() => {
+      if (!disposed) setLoading(false);
+    });
+    return () => { disposed = true; };
+  }, [projectId, revision]);
+
+  return <AssetsView
+    projectId={projectId}
+    files={files.filter((file) => file.mediaType && !file.directory)}
+    loading={loading}
+    error={error}
+    revision={revision}
+    onShowInCode={onShowInCode}
+  />;
+}
+
+export function AssetsView({
+  projectId,
+  files,
+  loading,
+  error,
+  revision,
+  onShowInCode,
+}: {
+  projectId?: string;
+  files: WorkspaceFile[];
+  loading: boolean;
+  error?: string;
+  revision: number;
+  onShowInCode: (path: string) => void;
+}) {
+  const [mediaFilter, setMediaFilter] = useState<MediaFilter>("all");
+  const [query, setQuery] = useState("");
+  const [selectedPath, setSelectedPath] = useState<string>();
+  const [filters, setFilters] = useState<ProjectAssetFilters>({});
+  const [sort, setSort] = useAssetSort("ohmygame:project-assets-sort");
+  // OhMyGame's own folder holds no assets; the project's panels show in Code.
+  const assets = useMemo(() => files.filter(hasMediaType).filter((file) => !isProjectDataPath(file.path)).map((file) => ({ ...file, projectId: projectId ?? "", revision, referenceOnly: file.purpose === "reference" })), [files, projectId, revision]);
+  // Laid out as the Library page: kind tabs with counts, the source and use
+  // filters beside them, and tiles below.
+  const narrowed = useMemo(() => filterAssets(assets, "all", query, filters), [assets, query, filters]);
+  const visibleAssets = useMemo(() => sortAssets(mediaFilter === "all" ? narrowed : narrowed.filter((asset) => asset.mediaType === mediaFilter), sort), [narrowed, mediaFilter, sort]);
+  const selectedAsset = assets.find((asset) => asset.path === selectedPath);
+  const filtered = Boolean(query.trim()) || (filters.origin ?? "all") !== "all" || (filters.purpose ?? "all") !== "all" || (filters.period ?? "all") !== "all";
+  const resetFilters = () => { setQuery(""); setFilters({}); };
+
+  if (loading && files.length === 0) return <WorkspaceState loading label={t("workspace.loadingAssets")} />;
+  if (error) return <WorkspaceState error={error} />;
+  if (!projectId || assets.length === 0) return <WorkspaceState icon={<ImageIcon size={20} />} label={t("workspace.noMedia")} />;
+  return (
+    <div className="assets-view">
+      <div className="assets-search"><SearchInput value={query} onChange={setQuery} label={t("assets.search")} placeholder={t("assets.search")} /></div>
+      <div className="library-filter-row assets-filter-row">
+        <Tabs variant="pills" label={t("assets.mediaTypes")} value={mediaFilter} onChange={setMediaFilter} tabs={[
+          { value: "all", label: t("assets.filter.all"), icon: <Layers3 size={14} />, count: narrowed.length },
+          ...ASSET_KINDS.map((kind) => ({ value: kind, label: t(`assets.filter.${kind}`), icon: <CategoryMark category={kind} />, count: narrowed.filter((asset) => asset.mediaType === kind).length })),
+        ]} />
+        <span className="library-filter-spacer" />
+        <ProjectAssetFilterRow assets={assets} filters={filters} onChange={setFilters} />
+        {filtered ? <Button size="sm" variant="ghost" onClick={resetFilters}>{t("libraryFilters.reset")}</Button> : null}
+        <AssetSortSelect value={sort} onChange={setSort} />
+      </div>
+      {visibleAssets.length ? <div className="library-tiles">{visibleAssets.map((asset) => (
+        <ProjectAssetTile key={asset.path} asset={asset} sort={sort} selected={selectedPath === asset.path} onOpen={() => setSelectedPath(asset.path)} />
+      ))}</div> : <Empty title={t("library.noMatch")} action={filtered ? <Button size="sm" onClick={resetFilters}>{t("libraryFilters.reset")}</Button> : undefined} />}
+      {selectedAsset ? <WorkspaceAssetDialog
+        asset={selectedAsset}
+        onClose={() => setSelectedPath(undefined)}
+        onShowInCode={() => { setSelectedPath(undefined); onShowInCode(selectedAsset.path); }}
+      /> : null}
+    </div>
+  );
+}
+
+const ASSET_KINDS = ["image", "video", "audio", "model"] as const;
+
+/** A project asset as a Library tile: its kind and where it came from below the preview. */
+function ProjectAssetTile({ asset, sort, selected, onOpen }: { asset: BrowsableAsset; sort: AssetSort; selected: boolean; onOpen: () => void }) {
+  const [tile, visible] = useNearViewport<HTMLButtonElement>();
+  const extension = fileExtension(asset.path).slice(1).toUpperCase();
+  const detail = assetSortDetail(asset, sort);
+  return <MediaTile ref={tile} category={asset.mediaType} name={fileName(asset.path)} selected={selected} onClick={onOpen}
+    meta={`${detail ? `${detail} · ` : ""}${mediaTypeLabel(asset.mediaType)} · ${asset.referenceOnly ? t("assets.reference") : libraryAssetOriginLabel(asset.origin)}`}
+    preview={asset.mediaType === "audio"
+      ? <span className="library-file-mark"><CategoryMark category="audio" size={22} />{extension ? <small>{extension}</small> : null}</span>
+      : <AssetThumbnail asset={asset} visible={visible} />} />;
+}
+
+function WorkspaceState({ label, error, loading, icon }: { label?: string; error?: string; loading?: boolean; icon?: React.ReactNode }) {
+  // A long message, such as a build's output, shows its first line; the rest is in the details.
+  const text = error ?? label ?? "";
+  const [first, ...rest] = text.split("\n");
+  const details = rest.join("\n").trim();
+  return (
+    <div className={`workspace-state${error ? " error-state" : ""}`} role={error ? "alert" : undefined}>
+      {loading ? <LoaderCircle className="spin" size={20} /> : error ? <X size={20} /> : icon}
+      <span>{details ? first : text}</span>
+      {details ? <Disclosure summary={t("common.errorDetails")}><pre>{details}</pre></Disclosure> : null}
+    </div>
+  );
+}
+
+/**
+ * How to play a game the panel can't: its plugins' `game.start` commands,
+ * such as running it in its engine, and the project's settings. An engine's
+ * plugin the folder's files turned on, waiting to be allowed, is offered to
+ * allow first. Without either, the web preview's switch is the way.
+ */
+function GameStartEmpty({ noWebProject = false, onOpenSettings }: { noWebProject?: boolean; onOpenSettings?: () => void }) {
+  const start = usePluginSlot("game.start");
+  const [allowing, setAllowing] = useState<string>();
+  const [failed, setFailed] = useState<string>();
+  // Why it couldn't, such as an agent still working, goes after a while, as the reason may have.
+  useEffect(() => {
+    if (!failed) return;
+    const timer = window.setTimeout(() => setFailed(undefined), 8000);
+    return () => window.clearTimeout(timer);
+  }, [failed]);
+  const waiting = start.commands.length ? [] : start.waiting;
+  const engine = start.commands.length > 0 || waiting.length > 0;
+  const allow = (id: string) => {
+    setAllowing(id);
+    setFailed(undefined);
+    void start.allow(id).catch((cause: unknown) => setFailed(cause instanceof Error ? cause.message : String(cause))).finally(() => setAllowing(undefined));
+  };
+  return <Empty icon={engine ? <Play size={20} /> : <Globe2 size={20} />}
+    title={engine ? t("workspace.playInEngine") : noWebProject ? t("workspace.noWebProject") : t("workspace.webPreviewOff")}
+    description={<>
+      {waiting.length ? t("workspace.allowEngineHint", { name: waiting[0]!.displayName }) : engine ? t("workspace.playInEngineHint") : noWebProject ? t("workspace.noWebProjectHint") : t("workspace.webPreviewOffHint")}
+      {failed ? <span className="game-start-error" role="alert">{failed}</span> : null}
+    </>}
+    action={<div className="game-start-actions">
+      {start.commands.map((command, index) => <Button key={command.id} variant={index === 0 ? "primary" : "secondary"} onClick={() => void start.run(command)}>{command.title}</Button>)}
+      {waiting.map((plugin, index) => <Button key={plugin.id} variant={index === 0 ? "primary" : "secondary"} disabled={allowing !== undefined}
+        onClick={() => allow(plugin.id)}>{t("workspace.allowPlugin", { name: plugin.displayName })}</Button>)}
+      {onOpenSettings ? <Button variant={engine ? "ghost" : "secondary"} onClick={onOpenSettings}>{t("workspace.openProjectSettings")}</Button> : null}
+    </div>} />;
+}
+
+/** A failed build's ways out from the project's plugins, such as installing what the build needs or running it in its engine. */
+function GameStartActions() {
+  const start = usePluginSlot("game.start");
+  return start.commands.length ? <div className="preview-recovery-actions">
+    {start.commands.map((command) => <button key={command.id} type="button" onClick={() => void start.run(command)}>{command.title}</button>)}
+  </div> : null;
+}
+
+function PreviewState({ status, error, phase, startedAt }: { status?: ProjectState["preview"]["status"]; error?: string; phase?: ProjectState["preview"]["phase"]; startedAt?: string }) {
+  const [elapsed, setElapsed] = useState(0);
+  useEffect(() => {
+    if (status !== "starting" || !startedAt) return;
+    const update = () => setElapsed(Math.max(0, Math.floor((Date.now() - Date.parse(startedAt)) / 1_000)));
+    update(); const timer = setInterval(update, 1_000); return () => clearInterval(timer);
+  }, [status, startedAt]);
+  switch (status) {
+    case "error": return <WorkspaceState error={error ?? t("workspace.processStopped")} />;
+    case "starting": return <div className="preview-starting" role="status"><LoaderCircle className="spin" size={14} /><span>{t(`workspace.phase.${phase ?? "launching"}`)} · {elapsed}s</span></div>;
+    case "waiting": return error ? <WorkspaceState label={error} /> : <PreviewEmptyState />;
+    case undefined: return <PreviewEmptyState />;
+    case "stopped": case "ready": return null;
+    default: status satisfies never; return null;
+  }
+}
+
+function PreviewLogs({ project, onClose }: { project?: ProjectState; onClose: () => void }) {
+  const preview = project?.preview;
+  // The desktop game is a native view above the page, so it steps aside for the logs.
+  return <aside className="preview-logs" aria-label={t("workspace.logs")} data-native-preview-overlay="">
+    <header><strong>{t("workspace.logs")}</strong><button type="button" onClick={onClose} aria-label={t("workspace.closeLogs")}><X size={14} /></button></header>
+    <p>{preview?.directory ?? project?.startupDirectory ?? "."} · {preview?.command ?? t("workspace.notStarted")}</p>
+    {preview?.manager ? <p>{preview.manager} · {preview.managerSource}</p> : null}
+    <pre>{preview?.logs || preview?.error || t("workspace.noOutput")}</pre>
+    {preview?.diagnostics?.map((diagnostic, index) => <Disclosure key={`${diagnostic.client}:${index}`} summary={`${diagnostic.source ?? t("workspace.previewSource")} · ${diagnostic.path ?? "/"}`}><pre>{diagnostic.message}</pre></Disclosure>)}
+  </aside>;
+}
+
+function previewRepairPrompt(project: ProjectState | undefined, message: string): string {
+  return `Please diagnose and fix this project's preview error. Preserve the configured runtime and package manager, and verify the result.\n\nStartup directory: ${project?.startupDirectory ?? "."}\nCommand: ${project?.preview.command ?? project?.startupScript ?? "dev"}\n\n${message}\n\nRecent output:\n${project?.preview.logs ?? "(none)"}`;
+}
+
+function previewErrorFile(project: ProjectState | undefined, message: string): string | undefined {
+  const match = message.match(/from ["']([^"']+\.(?:[jt]sx?|css|vue|svelte))["']/) ?? message.match(/(?:^|\n)([^\n]+\.(?:[jt]sx?|css|vue|svelte|html)):\d+/);
+  if (!match) return;
+  const file = match[1].trim().replaceAll("\\", "/");
+  const root = project?.workspacePath.replaceAll("\\", "/");
+  const relative = root && file.startsWith(`${root}/`) ? file.slice(root.length + 1) : file.replace(/^\.\//, "");
+  return relative.startsWith("/") || relative.split("/").includes("..") ? undefined : relative;
+}
+
+function PreviewEmptyState() {
+  return (
+    <div className="preview-empty-state">
+      <div className="preview-empty-mark" aria-hidden="true">
+        <LaptopMinimalistic size={20} />
+      </div>
+      <p className="preview-empty-title">{t("workspace.emptyTitle")}</p>
+      <p className="preview-empty-description">{t("workspace.emptyDescription")}</p>
+    </div>
+  );
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}

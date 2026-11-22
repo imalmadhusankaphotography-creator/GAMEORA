@@ -1,0 +1,515 @@
+import path from "node:path";
+import { pathToFileURL } from "node:url";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+const electron = vi.hoisted(() => ({
+  windows: [] as unknown[],
+  dark: false,
+  workArea: { x: 0, y: 0, width: 1920, height: 1080 },
+  cursorPoint: { x: 480, y: 320 },
+  getDisplayNearestPoint: vi.fn(),
+  openExternal: vi.fn(async () => {}),
+}));
+
+vi.mock("electron", () => ({
+  shell: { openExternal: electron.openExternal },
+  nativeTheme: { get shouldUseDarkColors() { return electron.dark; } },
+  screen: {
+    getCursorScreenPoint: () => electron.cursorPoint,
+    getDisplayNearestPoint: electron.getDisplayNearestPoint,
+  },
+  BrowserWindow: class {
+    readonly options: Record<string, unknown>;
+    readonly webContents = {
+      zoomLevel: 0,
+      isDestroyed: () => this.destroyed,
+      setWindowOpenHandler: vi.fn((handler: (details: { url: string }) => { action: string }) => {
+        this.onWindowOpen = handler;
+      }),
+      on: vi.fn((event: string, handler: (event: { preventDefault(): void }, url: string) => void) => {
+        if (event === "will-navigate") this.onNavigate = handler;
+        this.handlers.set(event, handler);
+      }),
+      setAudioMuted: vi.fn(),
+      mainFrame: { url: "http://127.0.0.1:43120/" },
+      ipc: {
+        on: vi.fn((channel: string, handler: (event: { senderFrame: unknown; returnValue?: unknown }) => void) => {
+          this.ipcHandlers.set(channel, handler);
+        }),
+        handle: vi.fn((channel: string, handler: (event: { senderFrame: unknown }, ...args: unknown[]) => unknown) => {
+          this.ipcInvokes.set(channel, handler);
+        }),
+      },
+    };
+    readonly handlers = new Map<string, (...args: never[]) => void>();
+    readonly ipcHandlers = new Map<string, (event: { senderFrame: unknown; returnValue?: unknown }) => void>();
+    readonly ipcInvokes = new Map<string, (event: { senderFrame: unknown }, ...args: unknown[]) => unknown>();
+    readonly once = vi.fn();
+    readonly loadURL = vi.fn(async () => {});
+    readonly setAspectRatio = vi.fn();
+    destroyed = false;
+    onNavigate?: (event: { preventDefault(): void }, url: string) => void;
+    onWindowOpen?: (details: { url: string }) => { action: string };
+
+    constructor(options: Record<string, unknown>) {
+      this.options = options;
+      electron.windows.push(this);
+    }
+    show() {}
+    isDestroyed() { return this.destroyed; }
+  },
+}));
+
+import { createDesktopWindow, fitPlaytestContentSize, isValidPlaytestViewport } from "../src/desktop/window.js";
+import { gameSignInIssuer } from "../src/desktop/game-sign-in.js";
+
+beforeEach(() => {
+  electron.windows.length = 0;
+  electron.dark = false;
+  electron.workArea = { x: 0, y: 0, width: 1920, height: 1080 };
+  electron.cursorPoint = { x: 480, y: 320 };
+  electron.getDisplayNearestPoint.mockReset().mockImplementation(() => ({ workArea: electron.workArea }));
+  electron.openExternal.mockClear();
+});
+
+afterEach(() => vi.unstubAllGlobals());
+
+describe("desktop window", () => {
+  it.each(["win32", "linux", "darwin"])("zooms symmetrically on the shifted and unshifted key on %s", async (platform) => {
+    vi.stubGlobal("process", { ...process, platform });
+    await createDesktopWindow({ runtime: { url: "http://127.0.0.1:43110", token: "token" }, preloadPath: "/tmp/preload.cjs", rendererUrl: "http://127.0.0.1:43120" });
+    const window = electron.windows[0] as {
+      destroyed: boolean;
+      webContents: { zoomLevel: number };
+      handlers: Map<string, (event: { preventDefault(): void }, input: Record<string, unknown>) => void>;
+    };
+    const handler = window.handlers.get("before-input-event");
+    if (platform === "darwin") {
+      expect(handler).toBeUndefined();
+      return;
+    }
+    const event = { preventDefault: vi.fn() };
+    const input = { type: "keyDown", key: "=", control: true, meta: false, shift: false, alt: false };
+    for (const [key, shift, level] of [["=", false, 0.5], ["+", true, 1], ["-", false, 0.5], ["_", true, 0]]) {
+      handler!(event, { ...input, key, shift });
+      expect(event.preventDefault).toHaveBeenCalledOnce();
+      expect(window.webContents.zoomLevel).toBe(level);
+      event.preventDefault.mockClear();
+    }
+    for (const other of [{ type: "keyUp" }, { control: false }, { meta: true }, { alt: true }, { key: "0" }]) handler!(event, { ...input, ...other });
+    expect(event.preventDefault).not.toHaveBeenCalled();
+    expect(window.webContents.zoomLevel).toBe(0);
+    window.destroyed = true;
+    handler!(event, input);
+    expect(event.preventDefault).not.toHaveBeenCalled();
+    expect(window.webContents.zoomLevel).toBe(0);
+  });
+
+  it("uses a native title bar to keep Playtest window controls outside the game on macOS", async () => {
+    vi.stubGlobal("process", { ...process, platform: "darwin" });
+    await createDesktopWindow({
+      runtime: { url: "http://127.0.0.1:43110", token: "token" },
+      preloadPath: "/tmp/preload.cjs",
+      rendererUrl: "http://127.0.0.1:43120",
+      contentSize: { width: 1280, height: 720 },
+      nativeTitleBar: true,
+    });
+    const window = electron.windows[0] as { options: Record<string, unknown> };
+    expect(window.options.useContentSize).toBe(true);
+    expect(window.options.titleBarStyle).toBeUndefined();
+  });
+
+  it("starts at a moderate size centered in the display work area", async () => {
+    await createDesktopWindow({
+      runtime: { url: "http://127.0.0.1:43110", token: "token" },
+      preloadPath: "/tmp/preload.cjs",
+      rendererUrl: "http://127.0.0.1:43120",
+    });
+    const window = electron.windows[0] as { options: Record<string, unknown> };
+    expect(window.options).toMatchObject({ width: 1200, height: 780, minWidth: 960, minHeight: 640, x: 360, y: 150 });
+  });
+
+  it.each([
+    { x: 0, y: 24, width: 1280, height: 696 },
+    { x: 0, y: 24, width: 800, height: 576 },
+    { x: -1440, y: 48, width: 1440, height: 852 },
+  ])("fits within the pointer display's work area %j", async (workArea) => {
+    electron.workArea = workArea;
+    electron.cursorPoint = { x: workArea.x + 100, y: workArea.y + 100 };
+    await createDesktopWindow({
+      runtime: { url: "http://127.0.0.1:43110", token: "token" },
+      preloadPath: "/tmp/preload.cjs",
+      rendererUrl: "http://127.0.0.1:43120",
+    });
+    const window = electron.windows[0] as {
+      options: { width: number; height: number; minWidth: number; minHeight: number; x: number; y: number };
+    };
+    const bounds = window.options;
+    expect(electron.getDisplayNearestPoint).toHaveBeenCalledWith(electron.cursorPoint);
+    expect(bounds.width).toBeLessThanOrEqual(Math.floor(workArea.width * 0.9));
+    expect(bounds.height).toBeLessThanOrEqual(Math.floor(workArea.height * 0.88));
+    expect(bounds.minWidth).toBeLessThanOrEqual(bounds.width);
+    expect(bounds.minHeight).toBeLessThanOrEqual(bounds.height);
+    expect(bounds.x).toBeGreaterThanOrEqual(workArea.x);
+    expect(bounds.y).toBeGreaterThanOrEqual(workArea.y);
+    expect(bounds.x + bounds.width).toBeLessThanOrEqual(workArea.x + workArea.width);
+    expect(bounds.y + bounds.height).toBeLessThanOrEqual(workArea.y + workArea.height);
+    expect(Math.abs((bounds.x - workArea.x) - (workArea.x + workArea.width - bounds.x - bounds.width))).toBeLessThanOrEqual(1);
+    expect(Math.abs((bounds.y - workArea.y) - (workArea.y + workArea.height - bounds.y - bounds.height))).toBeLessThanOrEqual(1);
+  });
+
+  it.each([false, true])("matches the native startup background to dark mode %s", async (dark) => {
+    electron.dark = dark;
+    await createDesktopWindow({
+      runtime: { url: "http://127.0.0.1:43110", token: "token" },
+      preloadPath: "/tmp/preload.cjs",
+      rendererUrl: "http://127.0.0.1:43120",
+    });
+    const window = electron.windows[0] as { options: Record<string, unknown> };
+    expect(window.options.backgroundColor).toBe(dark ? "#171717" : "#ffffff");
+  });
+
+  it("blocks main-frame navigation away from the renderer", async () => {
+    await createDesktopWindow({
+      runtime: { url: "http://127.0.0.1:43110", token: "token" },
+      preloadPath: "/tmp/preload.cjs",
+      rendererUrl: "http://127.0.0.1:43120",
+    });
+    const window = electron.windows[0] as {
+      loadURL: ReturnType<typeof vi.fn>;
+      onNavigate?: (event: { preventDefault(): void }, url: string) => void;
+    };
+
+    expect(window.loadURL).toHaveBeenCalledWith("http://127.0.0.1:43120/");
+    const allowed = { preventDefault: vi.fn() };
+    window.onNavigate?.(allowed, "http://127.0.0.1:43120/");
+    expect(allowed.preventDefault).not.toHaveBeenCalled();
+
+    for (const url of ["https://untrusted.example/", "http://127.0.0.1:43120/other.html", ""]) {
+      const rejected = { preventDefault: vi.fn() };
+      window.onNavigate?.(rejected, url);
+      expect(rejected.preventDefault).toHaveBeenCalledOnce();
+    }
+  });
+
+  it.each([
+    ["HTTP", { rendererUrl: "http://127.0.0.1:43120" }, "http://127.0.0.1:43120/"],
+    ["file", { rendererFile: path.resolve("renderer index.html") }, pathToFileURL(path.resolve("renderer index.html")).href],
+  ] as const)("gives the daemon runtime only to its own %s page, not its command line", async (_kind, renderer, pageUrl) => {
+    let handlerBeforeLoad = false;
+    await createDesktopWindow({
+      runtime: { url: "http://127.0.0.1:43110", token: "secret-token" },
+      preloadPath: "/tmp/preload.cjs",
+      ...renderer,
+      beforeLoad: (created) => {
+        handlerBeforeLoad = (created as unknown as { ipcHandlers: Map<string, unknown> }).ipcHandlers.has("ohmygame:desktop-runtime");
+      },
+    });
+    const window = electron.windows[0] as {
+      options: { webPreferences: Record<string, unknown> };
+      webContents: { mainFrame: { url: string } };
+      ipcHandlers: Map<string, (event: { senderFrame: unknown; returnValue?: unknown }) => void>;
+    };
+
+    expect(JSON.stringify(window.options)).not.toContain("secret-token");
+    expect(window.options.webPreferences.additionalArguments).toBeUndefined();
+    expect(handlerBeforeLoad).toBe(true);
+    const answer = window.ipcHandlers.get("ohmygame:desktop-runtime")!;
+
+    window.webContents.mainFrame.url = pageUrl;
+    const page = { senderFrame: window.webContents.mainFrame, returnValue: undefined as unknown };
+    answer(page);
+    expect(page.returnValue).toEqual({ url: "http://127.0.0.1:43110", token: "secret-token" });
+
+    window.webContents.mainFrame.url = `${pageUrl}#/playtest/project`;
+    const route = { senderFrame: window.webContents.mainFrame, returnValue: undefined as unknown };
+    answer(route);
+    expect(route.returnValue).toEqual({ url: "http://127.0.0.1:43110", token: "secret-token" });
+
+    for (const url of ["https://untrusted.example/", new URL("other.html", pageUrl).href, ""]) {
+      window.webContents.mainFrame.url = url;
+      const redirected = { senderFrame: window.webContents.mainFrame, returnValue: undefined as unknown };
+      answer(redirected);
+      expect(redirected.returnValue).toBeNull();
+    }
+
+    for (const senderFrame of [{ url: pageUrl }, null]) {
+      const embedded = { senderFrame, returnValue: undefined as unknown };
+      answer(embedded);
+      expect(embedded.returnValue).toBeNull();
+    }
+
+    window.webContents.mainFrame.url = pageUrl;
+    const closing = { senderFrame: window.webContents.mainFrame, returnValue: undefined as unknown };
+    (window as unknown as { destroyed: boolean }).destroyed = true;
+    Object.defineProperty(window, "webContents", { get: () => { throw new TypeError("Object has been destroyed"); } });
+    answer(closing);
+    expect(closing.returnValue).toBeNull();
+  });
+
+  it("keeps a page the Library embeds on its own site, once the window's own page names it", async () => {
+    await createDesktopWindow({ runtime: { url: "http://127.0.0.1:43110", token: "token" }, preloadPath: "/tmp/preload.cjs", rendererUrl: "http://127.0.0.1:43120" });
+    const window = electron.windows[0] as {
+      webContents: { mainFrame: { url: string } };
+      handlers: Map<string, (event: { isMainFrame: boolean; isSameDocument?: boolean; frame?: { url: string; frameTreeNodeId: number }; url: string; preventDefault(): void }) => void>;
+      ipcInvokes: Map<string, (event: { senderFrame: unknown }, ...args: unknown[]) => unknown>;
+    };
+    const allow = window.ipcInvokes.get("ohmygame:library-embed")!;
+    const navigate = window.handlers.get("will-frame-navigate")!;
+    const go = (from: string, to: string, isMainFrame = false) => {
+      const event = { isMainFrame, frame: { url: from, frameTreeNodeId: 1 }, url: to, preventDefault: vi.fn() };
+      navigate(event);
+      return event.preventDefault.mock.calls.length === 0;
+    };
+    // A frame that has `from` loaded starts going to `start`, and the server sends it to `to`.
+    const redirect = (from: string, start: string, to: string, frameTreeNodeId = 2) => {
+      const frame = { url: from, frameTreeNodeId };
+      window.handlers.get("did-start-navigation")!({ isMainFrame: false, isSameDocument: false, frame, url: start, preventDefault: vi.fn() });
+      const event = { isMainFrame: false, frame, url: to, preventDefault: vi.fn() };
+      window.handlers.get("will-redirect")!(event);
+      return event.preventDefault.mock.calls.length === 0;
+    };
+    const viewer = "https://sketchfab.com/models/abc/embed";
+
+    // Before it is named, a frame on that site goes where it likes, as other frames do.
+    expect(go(viewer, "https://elsewhere.example/")).toBe(true);
+    // Only the window's own page names one, and only an https page.
+    expect(() => allow({ senderFrame: { url: "http://127.0.0.1:43120/" } }, viewer)).toThrow();
+    expect(() => allow({ senderFrame: window.webContents.mainFrame }, "http://sketchfab.com/")).toThrow();
+    expect(() => allow({ senderFrame: window.webContents.mainFrame }, "https://user:pass@sketchfab.com/")).toThrow();
+    allow({ senderFrame: window.webContents.mainFrame }, viewer);
+
+    expect(go("about:blank", viewer)).toBe(true);
+    expect(go(viewer, "https://sketchfab.com/models/abc/embed?autostart=1")).toBe(true);
+    expect(go(viewer, "https://phishing.example/sign-in")).toBe(false);
+    expect(go(viewer, "javascript:alert(1)")).toBe(false);
+    expect(go("https://games.example/", "https://elsewhere.example/")).toBe(true);
+    expect(go(viewer, "https://elsewhere.example/", true)).toBe(true);
+
+    // A server redirect is held to the same site, on a frame's first load too.
+    expect(redirect("about:blank", viewer, "https://sketchfab.com/models/abc/embed?autostart=1")).toBe(true);
+    expect(redirect("about:blank", viewer, "https://phishing.example/sign-in")).toBe(false);
+    expect(redirect(viewer, "https://sketchfab.com/outbound?to=x", "https://phishing.example/sign-in")).toBe(false);
+    expect(redirect("about:blank", "https://games.example/", "https://elsewhere.example/")).toBe(true);
+  });
+
+  it("mutes a hidden window, such as a thumbnail capture", async () => {
+    const options = {
+      runtime: { url: "http://127.0.0.1:43110", token: "token" },
+      preloadPath: "/tmp/preload.cjs",
+      rendererUrl: "http://127.0.0.1:43120",
+    };
+    await createDesktopWindow({ ...options, hidden: true });
+    await createDesktopWindow(options);
+    const [hidden, shown] = electron.windows as { webContents: { setAudioMuted: ReturnType<typeof vi.fn> } }[];
+
+    expect(hidden!.webContents.setAudioMuted).toHaveBeenCalledWith(true);
+    expect(shown!.webContents.setAudioMuted).not.toHaveBeenCalled();
+  });
+
+  it("opens only HTTP links in the system browser", async () => {
+    await createDesktopWindow({
+      runtime: { url: "http://127.0.0.1:43110", token: "token" },
+      preloadPath: "/tmp/preload.cjs",
+      rendererUrl: "http://127.0.0.1:43120",
+    });
+    const window = electron.windows[0] as {
+      onWindowOpen?: (details: { url: string }) => { action: string };
+    };
+
+    expect(window.onWindowOpen?.({ url: "https://example.com/game" })).toEqual({ action: "deny" });
+    expect(window.onWindowOpen?.({ url: "http://127.0.0.1:43130/games/game-1" })).toEqual({ action: "deny" });
+    expect(window.onWindowOpen?.({ url: "file:///tmp/private" })).toEqual({ action: "deny" });
+    expect(window.onWindowOpen?.({ url: "javascript:alert(1)" })).toEqual({ action: "deny" });
+    expect(electron.openExternal).toHaveBeenCalledTimes(2);
+    expect(electron.openExternal).toHaveBeenNthCalledWith(1, "https://example.com/game");
+    expect(electron.openExternal).toHaveBeenNthCalledWith(2, "http://127.0.0.1:43130/games/game-1");
+  });
+
+  it("opens a published game's sign-in page in a plain child window, and nothing else from games", async () => {
+    expect(gameSignInIssuer({ OHMYGAME_ACCOUNT_ISSUER: "https://accounts.example/", CLOUD_API_URL: "https://api.example" })).toBe("https://accounts.example");
+    expect(gameSignInIssuer({ CLOUD_API_URL: "https://api.example/base" })).toBe("https://api.example/base");
+    expect(gameSignInIssuer({ PUBLISH_API_URL: "http://127.0.0.1:43130" })).toBeUndefined();
+    expect(gameSignInIssuer({})).toBeUndefined();
+
+    await createDesktopWindow({
+      runtime: { url: "http://127.0.0.1:43110", token: "token" },
+      preloadPath: "/tmp/preload.cjs",
+      rendererUrl: "http://127.0.0.1:43120",
+      gameSignInIssuer: "https://api.example/base",
+    });
+    const window = electron.windows[0] as {
+      onWindowOpen?: (details: { url: string; frameName?: string }) => { action: string; overrideBrowserWindowOptions?: Record<string, unknown> };
+      handlers: Map<string, (child: unknown) => void>;
+    };
+    const signIn = "https://api.example/base/v1/game-auth/authorize?response_type=code&state=s";
+    const allowed = window.onWindowOpen?.({ url: signIn, frameName: "ohmygame-sign-in" });
+    expect(allowed).toMatchObject({ action: "allow", overrideBrowserWindowOptions: { parent: window, webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false } } });
+    // The sign-in window is a plain web page: the app's preload never reaches it.
+    expect((allowed?.overrideBrowserWindowOptions?.webPreferences as Record<string, unknown>).preload).toBeUndefined();
+    for (const details of [
+      { url: signIn, frameName: "other" },
+      { url: signIn },
+      { url: "https://evil.example/base/v1/game-auth/authorize", frameName: "ohmygame-sign-in" },
+      { url: "https://api.example/v1/game-auth/authorize", frameName: "ohmygame-sign-in" },
+      { url: "https://api.example/base/v1/game-auth/token", frameName: "ohmygame-sign-in" },
+    ])
+      expect(window.onWindowOpen?.(details)).toEqual({ action: "deny" });
+    expect(electron.openExternal).toHaveBeenCalledTimes(5);
+    // A locally published game signs in through OhMyGame's local test sign-in, on this computer only.
+    expect(window.onWindowOpen?.({ url: "http://127.0.0.1:43139/v1/game-auth/authorize?state=s", frameName: "ohmygame-sign-in" })).toMatchObject({ action: "allow" });
+    expect(window.onWindowOpen?.({ url: "http://127.0.0.1:43139/other", frameName: "ohmygame-sign-in" })).toEqual({ action: "deny" });
+    expect(window.onWindowOpen?.({ url: "http://192.168.1.2:43139/v1/game-auth/authorize", frameName: "ohmygame-sign-in" })).toEqual({ action: "deny" });
+    electron.openExternal.mockClear();
+    electron.openExternal.mock.calls.length = 0;
+
+    // The child may pass through an identity provider over HTTPS, and opens no windows of its own.
+    const child = { handlers: new Map<string, (event: { preventDefault(): void }, url: string) => void>(), open: undefined as undefined | ((details: { url: string }) => unknown) };
+    const childContents = {
+      setWindowOpenHandler: (handler: (details: { url: string }) => unknown) => { child.open = handler; },
+      on: (event: string, handler: (event: { preventDefault(): void }, url: string) => void) => { child.handlers.set(event, handler); },
+    };
+    window.handlers.get("did-create-window")!({ webContents: childContents });
+    const navigate = (event: string, url: string) => {
+      const preventDefault = vi.fn();
+      child.handlers.get(event)!({ preventDefault }, url);
+      return preventDefault.mock.calls.length > 0;
+    };
+    expect(navigate("will-navigate", "https://accounts.google.com/o/oauth2/auth")).toBe(false);
+    expect(navigate("will-redirect", "https://g-game.play.example/?code=c&state=s")).toBe(false);
+    expect(navigate("will-navigate", "http://g-game.play.example/")).toBe(true);
+    expect(navigate("will-redirect", "http://127.0.0.1:5173/?code=c&state=s")).toBe(false);
+    expect(navigate("will-navigate", "file:///etc/passwd")).toBe(true);
+    expect(child.open!({ url: "https://help.example/" })).toEqual({ action: "deny" });
+    expect(electron.openExternal).toHaveBeenLastCalledWith("https://help.example/");
+  });
+
+  it("logs a link the system cannot open instead of leaving it unhandled", async () => {
+    await createDesktopWindow({
+      runtime: { url: "http://127.0.0.1:43110", token: "token" },
+      preloadPath: "/tmp/preload.cjs",
+      rendererUrl: "http://127.0.0.1:43120",
+    });
+    const window = electron.windows[0] as {
+      onWindowOpen?: (details: { url: string }) => { action: string };
+    };
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    electron.openExternal.mockRejectedValueOnce(new Error("Failed to open: no application is associated (0x483)"));
+
+    expect(window.onWindowOpen?.({ url: "https://example.com/game" })).toEqual({ action: "deny" });
+    await vi.waitFor(() => expect(warn).toHaveBeenCalledWith(
+      "Could not open https://example.com/game in the browser: Failed to open: no application is associated (0x483)",
+    ));
+    warn.mockRestore();
+  });
+
+  it("loads and permits a renderer hash route", async () => {
+    await createDesktopWindow({
+      runtime: { url: "http://127.0.0.1:43110", token: "token" },
+      preloadPath: "/tmp/preload.cjs",
+      rendererUrl: "http://127.0.0.1:43120",
+      rendererHash: "#/playtest/project",
+    });
+    const window = electron.windows[0] as {
+      loadURL: ReturnType<typeof vi.fn>;
+      onNavigate?: (event: { preventDefault(): void }, url: string) => void;
+    };
+
+    expect(window.loadURL).toHaveBeenCalledWith("http://127.0.0.1:43120/#/playtest/project");
+    const navigation = { preventDefault: vi.fn() };
+    window.onNavigate?.(navigation, "http://127.0.0.1:43120/#/playtest/project");
+    expect(navigation.preventDefault).not.toHaveBeenCalled();
+  });
+
+  it("supports a fixed content aspect ratio for playtest windows", async () => {
+    electron.workArea = { x: 0, y: 24, width: 800, height: 576 };
+    await createDesktopWindow({
+      runtime: { url: "http://127.0.0.1:43110", token: "token" },
+      preloadPath: "/tmp/preload.cjs",
+      rendererUrl: "http://127.0.0.1:43120",
+      contentSize: { width: 1280, height: 720 },
+      aspectRatio: 16 / 9,
+      minWidth: 640,
+      minHeight: 360,
+    });
+    const window = electron.windows[0] as {
+      options: Record<string, unknown>;
+      setAspectRatio: ReturnType<typeof vi.fn>;
+    };
+
+    expect(window.options).toMatchObject({
+      width: 1280,
+      height: 720,
+      minWidth: 640,
+      minHeight: 360,
+      useContentSize: true,
+    });
+    expect(window.setAspectRatio).toHaveBeenCalledWith(16 / 9);
+    expect(electron.getDisplayNearestPoint).not.toHaveBeenCalled();
+    expect(window.options.x).toBeUndefined();
+    expect(window.options.y).toBeUndefined();
+  });
+
+  it.each([
+    ["landscape", { width: 1280, height: 720 }, { width: 1280, height: 720 }],
+    ["portrait", { width: 720, height: 1280 }, { width: 450, height: 800 }],
+    ["square", { width: 1080, height: 1080 }, { width: 800, height: 800 }],
+    ["custom", { width: 1000, height: 500 }, { width: 1280, height: 640 }],
+  ])("fits a %s playtest viewport within the initial window bounds", (_label, viewport, expected) => {
+    expect(fitPlaytestContentSize(viewport)).toEqual(expected);
+  });
+
+  it("validates playtest viewport dimensions", () => {
+    expect(isValidPlaytestViewport({ width: 1280, height: 720 })).toBe(true);
+    expect(isValidPlaytestViewport({ width: 239, height: 720 })).toBe(false);
+    expect(isValidPlaytestViewport({ width: 1280.5, height: 720 })).toBe(false);
+    expect(isValidPlaytestViewport({ width: 1280, height: 8193 })).toBe(false);
+    expect(isValidPlaytestViewport(null)).toBe(false);
+  });
+
+  it("limits sidebar window effects to windows that request them", async () => {
+    await createDesktopWindow({
+      runtime: { url: "http://127.0.0.1:43110", token: "token" },
+      preloadPath: "/tmp/preload.cjs",
+      rendererUrl: "http://127.0.0.1:43120",
+    });
+    await createDesktopWindow({
+      runtime: { url: "http://127.0.0.1:43110", token: "token" },
+      preloadPath: "/tmp/preload.cjs",
+      rendererUrl: "http://127.0.0.1:43120",
+      sidebarVibrancy: true,
+    });
+
+    const plain = electron.windows[0] as { options: Record<string, unknown> };
+    const sidebar = electron.windows[1] as { options: Record<string, unknown> };
+    if (process.platform === "darwin") {
+      expect(plain.options.transparent).toBeUndefined();
+      expect(plain.options.vibrancy).toBeUndefined();
+      expect(sidebar.options.transparent).toBe(true);
+      expect(sidebar.options.vibrancy).toBe("sidebar");
+    } else {
+      expect(plain.options.transparent).toBeUndefined();
+      expect(sidebar.options.transparent).toBeUndefined();
+    }
+  });
+
+  it.each(["win32", "darwin", "linux"] as const)("configures %s window chrome", async (platform) => {
+    vi.stubGlobal("process", { ...process, platform });
+    await createDesktopWindow({
+      runtime: { url: "http://127.0.0.1:43110", token: "token" },
+      preloadPath: "/tmp/preload.cjs",
+      rendererUrl: "http://127.0.0.1:43120",
+      integratedWindowControls: true,
+    });
+
+    const window = electron.windows[0] as { options: Record<string, unknown> };
+    expect(window.options.titleBarOverlay).toBeUndefined();
+    if (platform === "win32") {
+      expect(window.options.titleBarStyle).toBe("hidden");
+    } else if (platform === "darwin") {
+      expect(window.options.titleBarStyle).toBe("hiddenInset");
+    } else {
+      expect(window.options.titleBarStyle).toBeUndefined();
+    }
+  });
+});

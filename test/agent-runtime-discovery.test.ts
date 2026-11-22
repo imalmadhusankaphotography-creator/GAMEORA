@@ -1,0 +1,200 @@
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { afterEach, expect, it, vi } from "vitest";
+import { probeModels } from "../src/daemon/agent-runtimes/discovery.js";
+import { AgentRuntimeService } from "../src/daemon/agent-runtimes/service.js";
+
+const cleanup: Array<() => unknown | Promise<unknown>> = [];
+afterEach(async () => {
+  vi.restoreAllMocks();
+  for (const close of cleanup.splice(0).reverse()) await close();
+});
+// Windows starts only .exe programs, so it cannot run these script stand-ins, and
+// discovery ignores them there (see docs/agent-runtimes.md).
+async function fixture() {
+  const root = await mkdtemp(path.join(os.tmpdir(), "ohmygame-model-cache-"));
+  cleanup.push(() => rm(root, { recursive: true, force: true }));
+  const service = new AgentRuntimeService(root, () => undefined);
+  await service.load();
+  cleanup.push(() => service.close());
+  const install = async (name: string) => {
+    const binary = path.join(root, name);
+    const catalog = binary + ".json",
+      started = binary + ".started",
+      gate = binary + ".gate";
+    await writeFile(
+      binary,
+      `#!${process.execPath}
+const fs = require("node:fs");
+if (process.argv[2] === "--version") { console.log("2.1.300"); process.exit(); }
+if (process.argv[2] === "auth") { console.log(JSON.stringify({loggedIn:true})); process.exit(); }
+require("node:readline").createInterface({input:process.stdin}).on("line", line => {
+  const m = JSON.parse(line);
+  if (m.type !== "control_request") return;
+  fs.writeFileSync(${JSON.stringify(started)}, "started");
+  const reply = () => {
+    if (fs.existsSync(${JSON.stringify(gate)})) return setTimeout(reply, 10);
+    const models = JSON.parse(fs.readFileSync(${JSON.stringify(catalog)}, "utf8"));
+    console.log(JSON.stringify({type:"control_response",response:{subtype:"success",request_id:m.request_id,response:{models}}}));
+  };
+  reply();
+});
+`,
+      { mode: 0o700 },
+    );
+    const setModel = (value: string) =>
+      writeFile(catalog, JSON.stringify([{ value, displayName: value }]));
+    await setModel(name);
+    return { binary, gate, started, setModel };
+  };
+  return { service, install };
+}
+it.skipIf(process.platform === "win32")("refreshes direct model lookup after the catalog TTL expires", async () => {
+  const { service, install } = await fixture();
+  const cli = await install("claude-a");
+  await service.update("claude-code-cli", {
+    binaryPath: cli.binary,
+    enabled: true,
+  });
+  expect(await service.model("claude-code-cli", "claude-a")).toBeDefined();
+  await cli.setModel("changed");
+  const now = Date.now();
+  vi.spyOn(Date, "now").mockReturnValue(now + 11 * 60_000);
+  expect(await service.model("claude-code-cli", "changed")).toBeDefined();
+  expect(await service.model("claude-code-cli", "claude-a")).toBeUndefined();
+});
+it.skipIf(process.platform === "win32")("does not let an old in-flight catalog overwrite a newly selected executable", async () => {
+  const { service, install } = await fixture();
+  const old = await install("claude-old"),
+    next = await install("claude-new");
+  await service.update("claude-code-cli", {
+    binaryPath: old.binary,
+    enabled: true,
+  });
+  const now = Date.now();
+  vi.spyOn(Date, "now").mockReturnValue(now + 11 * 60_000);
+  await rm(old.started);
+  await writeFile(old.gate, "hold");
+  const stale = service.model("claude-code-cli", "claude-old");
+  await expect
+    .poll(() => readFile(old.started, "utf8").catch(() => ""))
+    .toBe("started");
+  await service.update("claude-code-cli", { binaryPath: next.binary });
+  expect(await service.model("claude-code-cli", "claude-new")).toBeDefined();
+  await rm(old.gate);
+  expect(await stale).toBeUndefined();
+  expect(await service.model("claude-code-cli", "claude-new")).toBeDefined();
+  expect(await service.model("claude-code-cli", "claude-old")).toBeUndefined();
+});
+
+it.skipIf(process.platform === "win32")("loads every page of the native Codex model catalog", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "ohmygame-model-pages-"));
+  cleanup.push(() => rm(root, { recursive: true, force: true }));
+  const binary = path.join(root, "codex");
+  await writeFile(
+    binary,
+    `#!${process.execPath}
+require("node:readline").createInterface({input:process.stdin}).on("line", line => {
+  const m = JSON.parse(line);
+  if (m.id === undefined) return;
+  const result = m.method === "thread/start" ? {thread:{id:"probe"},activePermissionProfile:{id:m.params.permissions}} : m.method === "model/list" ? (m.params.cursor ? {data:[{id:"second",supportedReasoningEfforts:[{reasoningEffort:"high"}]}]} : {data:[{id:"first"}],nextCursor:"page-2"}) : {};
+  console.log(JSON.stringify({id:m.id,result}));
+});
+`,
+    { mode: 0o700 },
+  );
+  const result = await probeModels(
+    binary,
+    "codex-cli",
+    { PATH: process.env.PATH ?? "" },
+    root,
+  );
+  expect(result.models.map((model) => model.id)).toEqual(["first", "second"]);
+});
+
+it("keeps the last reported usage limits across a restart", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "ohmygame-limits-"));
+  cleanup.push(() => rm(root, { recursive: true, force: true }));
+  const { mkdir } = await import("node:fs/promises");
+  await mkdir(path.join(root, "agent-runtimes"), { recursive: true });
+  const fiveHour = {
+    id: "claude/five_hour",
+    usedPercent: 13,
+    windowMinutes: 300,
+    resetsAt: 1792326600,
+  };
+  const file = path.join(root, "agent-runtimes", "limits.json");
+  await writeFile(
+    file,
+    JSON.stringify({
+      version: 2,
+      limits: {
+        "claude-code-cli": [fiveHour, { id: 3 }],
+        "unknown-cli": [fiveHour],
+      },
+    }),
+  );
+  const service = new AgentRuntimeService(root, () => undefined);
+  await service.load();
+  cleanup.push(() => service.close());
+  expect((await service.status("claude-code-cli")).limits).toEqual([fiveHour]);
+  expect((await service.status("codex-cli")).limits).toBeUndefined();
+
+  // Earlier System default reports may belong to the folder OhMyGame was launched with.
+  const work = path.join(root, "work");
+  await mkdir(work);
+  const profile = await service.addAccountProfile("claude-code-cli", "Work", work);
+  await writeFile(
+    file,
+    JSON.stringify({
+      "claude-code-cli": [fiveHour],
+      "codex-cli": [fiveHour],
+      [`claude-code-cli:${profile.id}`]: [fiveHour],
+      "opencode-cli": [fiveHour],
+    }),
+  );
+  const upgraded = new AgentRuntimeService(root, () => undefined);
+  await upgraded.load();
+  cleanup.push(() => upgraded.close());
+  expect(upgraded.cachedLimits("claude-code-cli")).toBeUndefined();
+  expect(upgraded.cachedLimits("codex-cli")).toBeUndefined();
+  expect(upgraded.cachedLimits("claude-code-cli", profile.id)).toEqual([fiveHour]);
+  expect(upgraded.cachedLimits("opencode-cli")).toEqual([fiveHour]);
+});
+
+// npm's Windows shims, read on any platform: what they run is started directly.
+it("reads what an npm .cmd shim runs, and only Node scripts or programs inside it", async () => {
+  const { npmShimTarget } = await import("../src/daemon/agent-runtimes/npm-shim.js");
+  const root = await mkdtemp(path.join(os.tmpdir(), "ohmygame-npm-shim-"));
+  cleanup.push(() => rm(root, { recursive: true, force: true }));
+  const { mkdir } = await import("node:fs/promises");
+  await mkdir(path.join(root, "node_modules", "agent", "dist"), { recursive: true });
+  await writeFile(path.join(root, "node_modules", "agent", "dist", "cli.mjs"), "");
+  await writeFile(path.join(root, "node_modules", "agent", "agent.exe"), "");
+  const shim = async (name: string, text: string) => {
+    await writeFile(path.join(root, `${name}.cmd`), text);
+    return path.join(root, `${name}.cmd`);
+  };
+  const npm = (prog: string, target: string) => `@ECHO off\r\nIF EXIST "%dp0%\\${prog}.exe" (\r\n  SET "_prog=%dp0%\\${prog}.exe"\r\n) ELSE (\r\n  SET "_prog=${prog}"\r\n)\r\nendLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\\${target}" %*\r\n`;
+  const nodeDir = path.join(root, "nodejs");
+  await mkdir(nodeDir);
+  await writeFile(path.join(nodeDir, "node.exe"), "");
+  const env = { PATH: ["/nowhere", nodeDir].join(path.delimiter) };
+
+  expect(npmShimTarget(await shim("agent", npm("node", "node_modules\\agent\\dist\\cli.mjs")), env)).toEqual({
+    file: path.join(nodeDir, "node.exe"), args: [path.join(root, "node_modules", "agent", "dist", "cli.mjs")],
+  });
+  // A program in the package runs as it is.
+  expect(npmShimTarget(await shim("native", `@ECHO off\r\n"%~dp0\\node_modules\\agent\\agent.exe"   %*\r\n`), env))
+    .toEqual({ file: path.join(root, "node_modules", "agent", "agent.exe"), args: [] });
+  // Node next to the shim comes first.
+  await writeFile(path.join(root, "node.exe"), "");
+  expect(npmShimTarget(path.join(root, "agent.cmd"), env)?.file).toBe(path.join(root, "node.exe"));
+  // Another interpreter, a missing file, or Node nowhere: not started.
+  expect(npmShimTarget(await shim("sh", npm("sh", "node_modules\\agent\\dist\\cli.mjs")), env)).toBeUndefined();
+  expect(npmShimTarget(await shim("missing", npm("node", "node_modules\\agent\\gone.js")), env)).toBeUndefined();
+  expect(npmShimTarget(await shim("plain", "@echo off\r\ncalc.exe %*\r\n"), env)).toBeUndefined();
+  await rm(path.join(root, "node.exe"));
+  expect(npmShimTarget(path.join(root, "agent.cmd"), { PATH: "/nowhere" })).toBeUndefined();
+});
