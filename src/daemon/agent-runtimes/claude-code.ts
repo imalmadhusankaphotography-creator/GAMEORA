@@ -279,7 +279,7 @@ export class ClaudeCodeDriver implements NativeDriver {
         JSON.stringify({
           name: SESSION_PLUGIN,
           version: "1.0.0",
-          description: "OhMyGame Skills for this project",
+          description: "GAMEORA Skills for this project",
         }),
       );
       // Its folder is a working directory too, so reading a Skill's files is not
@@ -840,7 +840,7 @@ function endedByStop(result: Record<string, unknown>): boolean {
 
 function refusedTool(tool: string, readOnly: boolean): string | undefined {
   if (tool === "ExitPlanMode")
-    return "OhMyGame reviews plans itself: record the plan with update_plan and end your reply.";
+    return "GAMEORA reviews plans itself: record the plan with update_plan and end your reply.";
   if (readOnly && CLAUDE_CHANGE_TOOLS.has(tool)) return PLANNING_DENIAL;
   return undefined;
 }
@@ -869,7 +869,7 @@ function userMessage(input: NativeTurnInput, staged: ReadonlySet<string>): Recor
   };
 }
 
-/** OhMyGame's tools by their own names; Claude Code's file and shell tools by Pi's. */
+/** GAMEORA's tools by their own names; Claude Code's file and shell tools by Pi's. */
 export function claudeToolCall(
   name: string,
   input: Record<string, unknown>,

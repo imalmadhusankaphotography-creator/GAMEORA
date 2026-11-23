@@ -72,7 +72,7 @@ export interface NativeTurnInput {
   skills?: string[];
 }
 
-/** A tool result in the shape OhMyGame's own tools return, so artifacts and images show the same way. */
+/** A tool result in the shape GAMEORA's own tools return, so artifacts and images show the same way. */
 export interface NativeToolResult {
   content: Array<
     | { type: "text"; text: string }

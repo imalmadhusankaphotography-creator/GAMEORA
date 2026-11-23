@@ -289,7 +289,7 @@ export class ExternalMcpLauncher {
           )?.text;
           const project = JSON.parse(text ?? "{}") as { id?: unknown };
           if (typeof project.id !== "string" || !project.id)
-            throw new Error("OhMyGame returned no selected project ID");
+            throw new Error("GAMEORA returned no selected project ID");
           this.#projectId = connection.projectId = project.id;
         }
         return result;
@@ -306,7 +306,7 @@ export class ExternalMcpLauncher {
           !(cause instanceof SessionExpiredError)
         )
           throw new Error(
-            `OhMyGame's response to ${tool} was lost or failed (${errorMessage(cause)}). Execution status is unknown; the call was not automatically retried. Check the project before starting it again.`,
+            `GAMEORA's response to ${tool} was lost or failed (${errorMessage(cause)}). Execution status is unknown; the call was not automatically retried. Check the project before starting it again.`,
           );
         if (attempt === 0) continue;
         throw new Error(
@@ -323,10 +323,10 @@ export class ExternalMcpLauncher {
   ): Promise<unknown> {
     const response = await this.#post(connection, message, signal);
     if (response.status === 401 || response.status === 404)
-      throw new SessionExpiredError(`OhMyGame answered ${response.status}`);
+      throw new SessionExpiredError(`GAMEORA answered ${response.status}`);
     if (!response.ok)
       throw new Error(
-        `OhMyGame answered ${response.status}: ${await response.text()}`,
+        `GAMEORA answered ${response.status}: ${await response.text()}`,
       );
     const answer = (await response.json()) as Message;
     if (answer.error) throw new Error(errorMessage(answer.error));
@@ -353,7 +353,7 @@ export class ExternalMcpLauncher {
         const session = response.headers.get("mcp-session-id");
         if (!response.ok || !session)
           throw new Error(
-            `OhMyGame refused the connection (${response.status})`,
+            `GAMEORA refused the connection (${response.status})`,
           );
         this.#connection = { ...endpoint, session };
         return this.#connection;
@@ -382,7 +382,7 @@ export class ExternalMcpLauncher {
       const started = await this.#liveEndpoint();
       if (started) return started;
     }
-    throw new UnavailableError(`OhMyGame could not be started. ${NOT_RUNNING}`);
+    throw new UnavailableError(`GAMEORA could not be started. ${NOT_RUNNING}`);
   }
 
   async #appRunning(): Promise<boolean> {
@@ -476,7 +476,7 @@ export function appStartCommand(
 }
 
 const TURNED_OFF =
-  "OhMyGame is not accepting other agents. Open OhMyGame and turn on the MCP Server switch in Settings → MCP Server.";
+  "GAMEORA is not accepting other agents. Open GAMEORA and turn on the MCP Server switch in Settings → MCP Server.";
 const NOT_RUNNING = "Open the OhMyGame app and try again.";
 
 /** OhMyGame is off or closed; retrying the request would not help. */

@@ -21,13 +21,13 @@ export interface DriverContext {
   /** A folder of the daemon's for this session's generated files, outside the workspace and removed with the session. */
   privateDirectory: string;
   processDirectory?: string;
-  /** OhMyGame's instructions for the project, added to the agent's own. */
+  /** GAMEORA's instructions for the project, added to the agent's own. */
   instructions: string;
   bridge: ToolBridge;
   saveGeneratedImage?: SaveGeneratedImage;
   /** The person's choice: the CLI's usual permission mode, or no asking at all. */
   permissionMode: AgentPermissionMode;
-  /** Folders that each hold a SKILL.md: plugin Skills and OhMyGame's own. */
+  /** Folders that each hold a SKILL.md: plugin Skills and GAMEORA's own. */
   skillDirectories: readonly string[];
   /**
    * A loopback MCP endpoint for agents that can only reach tools over HTTP. Its
@@ -81,7 +81,7 @@ export class BridgeResults {
   }
 }
 
-/** Text a CLI returned for a tool, as OhMyGame's tool result. */
+/** Text a CLI returned for a tool, as GAMEORA's tool result. */
 export function textResult(value: unknown): NativeToolResult {
   if (typeof value === "string")
     return { content: [{ type: "text", text: value }] };

@@ -139,7 +139,7 @@ function OhMyGameAgent({ onBack, onOpenSection, onOpenPlugins }: {
   const chevron = <ChevronRight size={16} className="settings-row-chevron" />;
   return (
     <>
-      <SettingsDetailHead mark={<BrandMark size={28} />} title="OhMyGame" description={t("settings.agents.ohmygameDescription")} onBack={onBack} backLabel={t("settings.agents.back")} />
+      <SettingsDetailHead mark={<BrandMark size={28} />} title="GAMEORA" description={t("settings.agents.ohmygameDescription")} onBack={onBack} backLabel={t("settings.agents.back")} />
       <SettingsGroup
         title={t("settings.agents.models")}
         description={t("settings.agents.modelsHint")}

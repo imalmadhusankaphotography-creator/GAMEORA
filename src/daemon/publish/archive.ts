@@ -30,7 +30,7 @@ interface PackageJson {
 /** Why a story made before web stories cannot be built or published yet. */
 const STORY_NEEDS_UPGRADE = "This story was made before stories played as their own web page. Open it in the Story editor, which upgrades it, then try again.";
 
-/** What a build is for: OhMyGame's publishing, the local debug publisher, or an export to host elsewhere. */
+/** What a build is for: GAMEORA's publishing, the local debug publisher, or an export to host elsewhere. */
 type BuildPurpose = "publish" | "local" | "export";
 
 export class PublishError extends Error {
@@ -165,7 +165,7 @@ export class ArtifactBuilder {
       if (project.type !== "interactive-story") {
         register = purpose === "publish" && !multiplayer ? await localDeployment(source, declared) : undefined;
         if (register && !this.#gameServiceUrl)
-          throw new PublishError("Publishing a multiplayer game needs OhMyGame's game service. Set OHMYGAME_GAME_SERVICE_URL.");
+          throw new PublishError("Publishing a multiplayer game needs GAMEORA's game service. Set OHMYGAME_GAME_SERVICE_URL.");
         // An export may name the local service; it is still checked to match what the game declares.
         const configured = register ? undefined : await readMultiplayerConfig(source, multiplayer, declared, purpose !== "publish");
         if (configured && purpose !== "export") {
@@ -293,14 +293,14 @@ async function registerDeployment(serverUrl: string, gameId: string, accessToken
       signal: AbortSignal.timeout(15_000),
     });
   } catch (cause) {
-    throw new PublishError(`OhMyGame's game service could not be reached to register the game's rooms: ${cause instanceof Error ? cause.message : String(cause)}`, 502);
+    throw new PublishError(`GAMEORA's game service could not be reached to register the game's rooms: ${cause instanceof Error ? cause.message : String(cause)}`, 502);
   }
   const value: unknown = await response.json().catch(() => undefined);
   if (!response.ok)
-    throw new PublishError(`OhMyGame's game service refused the game's rooms: ${isRecord(value) && typeof value.error === "string" ? value.error : `HTTP ${response.status}`}`, 502);
+    throw new PublishError(`GAMEORA's game service refused the game's rooms: ${isRecord(value) && typeof value.error === "string" ? value.error : `HTTP ${response.status}`}`, 502);
   if (!isMultiplayerManifestConfig(value) || value.gameId !== gameId || value.serverUrl.replace(/\/$/, "") !== serverUrl.replace(/\/$/, "") ||
       value.adapterId !== adapterId || value.mode !== mode || value.maxClients !== maxClients || value.roomPolicy !== roomPolicy || value.tickMs !== tickMs)
-    throw new PublishError("OhMyGame's game service answered with a different deployment.", 502);
+    throw new PublishError("GAMEORA's game service answered with a different deployment.", 502);
   return value;
 }
 

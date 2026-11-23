@@ -56,7 +56,7 @@ export function acquireProfileOwnership(
       } catch (error) {
         if ((error as { errcode?: number }).errcode === 5)
           throw new Error(
-            `OhMyGame data directory is already in use. Close the other instance before starting: ${canonical}`,
+            `GAMEORA data directory is already in use. Close the other instance before starting: ${canonical}`,
             { cause: error },
           );
         throw error;

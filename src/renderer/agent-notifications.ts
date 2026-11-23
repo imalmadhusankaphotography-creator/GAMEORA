@@ -34,7 +34,7 @@ export function sendNotificationPreferences(settings = readNotificationSettings(
   void window.ohMyGameDesktop?.notifications?.setPreferences({
     ...settings,
     text: {
-      fallbackTitle: "OhMyGame",
+      fallbackTitle: "GAMEORA",
       approval: t("notifications.approval"),
       question: t("notifications.question"),
       plan: t("notifications.plan"),

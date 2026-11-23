@@ -1184,7 +1184,7 @@ export function createApp(options: AppOptions = {}) {
       return project ? (await pagePanels(project)).map(({ plugin, id, title }) => ({ plugin, id, title })) : [];
     },
   });
-  /** OhMyGame's own tools for a conversation, the same for Pi and for a coding agent. */
+  /** GAMEORA's own tools for a conversation, the same for Pi and for a coding agent. */
   const projectAgentTools = async (project: ProjectState, conversation: StoredConversation) => {
     const playtest = await ownedPlaytest(project, `${project.id}:${conversation.summary.id}`);
     return [...createAgentTools(
@@ -1231,7 +1231,7 @@ export function createApp(options: AppOptions = {}) {
     const url = await previews.holdWhile(project, "playtest:opening", () => previews.ensureStarted(project, false), signal);
     return { runtime: "web", url: previewPageUrl(url, "playtest") };
   };
-  /** OhMyGame's tools for agents outside the app; playtest windows belong to their MCP session. */
+  /** GAMEORA's tools for agents outside the app; playtest windows belong to their MCP session. */
   const externalMcp = new ExternalMcpService({
     dataDirectory,
     toolHooks: (project) => pluginHooks.tools(project.workspacePath),
@@ -2042,7 +2042,7 @@ export function createApp(options: AppOptions = {}) {
         displayName: text(entry.manifest.displayName),
         description: text(entry.manifest.description),
         marketplaceId: publisher,
-        marketplaceDisplayName: publisher === "ohmygame" ? "OhMyGame" : publisher,
+        marketplaceDisplayName: publisher === "ohmygame" ? "GAMEORA" : publisher,
         ...(icon ? { icon: { type: "asset" as const, path: icon }, iconRevision: entry.digest } : {}),
         ...(appliesTo ? { appliesTo, projectTypes: PROJECT_TYPE_IDS.filter((type) => pluginAppliesTo(appliesTo, type)) } : {}),
         ...(on ? {} : { off: true as const, ...(missing.length ? { asks: missing } : {}) }),

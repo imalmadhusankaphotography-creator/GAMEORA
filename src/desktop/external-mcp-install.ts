@@ -47,7 +47,7 @@ export async function installExternalMcpLauncher(
   const file = path.join(options.binDirectory, "ohmygame-mcp");
   const script = [
     "#!/bin/sh",
-    "# Starts OhMyGame's MCP server for Claude Code, Codex and other agents. OhMyGame rewrites this file.",
+    "# Starts GAMEORA's MCP server for Claude Code, Codex and other agents. GAMEORA rewrites this file.",
     `ELECTRON_RUN_AS_NODE=1 exec ${[options.executable, ...args].map(shellQuote).join(" ")} "$@"`,
     "",
   ].join("\n");

@@ -88,7 +88,7 @@ export class PluginDevelopment {
       watcher.on("error", () => {
         watcher.close();
         if (watched.watcher === watcher) watched.watcher = undefined;
-        void this.#fail(id, `OhMyGame stopped seeing changes in ${folder}. Add the folder again to keep developing it.`);
+        void this.#fail(id, `GAMEORA stopped seeing changes in ${folder}. Add the folder again to keep developing it.`);
       });
       watched.watcher = watcher;
     } catch {

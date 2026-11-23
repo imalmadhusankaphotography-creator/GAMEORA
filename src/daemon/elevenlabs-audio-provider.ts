@@ -154,7 +154,7 @@ export class ElevenLabsAudioProvider implements AudioProviderAdapter {
   }
 }
 
-/** ElevenLabs takes an ISO 639-1 or 639-3 code; OhMyGame's settings may carry a region, as in `zh-cn`. */
+/** ElevenLabs takes an ISO 639-1 or 639-3 code; GAMEORA's settings may carry a region, as in `zh-cn`. */
 export function languageCode(language: string | undefined): string | undefined {
   const primary = language?.trim().toLowerCase().split(/[-_]/)[0];
   return primary && /^[a-z]{2,3}$/.test(primary) ? primary : undefined;

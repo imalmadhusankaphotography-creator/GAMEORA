@@ -628,7 +628,7 @@ export class PluginSources {
 
   /** The answer, or undefined when GitHub has no such thing. */
   async #gitHubJson<T>(url: string, repository: string): Promise<T | undefined> {
-    const response = await this.#request(url, { accept: "application/vnd.github+json", "x-github-api-version": "2022-11-28", "user-agent": "OhMyGame" }, "Could not reach GitHub");
+    const response = await this.#request(url, { accept: "application/vnd.github+json", "x-github-api-version": "2022-11-28", "user-agent": "GAMEORA" }, "Could not reach GitHub");
     if (response.status === 404) return undefined;
     if (response.status === 403 || response.status === 429) throw new PluginSourceError("GitHub is limiting requests right now. Try again later.");
     if (!response.ok) throw new PluginSourceError(`GitHub answered ${response.status} about ${repository}.`);

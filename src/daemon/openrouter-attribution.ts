@@ -4,7 +4,7 @@ import type { ExtensionFactory } from "@earendil-works/pi-coding-agent";
 // The referer is the app's permanent identity in OpenRouter rankings; do not change it.
 export const OPENROUTER_ATTRIBUTION_HEADERS: Readonly<Record<string, string>> = {
   "HTTP-Referer": "https://ohmygame.ai/",
-  "X-OpenRouter-Title": "OhMyGame",
+  "X-OpenRouter-Title": "GAMEORA",
   "X-OpenRouter-Categories": "game,native-app-builder",
 };
 

@@ -24,7 +24,7 @@ import { BRIDGE_SERVER_NAME } from "./tool-bridge.js";
 const PROTOCOL_VERSION = 1;
 /** The error an agent returns when it needs signing in first. */
 const AUTH_REQUIRED = -32000;
-const ACP_CLIENT = { name: "ohmygame", title: "OhMyGame", version: "1" };
+const ACP_CLIENT = { name: "ohmygame", title: "GAMEORA", version: "1" };
 /** The one model of an agent that offers no choice of model. */
 export const ACP_DEFAULT_MODEL = "default";
 
@@ -232,7 +232,7 @@ interface AcpCall {
   locations: Array<{ path: string }>;
   content: unknown[];
   announced: boolean;
-  /** One of OhMyGame's own tools, which the bridge reports instead. */
+  /** One of GAMEORA's own tools, which the bridge reports instead. */
   bridged: boolean;
   finished: boolean;
 }
@@ -699,7 +699,7 @@ export class AcpDriver implements NativeDriver {
       turn.sink.toolUpdate(call.id, toolResult(call));
   }
 
-  /** One of OhMyGame's tools ran: its card shows what the tool returned. */
+  /** One of GAMEORA's tools ran: its card shows what the tool returned. */
   #bridged(
     call: { name: string; args: unknown; callId: string },
     outcome: { result: NativeToolResult; isError: boolean },
@@ -784,7 +784,7 @@ export class AcpDriver implements NativeDriver {
   }
 }
 
-/** OhMyGame's tool an agent names in a tool call's title, as agents prefix MCP tools. */
+/** GAMEORA's tool an agent names in a tool call's title, as agents prefix MCP tools. */
 export function bridgedToolName(
   title: string,
   names: readonly string[],

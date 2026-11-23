@@ -31,7 +31,7 @@ export interface AgentRuntimeSettings {
   defaultProfileId?: string;
 }
 
-/** Every runtime is off until enabled, and asks nothing once it is, as OhMyGame's own agent does. */
+/** Every runtime is off until enabled, and asks nothing once it is, as GAMEORA's own agent does. */
 function defaults(id: AgentRuntimeId): AgentRuntimeSettings {
   return { enabled: false, autoContinue: true, identifyAsOhMyGame: true, permissionMode: fullAccessPermissionMode(id) };
 }
@@ -55,7 +55,7 @@ const STANDARD_PERMISSION_MODES = {
 // compat: since beta.5.0, remove from beta.7 and 2026-11-28. Version 1 used OhMyGame's own two permission modes.
 const SETTINGS_VERSION = 2;
 
-/** A saved mode in the CLI's own words; OhMyGame's former two modes become the CLI's. */
+/** A saved mode in the CLI's own words; GAMEORA's former two modes become the CLI's. */
 function storedPermissionMode(
   id: AgentRuntimeId,
   value: unknown,

@@ -63,7 +63,7 @@ export class CodexRequestError extends Error {}
 
 export const CODEX_CLIENT = {
   name: "ohmygame",
-  title: "OhMyGame",
+  title: "GAMEORA",
   version: "1",
 };
 

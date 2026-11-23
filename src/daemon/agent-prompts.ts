@@ -23,7 +23,7 @@ const COMMON_AGENT_INSTRUCTIONS = [
 const GAME_SERVICES = [
   "For browser or WebView games using OhMyGame player services, call game_sdk_setup when saves, leaderboards or sign-in are needed; multiplayer_setup includes it. Follow its guide and preserve existing saves. This browser SDK is not a native-engine or mini-game API; use that target's existing integration instead.",
   "Players in the same multiplayer room can send each other emotes, quick phrases and chat with client.emit and onMessage, as the multiplayer guide describes. Messages are not saved, so there is no chat history.",
-  "For browser multiplayer using OhMyGame, call multiplayer_setup and follow the SDK guide it writes: OhMyGame's Colyseus + WebSocket service keeps the room, and local testing needs no cloud deployment. Follow the current tool schema: built-in rules run on the service; custom rules in server/rules.ts run on a browser host or in deterministic lockstep; owner rooms run each page's own player. Choose by trust and timing needs, and follow the guide's leaderboard restrictions. Do not silently substitute PeerJS, your own WebRTC or public signaling/STUN/TURN services; the SDK's built-in p2p option for owner rooms is the one exception. If the service, SDK or rules are missing, report a setup error rather than inventing a networking backend. An alternative stack the user explicitly asks for takes precedence.",
+  "For browser multiplayer using GAMEORA, call multiplayer_setup and follow the SDK guide it writes: GAMEORA's Colyseus + WebSocket service keeps the room, and local testing needs no cloud deployment. Follow the current tool schema: built-in rules run on the service; custom rules in server/rules.ts run on a browser host or in deterministic lockstep; owner rooms run each page's own player. Choose by trust and timing needs, and follow the guide's leaderboard restrictions. Do not silently substitute PeerJS, your own WebRTC or public signaling/STUN/TURN services; the SDK's built-in p2p option for owner rooms is the one exception. If the service, SDK or rules are missing, report a setup error rather than inventing a networking backend. An alternative stack the user explicitly asks for takes precedence.",
 ] as const;
 
 const GENERATED_MEDIA = "Media generation tools (generate_image, remove_image_background, generate_video, generate_3d_asset, when available) save files under assets/generated/ in the workspace and return the path. A file there is not part of the game until the game's own source uses it as described next.";
@@ -78,7 +78,7 @@ export function appendSystemPromptForProject(project: AgentPromptProject): strin
   return user ? [...own, userInstructionsPrompt(user)] : own;
 }
 
-/** The person's instructions as the agent receives them, after OhMyGame's. */
+/** The person's instructions as the agent receives them, after GAMEORA's. */
 export function userInstructionsPrompt(text: string): string {
   return `The user's own instructions for every project follow. Apply them unless they conflict with the current request, which takes precedence.\n\n${text}`;
 }

@@ -91,7 +91,7 @@ export async function startDaemon(options: StartDaemonOptions): Promise<ManagedD
     },
     stdio: ["pipe", "pipe", "pipe", "ipc"],
   });
-  options.log?.line(`OhMyGame service starting (pid ${child.pid ?? "unknown"})`);
+  options.log?.line(`GAMEORA service starting (pid ${child.pid ?? "unknown"})`);
   const stdoutLog = options.log?.stream();
   const stderrLog = options.log?.stream();
   const projectProcesses = new Set<number>();
@@ -154,7 +154,7 @@ export async function startDaemon(options: StartDaemonOptions): Promise<ManagedD
     const unexpected = ready && !stopped;
     stdoutLog?.flush();
     stderrLog?.flush();
-    options.log?.line(`OhMyGame service exited (${signal ?? code ?? "unknown"})`);
+    options.log?.line(`GAMEORA service exited (${signal ?? code ?? "unknown"})`);
     void cleanup().finally(() => {
       resolve();
       if (unexpected) options.onUnexpectedExit?.(startupError(`The background service exited (${signal ?? code ?? "unknown"})`, startupOutput));

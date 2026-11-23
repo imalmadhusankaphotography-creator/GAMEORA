@@ -86,7 +86,7 @@ export class PluginHooks {
               throw new Error("remember must be an explicit key and label on an ask decision");
             if (answer.decision === "deny") throw new Error(String(answer.reason));
             if (answer.decision === "ask") {
-              if (!approve) throw new Error("Approval requires an active conversation in OhMyGame");
+              if (!approve) throw new Error("Approval requires an active conversation in GAMEORA");
               const scope = answer.remember as ToolApprovalScope | undefined;
               const store = this.#options.approvals;
               if (scope && !store) throw new Error("Remembered plugin access is unavailable in this host");

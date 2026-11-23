@@ -293,7 +293,7 @@ export function updateFailure(
   const lower = detail.toLowerCase();
   let code: DesktopUpdateErrorCode = "unknown";
   let title = "Update could not be completed";
-  let message = "OhMyGame is still available at the current version. Try again or copy the details if the problem continues.";
+  let message = "GAMEORA is still available at the current version. Try again or copy the details if the problem continues.";
 
   if (error instanceof DesktopUpdatePreparationError && error.reason === "save") {
     code = "save";

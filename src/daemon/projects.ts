@@ -178,7 +178,7 @@ export class ProjectManager {
     if (path.parse(resolved).root === resolved) throw new ProjectWorkspaceError("The filesystem root cannot be the project location");
     // Compared as real paths, so a link (such as macOS's /var) can't hide the overlap.
     const storage = await realpath(this.#projectsDirectory).catch(() => this.#projectsDirectory);
-    if (pathsOverlap(resolved, storage) || pathsOverlap(resolved, this.#projectsDirectory)) throw new ProjectWorkspaceError("OhMyGame's project storage cannot be the project location");
+    if (pathsOverlap(resolved, storage) || pathsOverlap(resolved, this.#projectsDirectory)) throw new ProjectWorkspaceError("GAMEORA's project storage cannot be the project location");
     return resolved;
   }
 
@@ -1183,7 +1183,7 @@ export class ProjectManager {
       throw new ProjectWorkspaceError("The filesystem root cannot be used as a workspace");
     }
     if (pathsOverlap(workspacePath, this.#projectsDirectory)) {
-      throw new ProjectWorkspaceError("OhMyGame's project storage cannot be used as a workspace");
+      throw new ProjectWorkspaceError("GAMEORA's project storage cannot be used as a workspace");
     }
     const owner = this.#workspaceOwner(workspacePath);
     if (owner) throw new ProjectWorkspaceError(`This folder is already the workspace of “${owner.name}”`);

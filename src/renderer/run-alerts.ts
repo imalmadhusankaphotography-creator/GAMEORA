@@ -50,7 +50,7 @@ function alertFinished(projectId: string, name: string | undefined, onOpen: (pro
   // The desktop main process owns system notifications, including while this window is closed.
   if (window.ohMyGameDesktop?.notifications || !preferences.runNotifications || typeof Notification === "undefined") return;
   const show = () => {
-    const notification = new Notification(name ?? "OhMyGame", { body: t("runAlerts.finished"), tag: `run:${projectId}` });
+    const notification = new Notification(name ?? "GAMEORA", { body: t("runAlerts.finished"), tag: `run:${projectId}` });
     notification.onclick = () => {
       void window.ohMyGameDesktop?.focusWindow?.().catch(() => undefined);
       window.focus();

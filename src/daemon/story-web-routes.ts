@@ -86,7 +86,7 @@ export function registerStoryWebRoutes(
       const upgrade = await writes.exclusive(project.id, () => upgradeToWebStory(project.workspacePath, libraryFile));
       const after = await snapshot(project);
       const changed = (await checkpoints.diff(project, before, after)).map((change) => change.path);
-      await announce(project, changed, `OhMyGame upgraded this Interactive Story to a web story when the user opened it. It now plays as its own page: index.html loads the story runtime under story/, which reads graph.json and loads each Scene's files as they are. Library assets it used were copied under assets/library/. Read AGENTS.md before changing it.${legacyNote(upgrade.removedGraphFields)} Changed workspace paths: ${JSON.stringify(changed)}.`);
+      await announce(project, changed, `GAMEORA upgraded this Interactive Story to a web story when the user opened it. It now plays as its own page: index.html loads the story runtime under story/, which reads graph.json and loads each Scene's files as they are. Library assets it used were copied under assets/library/. Read AGENTS.md before changing it.${legacyNote(upgrade.removedGraphFields)} Changed workspace paths: ${JSON.stringify(changed)}.`);
       return {
         copiedAssets: upgrade.copiedAssets,
         missingAssets: upgrade.missingAssets,

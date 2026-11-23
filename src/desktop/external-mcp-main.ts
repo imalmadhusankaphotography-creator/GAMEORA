@@ -19,7 +19,7 @@ function argument(name: string): string | undefined {
 async function main(): Promise<void> {
   if (process.env[EXTERNAL_MCP_DISABLED_ENV] === "1") {
     process.stderr.write(
-      "OhMyGame runs this agent itself and already gives it OhMyGame's tools.\n",
+      "GAMEORA runs this agent itself and already gives it GAMEORA's tools.\n",
     );
     process.exit(1);
   }

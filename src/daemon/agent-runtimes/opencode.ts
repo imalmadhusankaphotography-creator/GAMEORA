@@ -288,7 +288,7 @@ export class OpenCodeDriver implements NativeDriver {
     } else {
       const created = record(
         await this.#api("POST", "/session", {
-          title: "OhMyGame",
+          title: "GAMEORA",
           location: { directory: this.context.workspacePath },
         }),
       );
@@ -576,7 +576,7 @@ export class OpenCodeDriver implements NativeDriver {
             record(record(entry)?.status)?.status === "connected",
         )
       )
-        throw new Error("OpenCode could not connect OhMyGame's tool bridge");
+        throw new Error("OpenCode could not connect GAMEORA's tool bridge");
       turn.signal.throwIfAborted();
     } catch (cause) {
       bridge.revoke();
@@ -983,7 +983,7 @@ export function splitModel(model: string): [string, string] {
     : [model.slice(0, index), model.slice(index + 1)];
 }
 
-/** OhMyGame's tools by their own names; OpenCode's file and shell tools by Pi's. */
+/** GAMEORA's tools by their own names; OpenCode's file and shell tools by Pi's. */
 export function openCodeToolCall(
   name: string,
   input: Record<string, unknown>,

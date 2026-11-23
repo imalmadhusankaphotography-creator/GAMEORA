@@ -228,7 +228,7 @@ export function createAgentTools(
       signal?.throwIfAborted();
       const result = await installMultiplayerWorkspace(project, config, await localGameServices?.());
       return {
-        content: [{ type: "text" as const, text: `Local Colyseus backend is running at ${config.serverUrl}. Read ${result.guidePath}, import the SDK from ${result.sdkPath}/client.js, and load ${result.manifestPath} at runtime. Integrate the game according to the selected mode's rules execution and trust model. For custom rules, write server/rules.test.ts with simulateRoom and run multiplayer_rules_test until it passes. Then test with two independent guests: one browser is one player, so use a private window or another browser for the second. This is a local playtest deployment. Publishing to OhMyGame registers it with OhMyGame's game service, and custom rules run in the players' browsers, so the game needs no server of its own.` }],
+        content: [{ type: "text" as const, text: `Local Colyseus backend is running at ${config.serverUrl}. Read ${result.guidePath}, import the SDK from ${result.sdkPath}/client.js, and load ${result.manifestPath} at runtime. Integrate the game according to the selected mode's rules execution and trust model. For custom rules, write server/rules.test.ts with simulateRoom and run multiplayer_rules_test until it passes. Then test with two independent guests: one browser is one player, so use a private window or another browser for the second. This is a local playtest deployment. Publishing to GAMEORA registers it with GAMEORA's game service, and custom rules run in the players' browsers, so the game needs no server of its own.` }],
         details: { multiplayer: result },
       };
     },
@@ -247,13 +247,13 @@ export function createAgentTools(
   })] : []), ...(supportsBrowserGameServices(project) ? [defineTool({
     name: "game_sdk_setup",
     label: "Set up the OhMyGame SDK",
-    description: "Write the OhMyGame browser SDK and its guide into this browser or WebView game, for saves that follow the player (game.storage), leaderboards (game.leaderboard) and OhMyGame sign-in (game.auth). Use it when a browser game needs OhMyGame player services; preserve existing saves and migrate deliberately. It is not a native-engine or mini-game API. multiplayer_setup already includes the SDK. Locally it points the game at OhMyGame's local service, which signs in test players by name and keeps saves and leaderboards in memory; publishing to OhMyGame switches to the real services with no code change.",
+    description: "Write the GAMEORA browser SDK and its guide into this browser or WebView game, for saves that follow the player (game.storage), leaderboards (game.leaderboard) and GAMEORA sign-in (game.auth). Use it when a browser game needs GAMEORA player services; preserve existing saves and migrate deliberately. It is not a native-engine or mini-game API. multiplayer_setup already includes the SDK. Locally it points the game at GAMEORA's local service, which signs in test players by name and keeps saves and leaderboards in memory; publishing to GAMEORA switches to the real services with no code change.",
     parameters: Type.Object({}),
     execute: async (_toolCallId, _input, signal) => {
       signal?.throwIfAborted();
       const services = await localGameServices?.();
       const result = await installGameSdk(project, services);
-      const viewer = services ? ` Local saves and leaderboards are kept by OhMyGame's local service until it quits; see them at ${services.cloud.serverUrl}dev/games/${encodeURIComponent(services.cloud.gameId)}.` : "";
+      const viewer = services ? ` Local saves and leaderboards are kept by GAMEORA's local service until it quits; see them at ${services.cloud.serverUrl}dev/games/${encodeURIComponent(services.cloud.gameId)}.` : "";
       return {
         content: [{ type: "text" as const, text: `Read ${result.guidePath} and import init from ${result.sdkPath}/client.js. ${result.manifestPath} must be copied into the build output so init() can load it.${viewer}` }],
         details: { sdk: result },

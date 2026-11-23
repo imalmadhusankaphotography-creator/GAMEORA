@@ -396,7 +396,7 @@ export async function probeAuth(
   return { status: "unknown", billing: "provider" };
 }
 
-/** The models a CLI offers, as OhMyGame's model picker lists them. */
+/** The models a CLI offers, as GAMEORA's model picker lists them. */
 export async function probeModels(
   binaryPath: string,
   id: AgentRuntimeId,

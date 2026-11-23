@@ -1,6 +1,6 @@
-/** OhMyGame's production cloud API, whose published games use OhMyGame's production game service. */
+/** GAMEORA's production cloud API, whose published games use GAMEORA's production game service. */
 export const PRODUCTION_CLOUD_API_URL = "https://cloud.ohmygame.ai";
-/** OhMyGame's production game service: rooms, cloud saves and leaderboards for published games. */
+/** GAMEORA's production game service: rooms, cloud saves and leaderboards for published games. */
 export const PRODUCTION_GAME_SERVICE_URL = "https://games.ohmygame.ai";
 
 /**

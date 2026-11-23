@@ -61,7 +61,7 @@ export type CodingSessionEvent = AgentSessionEvent
 export interface CodingSession {
   readonly messages: readonly unknown[];
   readonly model?: RuntimeModel;
-  /** The coding agent CLI that runs this session; absent for OhMyGame's own agent. */
+  /** The coding agent CLI that runs this session; absent for GAMEORA's own agent. */
   readonly runtime?: AgentRuntimeId;
   readonly profileId?: string;
   /** Whether prompt() emits message_start for its initial user message. */
@@ -685,7 +685,7 @@ export class AgentManager {
     await Promise.all([...this.#sessionDisposals].flatMap(([session, stopped]) => matches(session) ? [stopped] : []));
   }
 
-  /** The coding agent running a conversation's loaded session, if any; undefined for OhMyGame's own agent. */
+  /** The coding agent running a conversation's loaded session, if any; undefined for GAMEORA's own agent. */
   sessionRuntime(projectId: string, conversationId: string): AgentRuntimeId | undefined {
     return this.#sessions.get(conversationKey(projectId, conversationId))?.session.runtime;
   }
