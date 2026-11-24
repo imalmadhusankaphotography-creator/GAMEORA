@@ -31,10 +31,16 @@ export interface AgentRuntimeSettings {
   defaultProfileId?: string;
 }
 
-/** Every runtime is off until enabled, and asks nothing once it is, as GAMEORA's own agent does. */
+/**
+ * GAMEORA turns Claude Code on from the start; other runtimes stay off until enabled.
+ * Each asks nothing once on, as GAMEORA's own agent does. GAMEORA reports itself, not
+ * OhMyGame, to Claude Code unless the person turns that on.
+ */
 function defaults(id: AgentRuntimeId): AgentRuntimeSettings {
-  return { enabled: false, autoContinue: true, identifyAsOhMyGame: true, permissionMode: fullAccessPermissionMode(id) };
+  return { enabled: id === "claude-code-cli", autoContinue: true, identifyAsOhMyGame: false, permissionMode: fullAccessPermissionMode(id) };
 }
+/** Settings written before this carry OhMyGame's default of reporting OhMyGame; GAMEORA resets that once. */
+const GAMEORA_IDENTITY = 1;
 
 /**
  * The CLI's mode for OhMyGame's former "standard", which ran each agent in
@@ -124,6 +130,7 @@ export class AgentRuntimeSettingsStore {
       }) : []);
     }
     if (!runtimes || typeof runtimes !== "object") return;
+    const identityReviewed = stored.gameoraIdentity === GAMEORA_IDENTITY;
     for (const [id, entry] of Object.entries(runtimes)) {
       if (!isAgentRuntimeId(id) || !entry || typeof entry !== "object")
         continue;
@@ -134,7 +141,7 @@ export class AgentRuntimeSettingsStore {
             ? stored.enabled
             : defaults(id).enabled,
         autoContinue: stored.autoContinue !== false,
-        identifyAsOhMyGame: stored.identifyAsOhMyGame !== false,
+        identifyAsOhMyGame: identityReviewed && stored.identifyAsOhMyGame === true,
         ...(isAccountRuntimeId(id) && typeof stored.defaultProfileId === "string" && this.profiles(id).some((profile) => profile.id === stored.defaultProfileId) ? { defaultProfileId: stored.defaultProfileId } : {}),
         permissionMode: storedPermissionMode(
           id,
@@ -246,7 +253,7 @@ export class AgentRuntimeSettingsStore {
       try {
         await writeFile(
           temporary,
-          `${JSON.stringify({ version: SETTINGS_VERSION, runtimes: snapshot, accountProfiles, ...(defaults ? { defaultModel: defaults } : {}) }, null, 2)}\n`,
+          `${JSON.stringify({ version: SETTINGS_VERSION, gameoraIdentity: GAMEORA_IDENTITY, runtimes: snapshot, accountProfiles, ...(defaults ? { defaultModel: defaults } : {}) }, null, 2)}\n`,
         );
         await rename(temporary, this.#filePath);
       } catch (cause) {

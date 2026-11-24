@@ -4418,12 +4418,15 @@ export function createApp(options: AppOptions = {}) {
       : { models: [], loading: [] };
     const nativeDefaults = request.query.runtimes === "1" ? agentRuntimes.settings.defaultModel() : undefined;
     const nativeDefault = nativeDefaults ? findAgentModel(agents.models, nativeDefaults.model) : undefined;
+    // GAMEORA starts on Claude Code's Sonnet until the person picks another default.
+    const claudeCode = agents.models.filter((model) => model.provider === "claude-code-cli");
+    const claudeCodeDefault = claudeCode.find((model) => model.id === "sonnet") ?? claudeCode[0];
     return {
       models: [...models.map(summary), ...agents.models],
       ...(loadingProviders.length ? { loadingProviders } : {}),
       ...(agents.loading.length ? { loadingRuntimes: agents.loading } : {}),
       ...(hidden.length ? { hiddenModels: hidden.map(summary) } : {}),
-      ...(nativeDefault ? { defaultModel: { provider: nativeDefault.provider, id: nativeDefault.id }, ...(nativeDefaults?.nativeReasoningLevel ? { defaultNativeReasoningLevel: nativeDefaults.nativeReasoningLevel } : {}) } : defaultModel ? { defaultModel: { provider: defaultModel.provider, id: defaultModel.id } } : {}),
+      ...(nativeDefault ? { defaultModel: { provider: nativeDefault.provider, id: nativeDefault.id }, ...(nativeDefaults?.nativeReasoningLevel ? { defaultNativeReasoningLevel: nativeDefaults.nativeReasoningLevel } : {}) } : defaultModel ? { defaultModel: { provider: defaultModel.provider, id: defaultModel.id } } : claudeCodeDefault ? { defaultModel: { provider: claudeCodeDefault.provider, id: claudeCodeDefault.id } } : {}),
       defaultReasoningLevel: defaultReasoningLevel(dataDirectory, piAgentDirectory),
     };
   });
