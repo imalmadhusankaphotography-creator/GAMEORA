@@ -160,7 +160,8 @@ export async function recoverAgentDirectories(root: string): Promise<void> {
     )
       continue;
     if (!(await originalProcessLives(lease.pid, lease.identity, lookup)))
-      await rm(directory, { recursive: true, force: true });
+      // A folder Windows still reports busy is left for the next start rather than stopping this one.
+      await rm(directory, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 }).catch(() => {});
   }
 }
 
