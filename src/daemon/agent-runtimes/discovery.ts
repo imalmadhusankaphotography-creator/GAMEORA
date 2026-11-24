@@ -565,9 +565,11 @@ async function claudeModels(
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      void child.stop();
-      if (result instanceof Error) reject(result);
-      else resolve(result);
+      // Settle once the CLI has exited, so its working folder can be removed on Windows.
+      void child.stop().finally(() => {
+        if (result instanceof Error) reject(result);
+        else resolve(result);
+      });
     };
     const child = new AgentProcess({
       binaryPath,
@@ -707,7 +709,10 @@ export async function privateFolder(
     path: folder,
     remove: async () => {
       await lease.release();
-      await rm(folder, { recursive: true, force: true });
+      // On Windows a CLI that is still exiting keeps its working folder busy (EBUSY).
+      // Retry for a while, and never let cleanup fail the work that used the folder:
+      // a folder left behind is removed with the other probe folders at the next start.
+      await rm(folder, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }).catch(() => {});
     },
   };
 }
