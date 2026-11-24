@@ -90,12 +90,13 @@ nsis:
   oneClick: false
   allowToChangeInstallationDirectory: true
 
-# GAMEORA updates itself from the GitHub Releases of its own repo.
+# GAMEORA updates itself from the latest GitHub Release of its own repo.
+# The generic provider reads latest.yml through GitHub's /releases/latest/download
+# redirect instead of the releases.atom feed, which reported "No published versions".
 publish:
-  provider: github
-  owner: imalmadhusankaphotography-creator
-  repo: GAMEORA
-  releaseType: release
+  provider: generic
+  url: https://github.com/imalmadhusankaphotography-creator/GAMEORA/releases/latest/download
+  channel: latest
 
 dmg:
   artifactName: OhMyGame-${version}-${arch}.${ext}
