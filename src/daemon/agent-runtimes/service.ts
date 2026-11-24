@@ -1087,6 +1087,7 @@ export class AgentRuntimeService {
       const settings = this.settings.get(id);
       const binary = await resolveBinary(id, settings.binaryPath);
       if (!binary) {
+        console.error(`[agent-models] ${id} executable not found (configured: ${settings.binaryPath ?? "automatic"})`);
         if (this.#revisions.get(cacheKey) === revision) this.#models.set(cacheKey, { models: [], at: Date.now() });
         return [];
       }
@@ -1118,6 +1119,7 @@ export class AgentRuntimeService {
           env,
           folder.path,
         );
+        console.error(`[agent-models] ${id} (${binary.path}) listed ${models.length} model(s)${signedOut ? ", signed out" : ""}`);
         if (this.#revisions.get(cacheKey) !== revision) return [];
         this.#models.set(cacheKey, {
           signature: binary.signature,
@@ -1175,6 +1177,7 @@ export class AgentRuntimeService {
         await folder.remove();
       }
     })().catch((cause: unknown) => {
+      console.error(`[agent-models] ${id} model listing failed: ${cause instanceof Error ? cause.stack ?? cause.message : String(cause)}`);
       // A failed or missing CLI settles a snapshot too. Keep the next picker
       // poll from restarting the same discovery while its status is fresh.
       if (this.#revisions.get(cacheKey) === revision) {

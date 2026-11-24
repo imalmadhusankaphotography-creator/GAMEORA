@@ -628,12 +628,13 @@ async function claudeModels(
           /* Not a message. */
         }
       },
-      onExit: (_code, _signal, stderr) =>
+      onExit: (code, signal, stderr) =>
         finish(
           cliProbeError(
             "Claude Code",
-            stderr.trim().split("\n").at(-1) ||
-              "Claude Code exited before listing its models",
+            (code !== null || signal ? `exit ${code ?? signal}: ` : "") +
+              (stderr.trim().split("\n").at(-1) ||
+                "Claude Code exited before listing its models"),
           ),
         ),
     });
